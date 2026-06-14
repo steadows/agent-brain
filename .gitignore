@@ -1,0 +1,7 @@
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
+
+# The tool is self-contained — nothing generated lives here.
+# (A repo's own .brain/ runtime artifacts are ignored by .brain/.gitignore, written at `brain init`.)
