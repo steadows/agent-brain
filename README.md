@@ -75,8 +75,8 @@ branch name otherwise — matched *exactly* against `owns_branches`:
 |---|---|---|
 | `feat/dt-520-graph-pg1-read-surface` | `graph` | graph |
 | `feat/dt-513-cockpit-mini-graph` | `cockpit` | cockpit (the inner "graph" is never extracted) |
-| `feat/dt-487-board-composer` | `board` | workbench (owns `["workbench","board"]`) |
-| `main` | `main` | langgraph-runtime (owns `["main","langgraph-runtime"]`) |
+| `feat/dt-487-board-composer` | `workbench` | workbench (owns `["workbench","board"]`) |
+| `main` | `agent` | langgraph-runtime (owns `["main","langgraph-runtime"]`) |
 
 Exact-token matching means `graph` never matches `langgraph`. A branch that matches nothing → `whoami`
 is empty → the hooks no-op (that's how every *other* worktree in the repo is ignored automatically).
