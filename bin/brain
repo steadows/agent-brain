@@ -43,6 +43,18 @@ _relpath() {
   esac
 }
 
+# Repo-relative from the MAIN root or the caller's own worktree root. Needed by the pre-tool
+# hook: agents live in sibling worktrees, whose absolute paths never carry the $ROOT prefix,
+# so plain _relpath left them absolute and _path_match (exact-match) could never fire.
+_relpath_any() {
+  case "$1" in "$ROOT"/*) printf '%s\n' "${1#"$ROOT"/}"; return 0 ;; esac
+  _wt=$(git rev-parse --show-toplevel 2>/dev/null) || _wt=""
+  if [ -n "$_wt" ]; then
+    case "$1" in "$_wt"/*) printf '%s\n' "${1#"$_wt"/}"; return 0 ;; esac
+  fi
+  printf '%s\n' "$1"
+}
+
 # Read one frontmatter scalar (first match), stripping an inline "# comment" and trailing space.
 # The colon after the key disambiguates feature/features, status/current_status, etc.
 _fm() {
@@ -531,9 +543,12 @@ _emit_session_ctx() {
     || printf '%s\n' "$1"
 }
 _emit_pretool() {
-  # non-blocking: allow + surface the reason
+  # non-blocking: allow + surface the warning to the agent.
+  # Must be additionalContext — permissionDecisionReason is only rendered on ask/deny
+  # decisions and is silently dropped on allow (verified empirically 2026-08-01,
+  # docs/research/agent-lane-dm-mechanisms-eval.md E2/E9 in the ERD repo).
   jq -n --arg r "$1" \
-    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",permissionDecisionReason:$r}}' 2>/dev/null \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",additionalContext:$r}}' 2>/dev/null \
     || printf '%s\n' "$1"
 }
 
@@ -577,7 +592,7 @@ _hook_pre_tool() {
         *"git push"*|*"gh pr create"*) _paths=$(git -C "$ROOT" diff --name-only "$(_main_ref)" 2>/dev/null) ;;
         *) exit 0 ;;
       esac ;;
-    Edit|Write|MultiEdit) [ -n "$_fp" ] && _paths=$(_relpath "$_fp") ;;
+    Edit|Write|MultiEdit) [ -n "$_fp" ] && _paths=$(_relpath_any "$_fp") ;;
     *) exit 0 ;;
   esac
   [ -z "$_paths" ] && exit 0

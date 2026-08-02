@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.0.1 — 2026-08-02
+
+Fix: the PreToolUse collision warning never reached the agent. Two dead switches in series
+(found + fixes verified empirically — see `docs/research/agent-lane-dm-mechanisms-eval.md`
+in the Enterprise Research Dashboard repo, evals E2/E9):
+
+- **`_emit_pretool` emitted the warning in `permissionDecisionReason` on an `allow`
+  decision** — Claude Code only renders that field on `ask`/`deny`; on `allow` it is
+  silently dropped. Swapped to `additionalContext` (same hook, same event). The `ask`
+  branch is unchanged — its reason renders in the permission prompt and always worked.
+- **Edit/Write paths from sibling worktrees never matched.** `_relpath` only strips the
+  MAIN worktree's `$ROOT` prefix, but agents live in sibling worktrees, so `file_path`
+  stayed absolute and `_path_match` (exact-match) could never fire. New `_relpath_any`
+  also strips the caller's own worktree root. (The related `git push` diff-target issue
+  remains ROADMAP known-issue #1 — untouched.)
+
+Verified live: a no-op Write to a path in another active feature's `touches`, from a
+sibling-worktree session, surfaced "Shared-surface collision (proceeding; logged to
+journal)" in the acting agent's context and wrote the journal line.
+
 ## v1.0.0 — 2026-06-13
 
 Initial filesystem-only release. Built, seeded into a live 4-agent project, smoke-tested against the
