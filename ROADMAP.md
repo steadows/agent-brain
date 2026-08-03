@@ -13,6 +13,14 @@ v1 is filesystem-only and deliberately small; this is the backlog for "further d
    **own** worktree (`git rev-parse --show-toplevel`). Low impact today because agents set their own
    `touches` during `/wrap`, but the auto-refresh can write main's diff into a sibling's note.
    **Fix:** diff the local worktree (`show-toplevel`), not `$ROOT`.
+   **Observed live 2026-08-03 — impact is worse than "low":** `presence/pm.md` had `updated:` bumped
+   to the freshest of all 13 lanes and `touches[]` set to *another lane's* uncommitted files
+   (@observatory's, attributed to @pm), while `phase:`/`current_ticket:` stayed two weeks stale. Two
+   knock-ons: **(a)** `_detect_collisions` reads that same `touches[]`, so collision warnings can fire
+   against a lane that never touched the file — and miss real collisions; **(b)** `updated:` is
+   thereby useless as a liveness/staleness signal (`brain status` renders `phase`, so a lane can look
+   maximally fresh while reporting two-week-old work). Do not build anything that keys on `updated:`
+   until this is fixed.
 
 2. **`announce` attribution follows the running shell, not the intended author.**
    `brain announce` stamps the line with `whoami` of the shell it runs in. An agent that runs it from
