@@ -10,6 +10,10 @@
 set -u
 VERSION="1.0.0"
 
+# Clear the vault-resolution sentinel at process entry: it is a marker for "this process ran
+# brain_root()", and an inherited value would let a caller's environment stand in for that.
+_BRAIN_RESOLVED=""
+
 # DM bounds. The body cap keeps the lock-free append below PIPE_BUF (where a single append is
 # atomic) and keeps one message from dominating a recipient's boot context; the inject caps keep
 # a large unread backlog from blowing that context window entirely.
@@ -137,13 +141,14 @@ _new_journal() {
 
 # ── Resolve the vault for the subcommands that need it ────────────────────────────────────────
 _require_brain() {
-  # Already resolved in this process (cmd-from-cmd composition) → skip the git exec. ROOT must
-  # be set too: every caller depends on it, and requiring both means an inherited BRAIN alone
-  # cannot redirect writes at a vault we never resolved.
-  [ -n "${BRAIN:-}" ] && [ -n "${ROOT:-}" ] && [ -d "$BRAIN" ] && return 0
+  # Short-circuit ONLY on a resolution this process performed itself. _BRAIN_RESOLVED is a
+  # private sentinel cleared at process entry, so an inherited BRAIN/ROOT pair — however
+  # consistent it looks — cannot make us skip brain_root() and write to a foreign tree.
+  if [ "${_BRAIN_RESOLVED:-}" = "1" ] && [ -n "${BRAIN:-}" ] && [ -d "$BRAIN" ]; then return 0; fi
   ROOT=$(brain_root) || _die "not inside a git repository"
   BRAIN="$ROOT/.brain"
   [ -d "$BRAIN" ] || _die "no brain here (run: brain init)"
+  _BRAIN_RESOLVED=1
 }
 
 # ── whoami (the single identity resolver) ────────────────────────────────────────────────────
@@ -185,8 +190,8 @@ cmd_whoami() {
 _announce_as() {
   _require_brain
   _day=$(_today); _jf="$BRAIN/journal/$_day.md"
-  [ -f "$_jf" ] || _new_journal "$_jf" "$_day"
-  printf -- '- %s %s — %s\n' "$(_now_iso)" "$1" "$2" >> "$_jf"   # atomic append
+  [ -f "$_jf" ] || _new_journal "$_jf" "$_day" || return 1
+  printf -- '- %s %s — %s\n' "$(_now_iso)" "$1" "$2" >> "$_jf" || return 1   # atomic append
 }
 
 cmd_announce() {
@@ -219,8 +224,15 @@ _inbox_path() {
 # delivery that never happened.
 _inbox_ensure() {
   _ie=$(_inbox_path "$1") || return 1
+  # Refuse symlinked lane dirs / inboxes: a link would let a send append to — and boot delivery
+  # inject the contents of — a file outside the vault entirely.
+  [ -L "${_ie%/*}" ] && { _warn "brain: $1's dm directory is a symlink — refusing"; return 1; }
   [ -d "${_ie%/*}" ] || mkdir -p "${_ie%/*}" 2>/dev/null || return 1
-  [ -f "$_ie" ] || : > "$_ie" 2>/dev/null || return 1
+  [ -L "$_ie" ] && { _warn "brain: $1's inbox is a symlink — refusing"; return 1; }
+  # `: >>` not `: >` — a plain truncating redirect races another sender that created and wrote
+  # between our -f test and this line, erasing their message while both report success.
+  [ -f "$_ie" ] || : >> "$_ie" 2>/dev/null || return 1
+  [ -f "$_ie" ] || return 1
   printf '%s\n' "$_ie"
 }
 
@@ -307,7 +319,8 @@ cmd_dm() {
       fi
     done
     [ "$_n" -gt 0 ] || _die "brain dm: broadcast delivered to nobody${_failed:+ (failed:$_failed)}"
-    _announce_as "$_from" "dm → @all (broadcast to $_n inboxes; transcripts under .brain/dm/)${_failed:+ — FAILED:$_failed}"
+    _announce_as "$_from" "dm → @all (broadcast to $_n inboxes; transcripts under .brain/dm/)${_failed:+ — FAILED:$_failed}" \
+      || _warn "brain dm: broadcast DELIVERED but the journal call-log line FAILED — audit trail incomplete"
     printf 'dm → @all (%s inboxes)%s\n' "$_n" "${_failed:+ — FAILED:$_failed}"
     [ -z "${_failed:-}" ]      # partial delivery is a non-zero exit, not a success
     return $?
@@ -323,7 +336,10 @@ cmd_dm() {
   # secret scan cannot see a mid-line body; the pointer keeps the transcript retrievable.
   # Vault-relative on purpose — this line is committed and read on other machines, where an
   # absolute path is meaningless; and name where it moves, since boot rotation archives it.
-  _announce_as "$_from" "dm → @$_to (transcript: .brain/dm/$_to/inbox.jsonl, then read/ once delivered)"
+  # The message IS delivered by now, so a journal failure must not read as "resend" — report it
+  # as an audit-log failure with its own exit code.
+  _announce_as "$_from" "dm → @$_to (transcript: .brain/dm/$_to/inbox.jsonl, then read/ once delivered)" \
+    || _warn "brain dm: DELIVERED to @$_to but the journal call-log line FAILED — audit trail incomplete, do not resend"
   printf 'dm → @%s\n' "$_to"
 }
 
@@ -345,15 +361,21 @@ cmd_status() {
     [ -e "$_f" ] || continue
     _st=$(_fm "$_f" status); _sl=$(_agent_slug "$_f")
     _ph=$(_fm "$_f" phase); _tk=$(_fm "$_f" current_ticket)
+    # optional dialog_with (task 4.2), read OUTSIDE the status branch: an open dialog on an
+    # idle/done lane is the stale state this field exists to expose, so it must not hide there.
+    _dw=$(_fm "$_f" dialog_with)
     case "$_st" in
       active|blocked)
         printf '  • %-18s [%s] %s %s\n' "$_sl" "$_st" "${_ph:-—}" "${_tk:+($_tk)}"
-        # optional dialog_with (task 4.2): an open lane-to-lane dialog stays visible
-        _dw=$(_fm "$_f" dialog_with)
-        if [ -n "$_dw" ]; then printf '      ↳ in dialog with @%s\n' "$_dw"; fi
+        [ -n "$_dw" ] && printf '      ↳ in dialog with @%s\n' "$_dw"
         ;;
-      idle)           printf '  • %-18s [idle] (upcoming)\n' "$_sl" ;;
-      *)              : ;;   # done/unknown skipped
+      idle)
+        printf '  • %-18s [idle] (upcoming)\n' "$_sl"
+        [ -n "$_dw" ] && printf '      ⚠ still marked in dialog with @%s while idle — stale?\n' "$_dw"
+        ;;
+      *)
+        [ -n "$_dw" ] && printf '  • %-18s [%s] ⚠ still marked in dialog with @%s — stale\n' "$_sl" "${_st:-?}" "$_dw"
+        ;;
     esac
   done
 
@@ -564,16 +586,23 @@ cmd_commit() {
   # scaffold (and --force is forbidden on a live vault), so a vault initialized before the DM
   # feature would otherwise commit inbox bodies — which the line-anchored secret scan below
   # cannot see, since a jsonl line starts with '{'.
-  if [ -d "$BRAIN/dm" ] && ! grep -qxF 'dm/' "$BRAIN/.gitignore" 2>/dev/null; then
-    printf 'dm/\n' >> "$BRAIN/.gitignore" \
-      && _warn "added missing 'dm/' to .brain/.gitignore — DM inboxes must never be committed"
-  fi
-  # …and the ignore line alone is not enough: gitignore does not un-stage. Anything that ran
-  # `git add` before this point (another agent, a prior session) already has inboxes in the
-  # index, where the line-anchored secret scan below cannot see them either.
-  if git -C "$ROOT" diff --cached --name-only -- .brain/dm 2>/dev/null | grep -q .; then
-    git -C "$ROOT" rm -r --cached -q --ignore-unmatch -- .brain/dm 2>/dev/null \
-      && _warn "un-staged .brain/dm/ — DM inboxes are per-machine and must never be committed"
+  # DM inboxes must never reach a commit, and this guard FAILS CLOSED — the secret scan below
+  # is line-anchored and cannot see a jsonl body, so this is the only control that stands.
+  if [ -d "$BRAIN/dm" ]; then
+    if ! grep -qxF 'dm/' "$BRAIN/.gitignore" 2>/dev/null; then
+      printf 'dm/\n' >> "$BRAIN/.gitignore" 2>/dev/null \
+        || { _lock_release commit; _die "cannot write .brain/.gitignore to exclude dm/ — refusing to commit"; }
+      grep -qxF 'dm/' "$BRAIN/.gitignore" 2>/dev/null \
+        || { _lock_release commit; _die "could not verify the dm/ ignore rule — refusing to commit"; }
+      _warn "added missing 'dm/' to .brain/.gitignore — DM inboxes must never be committed"
+    fi
+    # An ignore rule does not apply to files git already TRACKS, and does not un-stage. Purge
+    # every dm path git knows about, not merely the ones showing in a staged diff.
+    if git -C "$ROOT" ls-files --cached -- .brain/dm 2>/dev/null | grep -q .; then
+      git -C "$ROOT" rm -r --cached -q --ignore-unmatch -- .brain/dm 2>/dev/null \
+        || { _lock_release commit; _die "could not un-track .brain/dm/ — refusing to commit"; }
+      _warn "un-tracked .brain/dm/ — DM inboxes are per-machine and must never be committed"
+    fi
   fi
   # secret scan staged .brain/ content. Extra denylist terms (one per line, '#' comments ok) come
   # from $BRAIN_SECRET_DENYLIST or, by default, <vault>/secret-denylist.txt (optional — absent = skip).
@@ -596,6 +625,13 @@ cmd_commit() {
   if [ -n "$_hit" ]; then _lock_release commit; _die "secret-scan abort: $_hit"; fi
 
   git -C "$ROOT" add -- .brain 2>/dev/null
+  # Re-purge AFTER staging: a DM landing between the pre-check and `git add` would otherwise
+  # ride along. Then assert the invariant on the actual index — fail closed if it does not hold.
+  git -C "$ROOT" rm -r --cached -q --ignore-unmatch -- .brain/dm 2>/dev/null || true
+  if git -C "$ROOT" diff --cached --name-only -- .brain/dm 2>/dev/null | grep -q .; then
+    _lock_release commit
+    _die "refusing to commit: .brain/dm/ is still staged after purge — DM bodies must never be committed"
+  fi
   if git -C "$ROOT" diff --cached --quiet -- .brain 2>/dev/null; then
     _lock_release commit; printf 'brain: nothing to commit\n'; return 0
   fi

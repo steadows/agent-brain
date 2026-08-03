@@ -444,10 +444,21 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
       committer** and `cmd_commit` stages the whole vault with a single pathspec, so the very next
       `brain commit` sweeps them in — which then poisons every lane's `touches[]` and fires
       `_detect_collisions` on every push. The window is small and the blast radius is every lane.
-- `[ ]` 5.2 Explicit `cp` source → `<main-worktree>/.brain/bin/brain`
-- `[ ]` 5.3 Deploy the skill in two steps (seam decision d): cp the updated generic template into
-      the deployed `<main>/.brain/templates/`, add the ERD project-hooks section to **that** copy,
-      then `brain install` (which cp's from the vault copy, not this repo)
+- `[ ]` 5.2 **Atomic engine swap — NOT a bare `cp`** (adversarial finding #9). `cp` truncates the
+      destination before rewriting it, and all 13 lanes execute that one file continuously
+      (SessionStart, PreToolUse, dm, commit) — a concurrent invocation during the copy runs an
+      empty or half-written script. Sequence: `cp` to a **same-directory** temp file
+      (`.brain/bin/.brain.new`), `chmod +x`, `sh -n` it, then `mv` over the live engine — `mv`
+      within one directory is an atomic rename, so every invocation sees either the old engine or
+      the new one, never a partial file.
+- `[ ]` 5.3 Deploy **both** templates (seam decision d + adversarial finding #8): cp
+      `navigation-standards.SKILL.md` **and `DM-PROTOCOL.md`** into the deployed
+      `<main>/.brain/templates/`, add the ERD project-hooks section to those copies, then
+      `brain install` (which cp's the skill from the vault copy, not this repo).
+      ⚠ **`DM-PROTOCOL.md` is a NEW file and nothing else will ever place it**: `brain init` on an
+      existing vault is a no-op and `--force` is forbidden (5.4), so `brain install` alone leaves
+      the always-read skill pointing at a file that does not exist. **Verify after:**
+      `test -f <main>/.brain/templates/DM-PROTOCOL.md`.
 - `[!]` 5.4 **Never run `brain init --force`** — it unconditionally overwrites `.gitignore` and
       `INDEX.md`, and the deployed `.gitignore` is a hand-commented variant that would be clobbered
 
@@ -476,12 +487,29 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
 
 ## Phase 7 — Review gates & ship `[ ]` (requires P6)
 
-- `[ ]` 7.1 **`/simplify`** on the full diff — reuse / simplification / efficiency / altitude. Quality
+- `[x]` 7.1 **`/simplify`** on the full diff — reuse / simplification / efficiency / altitude. Quality
       only, not a bug hunt. **Verify the diff against the 0.3 seam decisions** — that is what closes
       the loop between design-time and post-green.
-- `[ ]` 7.2 **`/steadows-code-review`** — orchestrator-side (Claude Code), never a Codex skill run. If
+      **Done 2026-08-03** (ran pre-deploy — cheaper to fix before 13 lanes run it): 4-agent review;
+      all three seams verified holding; 9 findings applied as refactor commit `77c67a0` (hot-path
+      `_require_brain` short-circuit, `_inbox_ensure` single owner, `_announce_as` seam, altitude
+      fix on the false enforcement claim), 4 skipped with reasons. Suite stayed 24/24.
+- `[~]` 7.2 **`/steadows-code-review`** — orchestrator-side (Claude Code), never a Codex skill run. If
       its adversarial second-opinion step dispatches Codex, scope that prompt to a **single agent, no
       fan-out**; the fleet belongs to 7.4.
+      **Claude pass done 2026-08-03** (5 agents). Findings applied in `4d774f6` + the fix commit —
+      **three were reproduced live by the reviewers**, all in code that had already passed
+      /simplify: (1) every vault initialised before this feature would have **committed DM bodies**
+      (`cmd_init` writes `.gitignore` only on a fresh scaffold) — now self-healed *and* un-staged in
+      `cmd_commit`; (2) `brain inbox '../../x'` escaped `.brain/` (no slug validation, and both dm
+      commands sit on the hook permission allowlist) — now `_feat_ok`; (3) a failed inbox write
+      printed success **and wrote a false "delivered" line into the committed journal** — now fails
+      loudly. Plus a **regression I introduced in 7.1**: `_require_brain`'s short-circuit trusted an
+      inherited `BRAIN`, silently redirecting writes. Docs co-change (README/BUILD-SPEC/CHANGELOG/
+      ROADMAP/INDEX) landed in `4d774f6`. **Codex adversarial sweep in flight**
+      (`task-msdqe49w-p6g6z1`, single agent, brief at `docs/prompts/lane-dm-adversarial-review.md`).
+      **Three coverage gaps owed as follow-ups** (frozen suite — route via `test-writer`): direct
+      `cmd_announce` coverage, the `@`-less `brain dm <lane>` form, the hook's no-identity exit.
 - `[ ]` 7.3 **PR — Steve clicks it.** `github.com/steadows/agent-brain`; the `gh` CLI here is the work
       EMU account and cannot open it. Base: `fix/pretool-collision-warning` (itself still awaiting its
       own PR — 7.3 may end up merging both).
@@ -496,6 +524,33 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
 that proves it
 
 ---
+
+## Open — adversarial review, design-level (Steve's call before Phase 5)
+
+Full report: `docs/lane-dm-adversarial-review-findings.md` (Codex, single agent). Findings
+2/3/4/5/7/8/9/10 are **fixed**; these three are not, because each points at the *append-to-one-JSONL*
+model itself rather than a bug in it:
+
+- `[ ]` **#1 (HIGH) — a send racing rotation is stranded, not delayed.** `mv` does not fence a
+  writer that already opened the inbox: it appends into the archive *after* the digest read it, so
+  the message is in `read/` but surfaces in no boot, ever. **This contradicts the Risks entry
+  below**, which accepted the race on the grounds that "no message is lost" — that acceptance was
+  based on a wrong model and does not hold. Window is sub-second; consequence is permanent.
+- `[ ]` **#6 (MEDIUM) — the no-lock justification is factually wrong.** `PIPE_BUF` (512 here)
+  governs pipes, not appends to regular files, and POSIX does not require shell `printf` to emit
+  one write; `DM_MAX_BODY` also counts source characters, while a 4096-char body of quotes encodes
+  to 8263 bytes. The no-lock *decision* stands as ruled — but it currently rests on a false premise.
+- `[ ]` **#11 (MEDIUM) — two sessions of one lane both consume every DM.** No receiver ownership;
+  both act on the same message.
+
+**The single fix for all three is the same shape:** one file per message (write to a temp name,
+atomic `rename` into a pending dir, atomic claim at delivery) instead of appending to a shared
+JSONL. That removes the interleaving surface, makes the size cap irrelevant, and gives claim/ack a
+natural home. **Cost:** it changes the wire/storage contract the frozen suite pins, so the suite
+must be re-opened through `test-writer` + `spec-watchdog` — i.e. a real slice of work, not a patch.
+**Alternative:** ship v1 as-is with these three documented as known limits (all three need genuine
+concurrency — two sends colliding in the same millisecond, or two live sessions of one lane) and
+revisit if they bite.
 
 ## Risks
 
@@ -522,9 +577,12 @@ that proves it
   session), but `dm/<lane>/read/` accumulates one file per boot forever. Both sit under the gitignored
   `dm/` so nothing reaches a commit — it is disk only. Acceptable for v1; note it rather than build a
   reaper for it.
-- `[ ]` **Rotation has a narrow write race** — a DM appended between the `mv` and the watcher arming
-  lands in the archived file, not the new inbox, so it is delivered at the *next* boot rather than
-  immediately. Sub-second window, no message lost. Accepted; do not add a lock (see task 1.4).
+- `[!]` **Rotation has a narrow write race** — ⚠ **THIS ACCEPTANCE IS WITHDRAWN (adversarial finding
+  #1).** It was accepted as "delivered at the *next* boot rather than immediately, no message lost."
+  That is wrong: a writer holding the old file descriptor appends into the *archive* after the
+  digest has read it, so the message surfaces at **no** boot — permanently stranded, not delayed.
+  Sub-second window, permanent consequence. See "Open — adversarial review" above; do not treat
+  this race as benign.
 - `[ ]` **`whoami` is empty off a brain branch** — a DM from `main`/detached HEAD has no resolvable
   sender; falls back to `$BRAIN_FEATURE`, then `system`.
 
