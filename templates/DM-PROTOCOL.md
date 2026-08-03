@@ -53,8 +53,10 @@ consultants*:
   doesn't count, the same bar lanes already apply to inbound claims.
 - The responding lane's **first turn must be a critique, not an endorsement** — but never a
   fabricated one: on a sound proposal, say "nothing contested" explicitly.
-- The convergence note records **what was contested and the tradeoff accepted**. A note recording
-  *nothing contested* surfaces in `brain status`, so the tell is read rather than confessed to no one.
+- The convergence note records **what was contested and the tradeoff accepted** — and when nothing
+  was contested, it says so explicitly. Open dialogs are visible in `brain status` (via
+  `dialog_with:`); the *nothing contested* tell is read in the PM's periodic vault sweep — v1 has
+  **no** automatic surfacing of convergence notes, so do not rely on one.
 
 ### Research first — never assert or ask cold
 

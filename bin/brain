@@ -24,6 +24,7 @@ brain_root() {
 
 # ── Small helpers ────────────────────────────────────────────────────────────────────────────
 _now_iso()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
+_now_compact() { date -u +%Y%m%dT%H%M%SZ; }   # filename-safe clock (dm read archives)
 _today()    { date -u +%Y-%m-%d; }
 # Test seam: BRAIN_TEST_BRANCH overrides the resolved branch (used by the smoke test only).
 _branch()   { printf '%s\n' "${BRAIN_TEST_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)}"; }
@@ -129,6 +130,8 @@ _new_journal() {
 
 # ── Resolve the vault for the subcommands that need it ────────────────────────────────────────
 _require_brain() {
+  # Already resolved in this process (cmd-from-cmd composition) → skip the git exec.
+  [ -n "${BRAIN:-}" ] && [ -d "$BRAIN" ] && return 0
   ROOT=$(brain_root) || _die "not inside a git repository"
   BRAIN="$ROOT/.brain"
   [ -d "$BRAIN" ] || _die "no brain here (run: brain init)"
@@ -168,13 +171,20 @@ cmd_whoami() {
 }
 
 # ── announce (the single canonical journal writer) ───────────────────────────────────────────
+# _announce_as: the write path, identity supplied by the caller — the seam for commands that
+# have already resolved who they are (cmd_dm) so they don't re-run the whoami presence scan.
+_announce_as() {
+  _require_brain
+  _day=$(_today); _jf="$BRAIN/journal/$_day.md"
+  [ -f "$_jf" ] || _new_journal "$_jf" "$_day"
+  printf -- '- %s %s — %s\n' "$(_now_iso)" "$1" "$2" >> "$_jf"   # atomic append
+}
+
 cmd_announce() {
   _require_brain
   [ -n "${1:-}" ] || _die "usage: brain announce \"<msg>\""
   _feat=$(cmd_whoami); [ -z "$_feat" ] && _feat="${BRAIN_FEATURE:-system}"
-  _day=$(_today); _jf="$BRAIN/journal/$_day.md"
-  [ -f "$_jf" ] || _new_journal "$_jf" "$_day"
-  printf -- '- %s %s — %s\n' "$(_now_iso)" "$_feat" "$1" >> "$_jf"   # atomic append
+  _announce_as "$_feat" "$1"
 }
 
 # ── dm (direct lane-to-lane message; the fast path, NOT the record) ──────────────────────────
@@ -182,15 +192,20 @@ cmd_announce() {
 # something changed — it exists to cut unblock latency from "next session boot" to seconds.
 _inbox_path() { printf '%s\n' "$BRAIN/dm/$1/inbox.jsonl"; }
 
+# The single owner of inbox creation: ensure a lane's inbox exists, print its path.
+_inbox_ensure() {
+  _ie=$(_inbox_path "$1")
+  [ -d "${_ie%/*}" ] || mkdir -p "${_ie%/*}" 2>/dev/null
+  [ -f "$_ie" ] || : > "$_ie"
+  printf '%s\n' "$_ie"
+}
+
 # Print this lane's inbox path — what the agent arms its Monitor on at session start.
 cmd_inbox() {
   _require_brain
   _feat=${1:-$(cmd_whoami)}
   [ -n "$_feat" ] || _die "usage: brain inbox [<feature>]   (no feature given and whoami is empty)"
-  _ib=$(_inbox_path "$_feat")
-  mkdir -p "$(dirname "$_ib")" 2>/dev/null || true
-  [ -f "$_ib" ] || : > "$_ib"
-  printf '%s\n' "$_ib"
+  _inbox_ensure "$_feat"
 }
 
 # The single send path (seam 0.3a): jq-encode + one O_APPEND printf. One JSON object per line
@@ -199,10 +214,9 @@ cmd_inbox() {
 # atomic, and _lock_acquire has no staleness break — one killed sender would wedge the
 # recipient's inbox forever. Journaling stays with the callers: one command invocation = one
 # journal line, never one per recipient.
-_dm_send() {
-  _sb=$(_inbox_path "$2")
-  mkdir -p "$(dirname "$_sb")" 2>/dev/null || true
-  _sl=$(jq -cn --arg f "$1" --arg t "$2" --arg ts "$(_now_iso)" --arg c "$3" \
+_dm_send() { # <from> <to> <msg> <ts>
+  _sb=$(_inbox_ensure "$2")
+  _sl=$(jq -cn --arg f "$1" --arg t "$2" --arg ts "$4" --arg c "$3" \
     '{from:$f,to:$t,ts:$ts,content:$c}' 2>/dev/null) \
     || _die "brain dm: jq failed to encode the message"
   printf '%s\n' "$_sl" >> "$_sb"
@@ -215,9 +229,9 @@ _dm_send() {
 _inbox_rotate() {
   _ri=$(_inbox_path "$1")
   [ -s "$_ri" ] || return 0
-  _rr="$BRAIN/dm/$1/read"
-  mkdir -p "$_rr" 2>/dev/null || return 1
-  _ra="$_rr/$(date -u +%Y%m%dT%H%M%SZ)-$$.jsonl"
+  _rr="${_ri%/*}/read"                       # derived from the path authority, not rebuilt
+  if [ ! -d "$_rr" ]; then mkdir -p "$_rr" 2>/dev/null || return 1; fi
+  _ra="$_rr/$(_now_compact)-$$.jsonl"
   mv "$_ri" "$_ra" 2>/dev/null || return 1
   printf '%s\n' "$_ra"
 }
@@ -227,7 +241,9 @@ cmd_dm() {
   _to=${1:-}; _msg=${2:-}
   [ -n "$_to" ] && [ -n "$_msg" ] || _die "usage: brain dm @<feature>|@all \"<msg>\""
   _to=${_to#@}
-  _from=$(cmd_whoami); [ -z "$_from" ] && _from="${BRAIN_FEATURE:-system}"
+  # whoami already falls back to BRAIN_FEATURE, so empty here can only mean "system"
+  _from=$(cmd_whoami); _from=${_from:-system}
+  _ts=$(_now_iso)
 
   if [ "$_to" = "all" ]; then
     # Broadcast (task 1.6): every registered presence note, skip self only. Deliberately NOT
@@ -238,21 +254,21 @@ cmd_dm() {
       [ -e "$_pn" ] || continue
       _rcpt=$(_agent_slug "$_pn")
       [ "$_rcpt" = "$_from" ] && continue
-      _dm_send "$_from" "$_rcpt" "$_msg"
+      _dm_send "$_from" "$_rcpt" "$_msg" "$_ts"
       _n=$((_n + 1))
     done
     [ "$_n" -gt 0 ] || _die "brain dm: no other registered features to broadcast to"
-    cmd_announce "dm → @all (broadcast to $_n inboxes; transcripts under .brain/dm/)"
+    _announce_as "$_from" "dm → @all (broadcast to $_n inboxes; transcripts under .brain/dm/)"
     printf 'dm → @all (%s inboxes)\n' "$_n"
     return 0
   fi
 
   [ -f "$BRAIN/presence/$_to.md" ] || _die "brain dm: no registered feature '$_to' (see brain status)"
   [ "$_from" = "$_to" ] && _die "brain dm: refusing to send to yourself ($_from)"
-  _dm_send "$_from" "$_to" "$_msg"
+  _dm_send "$_from" "$_to" "$_msg" "$_ts"
   # Call-log line, never the body (task 1.2, Steve's call): the journal is committed and the
   # secret scan cannot see a mid-line body; the pointer keeps the transcript retrievable.
-  cmd_announce "dm → @$_to (transcript: $(_inbox_path "$_to"))"
+  _announce_as "$_from" "dm → @$_to (transcript: $(_inbox_path "$_to"))"
   printf 'dm → @%s\n' "$_to"
 }
 
@@ -658,7 +674,7 @@ _hook_session_start() {
   _arc=$(_inbox_rotate "$_feat")
   _ib=$(cmd_inbox "$_feat")
   _dm_block=""
-  if [ -n "$_arc" ] && [ -f "$_arc" ]; then
+  if [ -n "$_arc" ]; then
     _dm_block="Unread DMs delivered while you were away (archived: $_arc):
 $(cat "$_arc")
 

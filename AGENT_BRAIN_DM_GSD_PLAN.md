@@ -375,6 +375,11 @@ only in this project. Put those in a project-hooks section or in the deployed sk
       - the convergence note records **what was contested and the tradeoff accepted**; if nothing was
         contested, say so explicitly — and a note recording *nothing contested* **surfaces in
         `cmd_status`** for the PM sweep, so the tell is read by someone rather than confessed to no one
+        ⚠ **Scope correction 2026-08-03 (/simplify altitude finding):** the `cmd_status` surfacing
+        of convergence notes is NOT implemented in v1 — it needs a convergence-note marker
+        convention and frozen-test coverage, neither of which exists. The shipped docs claim only
+        what exists (open dialogs via `dialog_with:`; the tell is read in the PM vault sweep).
+        Building the surfacing is a declared follow-up, not a silent gap.
 - `[x]` 3.6 **RESEARCH FIRST — never assert or ask cold.** A mid-dialog question with multiple
       defensible answers that depends on an external standard → **dispatch a research agent before
       taking a position** (`~/.claude/rules/common/research-before-asking.md`, applied lane-to-lane).
