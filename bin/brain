@@ -177,6 +177,85 @@ cmd_announce() {
   printf -- '- %s %s — %s\n' "$(_now_iso)" "$_feat" "$1" >> "$_jf"   # atomic append
 }
 
+# ── dm (direct lane-to-lane message; the fast path, NOT the record) ──────────────────────────
+# The journal stays the durable record and connections stay the state. A DM is the SIGNAL that
+# something changed — it exists to cut unblock latency from "next session boot" to seconds.
+_inbox_path() { printf '%s\n' "$BRAIN/dm/$1/inbox.jsonl"; }
+
+# Print this lane's inbox path — what the agent arms its Monitor on at session start.
+cmd_inbox() {
+  _require_brain
+  _feat=${1:-$(cmd_whoami)}
+  [ -n "$_feat" ] || _die "usage: brain inbox [<feature>]   (no feature given and whoami is empty)"
+  _ib=$(_inbox_path "$_feat")
+  mkdir -p "$(dirname "$_ib")" 2>/dev/null || true
+  [ -f "$_ib" ] || : > "$_ib"
+  printf '%s\n' "$_ib"
+}
+
+# The single send path (seam 0.3a): jq-encode + one O_APPEND printf. One JSON object per line
+# (wire format ratified: from/to/ts/content) so a quote or newline in the body can never break
+# the receiver's line framing. Deliberately NO lock (task 1.4): a single sub-PIPE_BUF append is
+# atomic, and _lock_acquire has no staleness break — one killed sender would wedge the
+# recipient's inbox forever. Journaling stays with the callers: one command invocation = one
+# journal line, never one per recipient.
+_dm_send() {
+  _sb=$(_inbox_path "$2")
+  mkdir -p "$(dirname "$_sb")" 2>/dev/null || true
+  _sl=$(jq -cn --arg f "$1" --arg t "$2" --arg ts "$(_now_iso)" --arg c "$3" \
+    '{from:$f,to:$t,ts:$ts,content:$c}' 2>/dev/null) \
+    || _die "brain dm: jq failed to encode the message"
+  printf '%s\n' "$_sl" >> "$_sb"
+}
+
+# Rotate a non-empty inbox to the read archive and print the archived path; silent no-op on a
+# missing/empty inbox (seam 0.3b). `mv` (not read-in-place) is what makes boot delivery
+# exactly-once; `<ts>-<pid>` (task 2.1) makes same-second rotations collision-free — each boot
+# is its own process, so $$ differs even when the clock does not.
+_inbox_rotate() {
+  _ri=$(_inbox_path "$1")
+  [ -s "$_ri" ] || return 0
+  _rr="$BRAIN/dm/$1/read"
+  mkdir -p "$_rr" 2>/dev/null || return 1
+  _ra="$_rr/$(date -u +%Y%m%dT%H%M%SZ)-$$.jsonl"
+  mv "$_ri" "$_ra" 2>/dev/null || return 1
+  printf '%s\n' "$_ra"
+}
+
+cmd_dm() {
+  _require_brain
+  _to=${1:-}; _msg=${2:-}
+  [ -n "$_to" ] && [ -n "$_msg" ] || _die "usage: brain dm @<feature>|@all \"<msg>\""
+  _to=${_to#@}
+  _from=$(cmd_whoami); [ -z "$_from" ] && _from="${BRAIN_FEATURE:-system}"
+
+  if [ "$_to" = "all" ]; then
+    # Broadcast (task 1.6): every registered presence note, skip self only. Deliberately NOT
+    # gated on status or updated: — presence `updated:` is unreliable, and writing one line
+    # into a dormant lane's inbox is harmless (delivered at its next boot by the rotation).
+    _n=0
+    for _pn in "$BRAIN"/presence/*.md; do
+      [ -e "$_pn" ] || continue
+      _rcpt=$(_agent_slug "$_pn")
+      [ "$_rcpt" = "$_from" ] && continue
+      _dm_send "$_from" "$_rcpt" "$_msg"
+      _n=$((_n + 1))
+    done
+    [ "$_n" -gt 0 ] || _die "brain dm: no other registered features to broadcast to"
+    cmd_announce "dm → @all (broadcast to $_n inboxes; transcripts under .brain/dm/)"
+    printf 'dm → @all (%s inboxes)\n' "$_n"
+    return 0
+  fi
+
+  [ -f "$BRAIN/presence/$_to.md" ] || _die "brain dm: no registered feature '$_to' (see brain status)"
+  [ "$_from" = "$_to" ] && _die "brain dm: refusing to send to yourself ($_from)"
+  _dm_send "$_from" "$_to" "$_msg"
+  # Call-log line, never the body (task 1.2, Steve's call): the journal is committed and the
+  # secret scan cannot see a mid-line body; the pointer keeps the transcript retrievable.
+  cmd_announce "dm → @$_to (transcript: $(_inbox_path "$_to"))"
+  printf 'dm → @%s\n' "$_to"
+}
+
 # ── status (the single live-state source) ────────────────────────────────────────────────────
 _recent_journal() {
   _feat=$1; _jf="$BRAIN/journal/$(_today).md"
@@ -196,7 +275,12 @@ cmd_status() {
     _st=$(_fm "$_f" status); _sl=$(_agent_slug "$_f")
     _ph=$(_fm "$_f" phase); _tk=$(_fm "$_f" current_ticket)
     case "$_st" in
-      active|blocked) printf '  • %-18s [%s] %s %s\n' "$_sl" "$_st" "${_ph:-—}" "${_tk:+($_tk)}" ;;
+      active|blocked)
+        printf '  • %-18s [%s] %s %s\n' "$_sl" "$_st" "${_ph:-—}" "${_tk:+($_tk)}"
+        # optional dialog_with (task 4.2): an open lane-to-lane dialog stays visible
+        _dw=$(_fm "$_f" dialog_with)
+        if [ -n "$_dw" ]; then printf '      ↳ in dialog with @%s\n' "$_dw"; fi
+        ;;
       idle)           printf '  • %-18s [idle] (upcoming)\n' "$_sl" ;;
       *)              : ;;   # done/unknown skipped
     esac
@@ -545,8 +629,8 @@ _emit_session_ctx() {
 _emit_pretool() {
   # non-blocking: allow + surface the warning to the agent.
   # Must be additionalContext — permissionDecisionReason is only rendered on ask/deny
-  # decisions and is silently dropped on allow (verified empirically 2026-08-01,
-  # docs/research/agent-lane-dm-mechanisms-eval.md E2/E9 in the ERD repo).
+  # decisions and is silently dropped on allow (verified empirically 2026-08-01, DM-mechanisms
+  # eval E2/E9 — the eval doc lives with the consuming project, not in this repo).
   jq -n --arg r "$1" \
     '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",additionalContext:$r}}' 2>/dev/null \
     || printf '%s\n' "$1"
@@ -568,11 +652,25 @@ _hook_session_start() {
     esac
     exit 0                               # non-feature branch → silent
   fi
+  # (b2) rotate → deliver → arm, in that order (task 2.1): the watcher attaches at end-of-file,
+  # so anything already in the inbox would be invisible — rotate it out, inject it, then
+  # re-create the empty inbox to arm on. `mv` makes delivery exactly-once across boots.
+  _arc=$(_inbox_rotate "$_feat")
+  _ib=$(cmd_inbox "$_feat")
+  _dm_block=""
+  if [ -n "$_arc" ] && [ -f "$_arc" ]; then
+    _dm_block="Unread DMs delivered while you were away (archived: $_arc):
+$(cat "$_arc")
+
+"
+  fi
   # (c) cheap auto-fixes, robust to a never-wraps agent
   cmd_reconcile >/dev/null 2>&1 || true
   # (d) inject the protocol nudge + live state
   _st=$(cmd_status 2>/dev/null)
-  _emit_session_ctx "Run the **navigation-standards** skill now (the Agent-Brain coordination protocol).
+  _emit_session_ctx "${_dm_block}Run the **navigation-standards** skill now (the Agent-Brain coordination protocol).
+
+Your DM inbox — arm a watch on it for lane-to-lane messages: $_ib
 
 $_st"
   exit 0
@@ -709,7 +807,7 @@ cmd_init() {
     printf 'brain: already initialized at %s (idempotent no-op; --force to re-template)\n' "$BRAIN"
   else
     mkdir -p "$BRAIN/bin" "$BRAIN/templates" "$BRAIN/presence" "$BRAIN/connections" \
-             "$BRAIN/journal" "$BRAIN/research"
+             "$BRAIN/journal" "$BRAIN/research" "$BRAIN/dm"
     # copy the engine + hook wrappers + templates from the source tool into the committed brain
     cp "$_tool_root/bin/"* "$BRAIN/bin/" 2>/dev/null || true
     chmod +x "$BRAIN/bin/"* 2>/dev/null || true
@@ -719,7 +817,9 @@ cmd_init() {
     [ -f "$BRAIN/CHANGES.md" ] || printf '# Brain CHANGES — structural change log\n\n' > "$BRAIN/CHANGES.md"
     printf 'templates/\nbin/\n' > "$BRAIN/.indexignore"
     # keep runtime artifacts + Obsidian config + the Phase-2 index DB out of commits
-    printf '.obsidian/\n.cursors/\n.locks/\n.hook-fired/\n.hook-errors.log\nindex/\n*.db\n' > "$BRAIN/.gitignore"
+    # (dm/ is per-machine transient: cmd_commit stages the whole vault, and a tracked inbox
+    # would land in every lane's touches[] and fire _detect_collisions on every push)
+    printf '.obsidian/\n.cursors/\n.locks/\n.hook-fired/\n.hook-errors.log\nindex/\n*.db\ndm/\n' > "$BRAIN/.gitignore"
     _day=$(_today); _jf="$BRAIN/journal/$_day.md"
     [ -f "$_jf" ] || { _new_journal "$_jf" "$_day"; \
       printf -- '- %s system — brain initialized. Agents: run the navigation-standards skill; query the brain yourself (pull, not push).\n' "$(_now_iso)" >> "$_jf"; }
@@ -746,6 +846,8 @@ brain — Agent Brain coordination vault (v1, filesystem-only)
   brain new-feature <slug>              register one feature (run once)
   brain whoami                          resolve the current feature (empty = not a brain branch)
   brain announce "<msg>"                append a line to today's journal
+  brain dm @<feature>|@all "<msg>"      direct-message a lane's inbox (@all = every lane but you)
+  brain inbox [<feature>]               print (and create) a lane's DM inbox path
   brain status                          live dashboard (features, connections, banners)
   brain reconcile [--check]             validate + cheap auto-fixes (--check = validate only)
   brain commit                          durability: path-scoped, locked, secret-scanned, ff-only
@@ -765,6 +867,8 @@ case "$_sub" in
   new-feature) cmd_new_feature "$@" ;;
   whoami)      cmd_whoami "$@" ;;
   announce)    cmd_announce "$@" ;;
+  dm)          cmd_dm "$@" ;;
+  inbox)       cmd_inbox "$@" ;;
   status)      cmd_status "$@" ;;
   reconcile)   cmd_reconcile "$@" ;;
   commit)      cmd_commit "$@" ;;

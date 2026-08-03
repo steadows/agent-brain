@@ -1,8 +1,8 @@
 # Agent-Brain Lane DM — GSD Plan
 
-**Status:** `[~]` Phase 0 ✅ CLOSED 2026-08-03 (Gate 0.G: suite FROZEN after a 4-round
-adversarial audit — 24 scenarios, 25 mutations driven, 2 declared residuals); **next is Phase 1
-transport GREEN** against the frozen suite
+**Status:** `[~]` P0–P4 ✅ DONE 2026-08-03 — suite frozen (4-round audit), then GREEN landed:
+**24/24 scenarios pass** (engine + hook + protocol + presence). **Next is Phase 5 deploy — STOP:
+machine-wide and instant for all 13 lanes; needs Steve's go**
 **Owner:** @pm · **Repo:** `~/agent-brain` (branch `fix/pretool-collision-warning`) → deployed to `<main-worktree>/.brain/`
 **Evidence:** `docs/research/agent-lane-dm-mechanisms-eval.md` (E0–E15) in `enterprise_research_dashboard-pm`
 **Predecessor:** `~/agent-brain/docs/AGENT-DM-CHANNELS.md` (2026-06-15, superseded in part)
@@ -256,16 +256,16 @@ manufacture evidence of compliance nobody checked.
 current engine (verified independently by orchestrator AND watchdog: exit 1, 20 non-guard FAIL,
 the 4 passes are exactly the 4 guards) · watchdog round 4 verdict CLEAN, no unaddressed finding
 
-## Phase 1 — Transport `[ ]` (machinery · `~/agent-brain/bin/brain`)
+## Phase 1 — Transport `[x]` (machinery · `~/agent-brain/bin/brain`)
 
 **Wire format (ratified 2026-08-03, watchdog finding m2):** one jq-encoded JSON object per inbox
 line, keys exactly `from` / `to` / `ts` / `content` — matches the E1–E15 fixtures and the draft
 encoder. The frozen suite pins these keys; changing them is a plan change, not an implementation
 choice.
 
-- `[ ]` 1.1 Register `dm)` and `inbox)` in the dispatch `case` (~L799–816) **and** in `usage()`
+- `[x]` 1.1 Register `dm)` and `inbox)` in the dispatch `case` (~L799–816) **and** in `usage()`
       — the single reason the existing code is dead
-- `[ ]` 1.2 **Journal a call-log line, never the message body** (Steve's call, 2026-08-03).
+- `[x]` 1.2 **Journal a call-log line, never the message body** (Steve's call, 2026-08-03).
       `cmd_announce` writes `- <ts> <feat> — <msg>`, so a verbatim body lands **mid-line**, where the
       commit secret scan's `^[A-Z][A-Z0-9_]*=.+` anchor (`bin/brain:447`) can never match — and
       `journal/` **is** committed. Write `dm → @<to> (transcript: <inbox path>)` instead: keeps the
@@ -274,16 +274,16 @@ choice.
       back to the real transcript. Secondary effect fixed for free — a verbatim body would be injected
       into **every** lane its text names via `_recent_journal` at SessionStart
       (`bin/brain:218-222`, `279-282`), not just the addressee.
-- `[ ]` 1.3 Add `dm/` to `cmd_init`'s `mkdir -p` (~L748) and to the `.gitignore` `printf` (~L759),
+- `[x]` 1.3 Add `dm/` to `cmd_init`'s `mkdir -p` (~L748) and to the `.gitignore` `printf` (~L759),
       in the existing *"Brain runtime artifacts — per-machine, transient"* section
-- `[ ]` 1.4 **Drop the `dm-<to>` lock.** `_lock_acquire` (`bin/brain:113–121`) has no staleness break,
+- `[x]` 1.4 **Drop the `dm-<to>` lock.** `_lock_acquire` (`bin/brain:113–121`) has no staleness break,
       so a `brain dm` killed mid-critical-section wedges every later send to that lane permanently —
       and DM frequency will be far higher than commit's. One `printf` append of one jq-encoded line is
       a single `O_APPEND` write, atomic at these sizes; that is also what keeps the receiver's
       line-by-line `tail -F` framing intact.
-- `[ ]` 1.5 Fix the stale doc reference in the `_emit_pretool` comment (**~L584–586**, working-tree
+- `[x]` 1.5 Fix the stale doc reference in the `_emit_pretool` comment (**~L584–586**, working-tree
       numbering) — points at a path that exists only in the `-pm` worktree
-- `[ ]` 1.6 **Broadcast: `brain dm @all "<msg>"`.** The protocol names *status broadcast* and *merge
+- `[x]` 1.6 **Broadcast: `brain dm @all "<msg>"`.** The protocol names *status broadcast* and *merge
       coordination* among its six shapes (3.1), but `cmd_dm` is strictly point-to-point — the plan
       described a shape the transport could not do (found by Steve, 2026-08-03).
       Fan the same line into **every** registered inbox (loop `presence/*.md`, skip self), plus one
@@ -291,7 +291,8 @@ choice.
       rotation. **Do not gate the fan-out on who looks "live"** — presence `updated:` is unreliable
       (see Risks). Writing to a dormant lane's inbox costs one line and is harmless.
 
-**Gate 1.G** `[ ]` **scoped verify** (syntax · shellcheck · `test/dm.sh` exit 0 · secret probe), with
+**Gate 1.G** `[x]` **PASSED 2026-08-03** (suite 24/24; shellcheck at baseline parity — 13
+pre-existing findings, none in new code) — **scoped verify** (syntax · shellcheck · `test/dm.sh` exit 0 · secret probe), with
 these P1 scenarios now GREEN in the frozen suite: `brain inbox` prints+creates · `brain dm @graph "x"`
 writes one valid JSON line to the inbox **and** one journal line containing the inbox path and **not**
 the body · **a DM body containing `AWS_SECRET_ACCESS_KEY=abc123` leaves no trace of that string
@@ -299,9 +300,9 @@ anywhere under `journal/`** · `brain dm @all "x"` lands in **all 13** registere
 sender's · unknown recipient fails cleanly · self-send refused · `git status` in the main worktree
 shows **no** `.brain/dm/`
 
-## Phase 2 — Hook `[ ]` (machinery · same file)
+## Phase 2 — Hook `[x]` (machinery · same file)
 
-- `[ ]` 2.1 **Rotate, deliver, then arm — in that order.** In `_hook_session_start`, before anything
+- `[x]` 2.1 **Rotate, deliver, then arm — in that order.** In `_hook_session_start`, before anything
       else: if `dm/<me>/inbox.jsonl` is non-empty, `mv` it to `dm/<me>/read/<ts>-<pid>.jsonl` and
       inject its contents into the session's startup context alongside the existing "run
       navigation-standards" block. Then arm the watcher on a now-empty inbox.
@@ -320,16 +321,24 @@ shows **no** `.brain/dm/`
       skip; a hook is machinery that runs whether or not the agent is paying attention. Precedent for
       the failure mode: the collision warning that never fired, and the agent-frontmatter `hooks:`
       block that never fires.
-- `[ ]` 2.2 Extend the same injected block with the arm-your-inbox instruction carrying the concrete
+- `[x]` 2.2 Extend the same injected block with the arm-your-inbox instruction carrying the concrete
       `cmd_inbox` path
 
-**Gate 2.G** `[ ]` **scoped verify**, plus: cold scratch lane arms the Monitor **unprompted** and a DM
+**Gate 2.G** `[~]` **scriptable clauses PASSED 2026-08-03** (offline delivery, exactly-once,
+collision-free archives — all green in the frozen suite). **The live-arming clause is deferred to
+P6 by design** — "a cold lane arms the Monitor unprompted, mid-task delivery" needs a real Claude
+session, which is exactly scenarios 6.1/6.2; it cannot be a `test/dm.sh` scenario. Full gate text:
+**scoped verify**, plus: cold scratch lane arms the Monitor **unprompted** and a DM
 from another process arrives mid-task · **offline delivery:** send to a lane that is **not running**,
 then boot it — it reports the message as part of waking up, `inbox.jsonl` is empty, and the line is in
 `read/<ts>.jsonl` · **exactly-once:** boot that same lane a second time and it does **not** re-report
 the message
 
-## Phase 3 — Protocol `[ ]` (convention · `templates/navigation-standards.SKILL.md`) — CONCURRENT with P1/P2
+## Phase 3 — Protocol `[x]` (convention · `templates/navigation-standards.SKILL.md`) — CONCURRENT with P1/P2
+
+**Done 2026-08-03:** always-read DM section in the skill (78 lines, ≤80 budget) + the on-demand
+`templates/DM-PROTOCOL.md` carrying 3.1–3.8 in full + a `## Project hooks` placeholder in both
+(seam d — ERD referents go in the DEPLOYED copies at 5.3, never here).
 
 The engine is ~40 lines; the protocol is the product.
 
@@ -342,19 +351,19 @@ on-demand reference file the skill points at.
 project-agnostic, but 3.6/3.8 cite `docs/AUTONOMOUS_WORK.md` §3.1 and `.brain/research/`, which exist
 only in this project. Put those in a project-hooks section or in the deployed skill copy.
 
-- `[ ]` 3.1 **The six shapes** (measured from the vault, not invented): status broadcast ·
+- `[x]` 3.1 **The six shapes** (measured from the vault, not invented): status broadcast ·
       intake/handoff · heads-up/warning · unblock (`waiting-on`) · merge coordination · dialog
-- `[ ]` 3.2 **Rules of engagement — triage by cost, not authority:** read everything · **ack
+- `[x]` 3.2 **Rules of engagement — triage by cost, not authority:** read everything · **ack
       everything even when deferring** · do it now if small · **do it now if it invalidates your
       current work** (the "main moved" case) · else finish your task first · **write it down when you
       defer** (punch list / connection note — never held only in context, which dies at compaction)
-- `[ ]` 3.3 **Merge coordination needs a handshake** — the one shape where **silence means NO
+- `[x]` 3.3 **Merge coordination needs a handshake** — the one shape where **silence means NO
       agreement**. An unacked "hold your merge until mine lands" is *not agreed*. DM = signal;
       the existing `waiting-on` connection note = record
-- `[ ]` 3.4 **Dialog mode** — `dialog_with:` set in your presence note while engaged, cleared after.
+- `[x]` 3.4 **Dialog mode** — `dialog_with:` set in your presence note while engaged, cleared after.
       Both ends opt in. **Push toward convergence; do not go forever** — converge / deadlock /
       escalate. Convergence *is* writing the shared conclusion to a `connections/` note
-- `[ ]` 3.5 **Anti-sycophancy.** Be honest about which of these is machinery and which is compliance:
+- `[x]` 3.5 **Anti-sycophancy.** Be honest about which of these is machinery and which is compliance:
       the **convergence artifact** and the **go-get-evidence step (3.7)** are structural; "cite
       evidence" and "critique first" are rules nothing enforces. Label them as such rather than
       claiming enforcement that doesn't exist. Lanes are technical experts in their own surface and
@@ -366,25 +375,27 @@ only in this project. Put those in a project-hooks section or in the deployed sk
       - the convergence note records **what was contested and the tradeoff accepted**; if nothing was
         contested, say so explicitly — and a note recording *nothing contested* **surfaces in
         `cmd_status`** for the PM sweep, so the tell is read by someone rather than confessed to no one
-- `[ ]` 3.6 **RESEARCH FIRST — never assert or ask cold.** A mid-dialog question with multiple
+- `[x]` 3.6 **RESEARCH FIRST — never assert or ask cold.** A mid-dialog question with multiple
       defensible answers that depends on an external standard → **dispatch a research agent before
       taking a position** (`~/.claude/rules/common/research-before-asking.md`, applied lane-to-lane).
       Bring file paths / issue numbers / doc URLs, not opinions. Check `.brain/research/` first
       (83 notes — it may already be answered); drop a self-sufficient note when it isn't.
       *This is the other half of anti-sycophancy: two lanes trading unevidenced opinions converge on
       whoever is more confident.*
-- `[ ]` 3.7 **Deadlock protocol — go get evidence, then reconvene** (Steve, 2026-08-03). When two
+- `[x]` 3.7 **Deadlock protocol — go get evidence, then reconvene** (Steve, 2026-08-03). When two
       lanes are stuck, they **agree to go do research and/or thought partnership**, **share what they
       produce** (documents, reviews, research write-ups) with each other, **discuss it**, and
       **converge**. That is the entire procedure. It is a protocol *between the two lanes* — not an
       escalation to a referee, and not an escalation to Steve.
-- `[ ]` 3.8 **Name the split** (`docs/AUTONOMOUS_WORK.md` §3.1's own framing): *research finds what
+- `[x]` 3.8 **Name the split** (`docs/AUTONOMOUS_WORK.md` §3.1's own framing): *research finds what
       others do; thought partnership stress-tests what we should do.* Research when there's a
       documented answer; thought partnership when it's judgment. §3.1 already carries the full
       dispatch discipline — **cite it, don't restate it.**
       ⚠ §3.1 lives in the **main** worktree's copy — the `-pm` copy is 332 lines stale
 
-**Gate 3.G** `[ ]` A doc phase still needs a falsifiable gate, or it ships nothing and nobody notices.
+**Gate 3.G** `[x]` **PASSED 2026-08-03** — 78 lines measured; 3.G/16–18 positive scenarios + both
+guards green; every act-on rule is in the always-read part. Original gate text:
+A doc phase still needs a falsifiable gate, or it ships nothing and nobody notices.
 Always-read skill is **still ≤ ~80 lines** (M5 — measure it, don't estimate) · every rule an agent is
 expected to *act* on appears in the always-read part, not only the on-demand reference · **zero
 ERD-specific paths** in the generic template (M3 — `grep -c 'AUTONOMOUS_WORK\|\.brain/research' templates/navigation-standards.SKILL.md`
@@ -403,13 +414,13 @@ the gate would have verified one instance of agent compliance, not a mechanism.
 
 Task **3.7** carries the whole remaining rule. **Revisit only if a real deadlock actually occurs.**
 
-## Phase 4 — Presence field `[ ]` (convention · `templates/presence.md`) — CONCURRENT
+## Phase 4 — Presence field `[x]` (convention · `templates/presence.md`) — CONCURRENT
 
-- `[ ]` 4.1 Add optional `dialog_with:` to the presence schema
-- `[ ]` 4.2 Surface it in `cmd_status` so an open dialog is visible to other lanes and to Steve
+- `[x]` 4.1 Add optional `dialog_with:` to the presence schema
+- `[x]` 4.2 Surface it in `cmd_status` so an open dialog is visible to other lanes and to Steve
       (a conversation still open an hour later becomes visible rather than silent)
 
-**Gate 4.G** `[ ]` **scoped verify**, plus: a presence note **with** `dialog_with:` shows the open
+**Gate 4.G** `[x]` **PASSED 2026-08-03** (4.G/13a red + 13b/13c guards all green) — **scoped verify**, plus: a presence note **with** `dialog_with:` shows the open
 dialog in `brain status` · a note **without** it renders unchanged (the field is genuinely optional —
 13 existing notes must not break) · `brain reconcile` does not flag the new field as stealth-structural
 
