@@ -10,6 +10,13 @@
 set -u
 VERSION="1.0.0"
 
+# DM bounds. The body cap keeps the lock-free append below PIPE_BUF (where a single append is
+# atomic) and keeps one message from dominating a recipient's boot context; the inject caps keep
+# a large unread backlog from blowing that context window entirely.
+DM_MAX_BODY=4096
+DM_INJECT_MAX_LINES=40
+DM_INJECT_MAX_COLS=2000
+
 # ── Root discovery (fix A) — the one function everything reuses ───────────────────────────────
 # --git-common-dir resolves to the MAIN worktree's .git from any sibling worktree, so the brain
 # is always the one <main>/.brain/. Robust to a relative result (e.g. ".git" or "../.git").
@@ -130,8 +137,10 @@ _new_journal() {
 
 # ── Resolve the vault for the subcommands that need it ────────────────────────────────────────
 _require_brain() {
-  # Already resolved in this process (cmd-from-cmd composition) → skip the git exec.
-  [ -n "${BRAIN:-}" ] && [ -d "$BRAIN" ] && return 0
+  # Already resolved in this process (cmd-from-cmd composition) → skip the git exec. ROOT must
+  # be set too: every caller depends on it, and requiring both means an inherited BRAIN alone
+  # cannot redirect writes at a vault we never resolved.
+  [ -n "${BRAIN:-}" ] && [ -n "${ROOT:-}" ] && [ -d "$BRAIN" ] && return 0
   ROOT=$(brain_root) || _die "not inside a git repository"
   BRAIN="$ROOT/.brain"
   [ -d "$BRAIN" ] || _die "no brain here (run: brain init)"
@@ -190,13 +199,28 @@ cmd_announce() {
 # ── dm (direct lane-to-lane message; the fast path, NOT the record) ──────────────────────────
 # The journal stays the durable record and connections stay the state. A DM is the SIGNAL that
 # something changed — it exists to cut unblock latency from "next session boot" to seconds.
-_inbox_path() { printf '%s\n' "$BRAIN/dm/$1/inbox.jsonl"; }
+# A feature slug becomes a path segment under .brain/dm/, so validate it once here — every
+# inbox path in the engine flows through this function, and `brain dm`/`brain inbox` are on the
+# hook allowlist, i.e. callable without a permission prompt.
+_feat_ok() {
+  case "$1" in
+    ''|.*|*/*|*'..'*|*' '*) return 1 ;;
+  esac
+  return 0
+}
+
+_inbox_path() {
+  _feat_ok "$1" || _die "brain: invalid feature name '$1' (bare slug, no path separators)"
+  printf '%s\n' "$BRAIN/dm/$1/inbox.jsonl"
+}
 
 # The single owner of inbox creation: ensure a lane's inbox exists, print its path.
+# Returns non-zero if the inbox cannot be created — a caller that ignores that would report a
+# delivery that never happened.
 _inbox_ensure() {
-  _ie=$(_inbox_path "$1")
-  [ -d "${_ie%/*}" ] || mkdir -p "${_ie%/*}" 2>/dev/null
-  [ -f "$_ie" ] || : > "$_ie"
+  _ie=$(_inbox_path "$1") || return 1
+  [ -d "${_ie%/*}" ] || mkdir -p "${_ie%/*}" 2>/dev/null || return 1
+  [ -f "$_ie" ] || : > "$_ie" 2>/dev/null || return 1
   printf '%s\n' "$_ie"
 }
 
@@ -214,26 +238,43 @@ cmd_inbox() {
 # atomic, and _lock_acquire has no staleness break — one killed sender would wedge the
 # recipient's inbox forever. Journaling stays with the callers: one command invocation = one
 # journal line, never one per recipient.
-_dm_send() { # <from> <to> <msg> <ts>
-  _sb=$(_inbox_ensure "$2")
+_dm_send() { # <from> <to> <msg> <ts> — non-zero on ANY failure to store the message
+  _sb=$(_inbox_ensure "$2") || return 1
   _sl=$(jq -cn --arg f "$1" --arg t "$2" --arg ts "$4" --arg c "$3" \
     '{from:$f,to:$t,ts:$ts,content:$c}' 2>/dev/null) \
     || _die "brain dm: jq failed to encode the message"
-  printf '%s\n' "$_sl" >> "$_sb"
+  printf '%s\n' "$_sl" >> "$_sb" || return 1
 }
 
 # Rotate a non-empty inbox to the read archive and print the archived path; silent no-op on a
 # missing/empty inbox (seam 0.3b). `mv` (not read-in-place) is what makes boot delivery
 # exactly-once; `<ts>-<pid>` (task 2.1) makes same-second rotations collision-free — each boot
 # is its own process, so $$ differs even when the clock does not.
+# Returns 0 (silent) when there is nothing to rotate, 0 + the archive path on success, and
+# non-zero when rotation FAILED — the caller must tell those apart, because a failed rotation
+# leaves real unread messages sitting in the inbox where nothing else will surface them.
 _inbox_rotate() {
-  _ri=$(_inbox_path "$1")
+  _ri=$(_inbox_path "$1") || return 1
   [ -s "$_ri" ] || return 0
   _rr="${_ri%/*}/read"                       # derived from the path authority, not rebuilt
-  if [ ! -d "$_rr" ]; then mkdir -p "$_rr" 2>/dev/null || return 1; fi
+  if [ ! -d "$_rr" ]; then mkdir -p "$_rr" || return 1; fi
   _ra="$_rr/$(_now_compact)-$$.jsonl"
-  mv "$_ri" "$_ra" 2>/dev/null || return 1
+  mv "$_ri" "$_ra" || return 1
   printf '%s\n' "$_ra"
+}
+
+# Bounded render of a jsonl transcript for injection into a session's startup context: an
+# unbounded backlog would otherwise consume the receiving lane's context window.
+_dm_digest() {
+  _dgn=$(wc -l < "$1" 2>/dev/null | tr -d ' ') || _dgn=0
+  [ -n "$_dgn" ] || _dgn=0
+  if [ "$_dgn" -gt "$DM_INJECT_MAX_LINES" ]; then
+    printf '(%s earlier message(s) omitted — full transcript: %s)\n' \
+      "$((_dgn - DM_INJECT_MAX_LINES))" "$1"
+    tail -n "$DM_INJECT_MAX_LINES" "$1" | cut -c1-"$DM_INJECT_MAX_COLS"
+  else
+    cut -c1-"$DM_INJECT_MAX_COLS" < "$1"
+  fi
 }
 
 cmd_dm() {
@@ -244,6 +285,10 @@ cmd_dm() {
   # whoami already falls back to BRAIN_FEATURE, so empty here can only mean "system"
   _from=$(cmd_whoami); _from=${_from:-system}
   _ts=$(_now_iso)
+  # Bound the body: the lock-free append is atomic only below PIPE_BUF, and a huge body would
+  # also dominate the recipient's boot context. Anything larger belongs in a connection note.
+  [ "${#_msg}" -le "$DM_MAX_BODY" ] || \
+    _die "brain dm: message too long (${#_msg} > $DM_MAX_BODY chars) — put it in a connections/ note and DM the pointer"
 
   if [ "$_to" = "all" ]; then
     # Broadcast (task 1.6): every registered presence note, skip self only. Deliberately NOT
@@ -254,21 +299,31 @@ cmd_dm() {
       [ -e "$_pn" ] || continue
       _rcpt=$(_agent_slug "$_pn")
       [ "$_rcpt" = "$_from" ] && continue
-      _dm_send "$_from" "$_rcpt" "$_msg" "$_ts"
-      _n=$((_n + 1))
+      if _dm_send "$_from" "$_rcpt" "$_msg" "$_ts"; then
+        _n=$((_n + 1))
+      else
+        _warn "brain dm: could NOT deliver to @$_rcpt (check .brain/dm/$_rcpt/)"
+        _failed="${_failed:-} @$_rcpt"
+      fi
     done
-    [ "$_n" -gt 0 ] || _die "brain dm: no other registered features to broadcast to"
-    _announce_as "$_from" "dm → @all (broadcast to $_n inboxes; transcripts under .brain/dm/)"
-    printf 'dm → @all (%s inboxes)\n' "$_n"
-    return 0
+    [ "$_n" -gt 0 ] || _die "brain dm: broadcast delivered to nobody${_failed:+ (failed:$_failed)}"
+    _announce_as "$_from" "dm → @all (broadcast to $_n inboxes; transcripts under .brain/dm/)${_failed:+ — FAILED:$_failed}"
+    printf 'dm → @all (%s inboxes)%s\n' "$_n" "${_failed:+ — FAILED:$_failed}"
+    [ -z "${_failed:-}" ]      # partial delivery is a non-zero exit, not a success
+    return $?
   fi
 
   [ -f "$BRAIN/presence/$_to.md" ] || _die "brain dm: no registered feature '$_to' (see brain status)"
   [ "$_from" = "$_to" ] && _die "brain dm: refusing to send to yourself ($_from)"
-  _dm_send "$_from" "$_to" "$_msg" "$_ts"
+  # A failed store must never be announced as a delivery — the journal is committed, so a false
+  # "delivered" line is worse than a loud failure.
+  _dm_send "$_from" "$_to" "$_msg" "$_ts" \
+    || _die "brain dm: could not write to @$_to's inbox — nothing sent (check .brain/dm/$_to/)"
   # Call-log line, never the body (task 1.2, Steve's call): the journal is committed and the
   # secret scan cannot see a mid-line body; the pointer keeps the transcript retrievable.
-  _announce_as "$_from" "dm → @$_to (transcript: $(_inbox_path "$_to"))"
+  # Vault-relative on purpose — this line is committed and read on other machines, where an
+  # absolute path is meaningless; and name where it moves, since boot rotation archives it.
+  _announce_as "$_from" "dm → @$_to (transcript: .brain/dm/$_to/inbox.jsonl, then read/ once delivered)"
   printf 'dm → @%s\n' "$_to"
 }
 
@@ -349,6 +404,12 @@ cmd_status() {
 cmd_new_feature() {
   _require_brain
   _slug=${1:-}; [ -n "$_slug" ] || _die "usage: brain new-feature <slug>"
+  _feat_ok "$_slug" || _die "invalid feature slug: '$_slug' (bare slug, no path separators)"
+  # 'all' would be swallowed by the dm broadcast keyword and 'system' is the unresolved-sender
+  # fallback — a lane registered under either becomes unreachable by name.
+  case "$_slug" in
+    all|system) _die "reserved feature name: '$_slug' (brain dm @all is the broadcast; 'system' is the fallback author)" ;;
+  esac
   _note="$BRAIN/presence/$_slug.md"
   [ -f "$_note" ] && _die "feature already registered: $_slug"
 
@@ -499,6 +560,21 @@ _days_ago() {
 cmd_commit() {
   _require_brain
   _lock_acquire commit || _die "another brain commit is in progress"
+  # Self-healing invariant: dm/ MUST be ignored. cmd_init writes .gitignore only on a fresh
+  # scaffold (and --force is forbidden on a live vault), so a vault initialized before the DM
+  # feature would otherwise commit inbox bodies — which the line-anchored secret scan below
+  # cannot see, since a jsonl line starts with '{'.
+  if [ -d "$BRAIN/dm" ] && ! grep -qxF 'dm/' "$BRAIN/.gitignore" 2>/dev/null; then
+    printf 'dm/\n' >> "$BRAIN/.gitignore" \
+      && _warn "added missing 'dm/' to .brain/.gitignore — DM inboxes must never be committed"
+  fi
+  # …and the ignore line alone is not enough: gitignore does not un-stage. Anything that ran
+  # `git add` before this point (another agent, a prior session) already has inboxes in the
+  # index, where the line-anchored secret scan below cannot see them either.
+  if git -C "$ROOT" diff --cached --name-only -- .brain/dm 2>/dev/null | grep -q .; then
+    git -C "$ROOT" rm -r --cached -q --ignore-unmatch -- .brain/dm 2>/dev/null \
+      && _warn "un-staged .brain/dm/ — DM inboxes are per-machine and must never be committed"
+  fi
   # secret scan staged .brain/ content. Extra denylist terms (one per line, '#' comments ok) come
   # from $BRAIN_SECRET_DENYLIST or, by default, <vault>/secret-denylist.txt (optional — absent = skip).
   _deny="${BRAIN_SECRET_DENYLIST:-$BRAIN/secret-denylist.txt}"
@@ -671,12 +747,21 @@ _hook_session_start() {
   # (b2) rotate → deliver → arm, in that order (task 2.1): the watcher attaches at end-of-file,
   # so anything already in the inbox would be invisible — rotate it out, inject it, then
   # re-create the empty inbox to arm on. `mv` makes delivery exactly-once across boots.
-  _arc=$(_inbox_rotate "$_feat")
+  _arc=$(_inbox_rotate "$_feat"); _rot_rc=$?
   _ib=$(cmd_inbox "$_feat")
   _dm_block=""
   if [ -n "$_arc" ]; then
     _dm_block="Unread DMs delivered while you were away (archived: $_arc):
-$(cat "$_arc")
+$(_dm_digest "$_arc")
+
+"
+  elif [ "$_rot_rc" != 0 ] && [ -s "$_ib" ]; then
+    # Rotation failed but messages are really there: deliver in place rather than boot silent.
+    # This trades exactly-once for at-least-once (they re-report next boot) — the honest trade,
+    # and the _warn reaches .hook-errors.log via cmd_hook's stderr redirect.
+    _warn "brain: could not rotate @$_feat's inbox — delivering in place; fix perms under .brain/dm/$_feat/"
+    _dm_block="Unread DMs — NOT archived, inbox rotation FAILED, so these repeat next boot:
+$(_dm_digest "$_ib")
 
 "
   fi
