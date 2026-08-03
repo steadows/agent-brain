@@ -1,8 +1,9 @@
 # Agent-Brain Lane DM — GSD Plan
 
-**Status:** `[~]` P0–P4 ✅ DONE 2026-08-03 — suite frozen (4-round audit), then GREEN landed:
-**24/24 scenarios pass** (engine + hook + protocol + presence). **Next is Phase 5 deploy — STOP:
-machine-wide and instant for all 13 lanes; needs Steve's go**
+**Status:** `[~]` P0–P4 ✅ + gates 7.1 (/simplify) and 7.2 (5-agent review + Codex adversarial)
+✅ DONE 2026-08-03 — 24/24 green, all review fixes landed. **Steve ruled 2026-08-03: SHIP —
+deploy v1 with the 3 concurrency limits documented (v1.1 queue follow-up in ROADMAP). Next is
+Phase 5 deploy (per the corrected 5.1→5.4 sequence), then P6 live e2e.**
 **Owner:** @pm · **Repo:** `~/agent-brain` (branch `fix/pretool-collision-warning`) → deployed to `<main-worktree>/.brain/`
 **Evidence:** `docs/research/agent-lane-dm-mechanisms-eval.md` (E0–E15) in `enterprise_research_dashboard-pm`
 **Predecessor:** `~/agent-brain/docs/AGENT-DM-CHANNELS.md` (2026-06-15, superseded in part)
@@ -525,7 +526,14 @@ that proves it
 
 ---
 
-## Open — adversarial review, design-level (Steve's call before Phase 5)
+## Open — adversarial review, design-level — ✅ DECIDED (Steve, 2026-08-03): SHIP AS-IS
+
+**Ruling:** ship v1 with #1/#6/#11 as **documented known limits**; address after the feature is
+deployed, up and running, and live-tested (P5/P6). The fix is the per-message-file queue below —
+scheduled as the **v1.1 follow-up** (recorded in ROADMAP.md), reopening the frozen suite through
+`test-writer` + `spec-watchdog`. All three limits need split-second concurrency to trigger, and
+the fallback is today's status quo (the information still arrives via journal/connections at next
+boot).
 
 Full report: `docs/lane-dm-adversarial-review-findings.md` (Codex, single agent). Findings
 2/3/4/5/7/8/9/10 are **fixed**; these three are not, because each points at the *append-to-one-JSONL*

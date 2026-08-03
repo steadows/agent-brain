@@ -39,6 +39,25 @@ v1 is filesystem-only and deliberately small; this is the backlog for "further d
 
 ---
 
+## v1.1 — DM per-message queue (deferred-by-decision, Steve 2026-08-03)
+
+Ship-blocking? No — but these three adversarial-review findings (full report:
+`docs/lane-dm-adversarial-review-findings.md`) are **accepted known limits of v1's
+one-shared-JSONL-inbox design**, to be fixed together once the DM feature is deployed and
+live-tested:
+
+- **#1 (HIGH)** a send racing boot-time rotation is permanently stranded in the `read/` archive
+  (never surfaced at any boot) — the old "delayed, not lost" acceptance was wrong and is withdrawn;
+- **#6 (MEDIUM)** the no-lock append's atomicity premise is false (`PIPE_BUF` governs pipes, not
+  regular-file appends; the body cap counts chars, not encoded bytes);
+- **#11 (MEDIUM)** two live sessions of one lane both consume every message (no receiver claim).
+
+**The one fix for all three:** one file per message — write to a temp name, atomic `rename` into
+`dm/<lane>/pending/`, atomic claim at delivery. Removes the interleaving surface entirely, makes
+the size cap irrelevant to atomicity, gives claim/ack a natural home. **Cost:** changes the
+storage contract the frozen `test/dm.sh` pins → the suite reopens through the `test-writer` +
+`spec-watchdog` pair. Roughly one session of work.
+
 ## Decisions recorded (won't-do / deferred-by-design)
 
 - **`whoami` worktree-path fallback for detached HEAD — NOT building.**
