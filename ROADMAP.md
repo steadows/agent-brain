@@ -27,7 +27,9 @@ v1 is filesystem-only and deliberately small; this is the backlog for "further d
    the *main* worktree (e.g. while doing cross-worktree work) gets stamped `langgraph-runtime` (or
    whatever owns `main`). The live agents already hit this and worked around it with a manual
    `[attribution corrected: …]` note. **Workaround:** `BRAIN_FEATURE=<feature> brain announce …`.
-   **Enhancement:** a `brain announce --as <feature>` flag.
+   **Enhancement:** a `brain announce --as <feature>` flag. **Half-built:** the DM work added an
+   internal `_announce_as <feat> <msg>` seam (the journal writer with identity supplied by the
+   caller) — exposing the flag is now just arg-parsing on `cmd_announce`, not new plumbing.
 
 3. **Research notes drift from the template schema.**
    `research/` is the most free-form note type, and agents have written valid-but-off-template
@@ -81,16 +83,22 @@ self-tests, so an overnight run can evolve the engine without ever hanging on it
 
 ## Smaller enhancements (nice-to-have)
 
-- **A real test suite.** v1 was proven by running (the BUILD-SPEC §10 scenarios). Capture those as a
+- **A real test suite.** _Partly delivered:_ `test/dm.sh` (24 scenarios) now exists, built exactly
+  this way — temp-repo fixtures via the `BRAIN_TEST_BRANCH` / `BRAIN_SKILLS_DIR` /
+  `BRAIN_GLOBAL_SETTINGS` seams — but it covers the **DM slice only**. The pre-existing surface
+  below is still uncovered; extend the same harness rather than starting a second one.
+  v1 was proven by running (the BUILD-SPEC §10 scenarios). Capture those as a
   `test/` script (temp-repo init → new-feature → whoami edge cases → reconcile resolve/downgrade →
   governance → hooks) so regressions are caught mechanically. The `BRAIN_TEST_BRANCH` env override and
   `BRAIN_SKILLS_DIR` / `BRAIN_GLOBAL_SETTINGS` redirects already exist for exactly this.
 - **`brain connect <a> <b> <kind>`** helper to scaffold a connection from the template (connections
   are free-to-create today, so a template suffices, but a helper would enforce the deterministic slug).
 - **`brain research <topic>`** helper to scaffold a research note.
-- **Re-add the PostToolUse fast-awareness hook** (shell-only, mtime-gated, @mention-only) if
-  between-actions latency on `@mentions` ever bites — currently a mention lands at the next session
-  start or the next pre-tool gate.
+- ~~**Re-add the PostToolUse fast-awareness hook**~~ — **superseded** by `brain dm` (lane-to-lane
+  DM). The latency this item existed to fix ("a mention lands at the next session start") is now
+  addressed by a different mechanism: an inbox file the receiving agent watches, delivering in
+  seconds without a third hook firing on every tool call. Revisit only if watching proves
+  unreliable in practice.
 - **An Obsidian workspace preset** (`.obsidian/` is gitignored, but a shipped, opt-in graph-view
   config could make the human dashboard nicer out of the box).
 

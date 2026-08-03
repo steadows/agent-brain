@@ -27,6 +27,7 @@
   connections/                      seeded: the 6 real cross-feature edges
   journal/<today>.md                seeded init line
   research/                         empty (grown live)
+  dm/                               per-lane DM inboxes + read/ archives — GITIGNORED, per-machine
   INDEX.md                          static map + pointer to `brain status`
   CHANGES.md                        the governance changelog (structural changes)
   .indexignore                      reserved for Phase 2 (templates/ + bin/); empty-effect in v1
@@ -80,6 +81,14 @@ Portable POSIX sh, no Claude-specific deps. Subcommands:
   `owns_branches` (precise rule + the four real features in **§2a**); (3) on multi-match, disambiguate
   by `current_worktree`; (4) still ambiguous → **print nothing + exit non-zero** (refuse to guess).
   Empty result = not a brain branch.
+- **`brain dm @<feature>|@all "<msg>"`** — the **fast tier**: append one jq-encoded JSON line
+  (`from`/`to`/`ts`/`content`) to `dm/<feature>/inbox.jsonl`, reaching a running lane in seconds;
+  `@all` fans into every registered inbox but the sender's (never gated on apparent liveness).
+  **No lock** on the send path (a single sub-`PIPE_BUF` append is atomic; a lock with no staleness
+  break would let one killed sender wedge an inbox forever) and the body is length-capped to keep
+  that true. The journal gets a **call-log line only, never the body** — `journal/` is committed
+  and the secret scan is line-anchored, so a mid-line body would be invisible to it.
+- **`brain inbox [<feature>]`** — print (and create) the inbox path an agent watches.
 - **`brain announce "<msg>"`** — atomic-append `- <ISO-time> <feature> — <msg>` to today's journal
   (auto-creates the daily file). The single canonical journal writer (agents + hooks).
 - **`brain status`** — print the text dashboard: active features (status active/blocked, or idle with
@@ -215,6 +224,12 @@ Both are thin wrappers calling `brain hook <event>`; both **fail-open** (drop a 
      (slug from branch; harmless if ignored on a non-brain worktree — an optional committed
      `templates/non-brain-globs` suppresses it). Keeps M9 (agent onboards itself; human never runs it).
    - **(b)** cache `BRAIN_FEATURE` for the session.
+   - **(b2) rotate → deliver → arm (DM).** If `dm/<me>/inbox.jsonl` is non-empty, `mv` it to
+     `dm/<me>/read/<ts>-<pid>.jsonl`, inject its (bounded) contents, then arm on the now-empty
+     inbox. Order is load-bearing: a watcher attaches at end-of-file, so mail already sitting in
+     the inbox is invisible to it — without the rotate a DM to a *down* lane is lost, not queued.
+     `mv` (not read-in-place) is what makes delivery **exactly once**. A failed rotation warns to
+     `.hook-errors.log` and delivers in place rather than booting silent.
    - **(c)** run `brain reconcile` (cheap auto-fixes — robust to never-wraps).
    - **(d)** inject "run the `navigation-standards` skill" + `brain status` (incl. relevant **recent
      journal lines** since `updated`, the agents+connections summary, and the `CHANGES`/error banners).

@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — lane-to-lane DM
+
+Adds a **fast tier** to coordination. Until now every signal travelled at the speed of the
+other lane's next session boot; `brain dm` reaches a running lane in seconds, which removes
+the human from the relay loop between two lanes that are both already awake.
+
+- **`brain dm @<feature> "<msg>"`** — one jq-encoded JSON line (`from`/`to`/`ts`/`content`)
+  appended to `.brain/dm/<feature>/inbox.jsonl`. No lock on the send path: a single
+  sub-`PIPE_BUF` append is atomic, and a lock with no staleness break would let one killed
+  sender wedge a lane's inbox permanently. Bodies are capped (`DM_MAX_BODY`) to keep that
+  premise true.
+- **`brain dm @all "<msg>"`** — fans into every registered inbox (skipping the sender), for
+  status broadcast and merge coordination. Deliberately not gated on who looks "live":
+  presence `updated:` is not a liveness signal.
+- **`brain inbox [<feature>]`** — prints (and creates) the inbox path an agent watches.
+- **SessionStart now rotates → delivers → arms.** A DM sent to a lane that is *down* used to
+  be lost, because a watcher attaches at end-of-file. The hook now `mv`s a non-empty inbox to
+  `dm/<lane>/read/<ts>-<pid>.jsonl`, injects it into the startup context, then arms on an
+  empty file — so delivery is **exactly once**, and a dormant lane reads its mail when it
+  wakes. Injected content is bounded so a large backlog can't blow the lane's context window.
+- **The journal records a call log, never the message body** — `dm → @lane (transcript: …)`.
+  `journal/` is committed and the secret scan is line-anchored, so a body written mid-line
+  would be invisible to it. `dm/` is gitignored, and `brain commit` now self-heals that
+  invariant (and un-stages inboxes) for vaults initialised before this feature.
+- **`dialog_with:`** — optional presence field, surfaced by `brain status`, so a lane-to-lane
+  dialog left open an hour later is visible rather than silent.
+- **Protocol** — the always-read nav skill gains the DM tier, triage rules, and the merge
+  handshake; `templates/DM-PROTOCOL.md` carries the full dialog/anti-sycophancy/deadlock
+  reference on demand, keeping the per-session context tax flat.
+- **`test/dm.sh`** — the repo's first test suite (24 scenarios, temp-repo fixtures), the thing
+  ROADMAP has wanted since v1.
+
 ## v1.0.1 — 2026-08-02
 
 Fix: the PreToolUse collision warning never reached the agent. Two dead switches in series

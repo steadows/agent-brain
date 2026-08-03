@@ -27,6 +27,7 @@ A `.brain/` vault at the repo's main worktree, shared by every agent through its
   presence/      one note per FEATURE — where each agent is (status, phase, branch, files it touches)
   connections/   the cross-feature blackboard — clash · shared-file · waiting-on · shared-rule
   journal/       append-only daily comms timeline (the three "announce" moments)
+  dm/            per-lane DM inboxes + read archives — PER-MACHINE, gitignored, never committed
   research/      shared, self-sufficient findings — the durable home research never had
   bin/brain      the engine (this script travels with the vault)
   templates/     the blank schemas that make it project-agnostic
@@ -113,6 +114,8 @@ and no-ops in every repo without a brain). `brain install` is what puts them the
 | `brain whoami` | resolve the current feature (empty = not a brain branch) |
 | `brain status` | live dashboard: active features, connections touching you, change/error banners |
 | `brain announce "<msg>"` | atomic-append a line to today's journal |
+| `brain dm @<feature>\|@all "<msg>"` | direct-message a lane's inbox — seconds, not next boot (`@all` = every lane but you) |
+| `brain inbox [<feature>]` | print (and create) a lane's DM inbox path — what an agent watches |
 | `brain reconcile [--check]` | validate + cheap auto-fixes (`--check` = validate only, no mutation) |
 | `brain commit` | durability: path-scoped, locked, secret-scanned, ff-only |
 | `brain wrap` | self-contained session closeout: reconcile + commit (from the main worktree) |
