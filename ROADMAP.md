@@ -39,12 +39,19 @@ v1 is filesystem-only and deliberately small; this is the backlog for "further d
 
 ---
 
-## v1.1 — DM per-message queue (deferred-by-decision, Steve 2026-08-03)
+## v1.1 — DM per-message queue (⚠ PROMOTED TO SHIP-BLOCKING, Steve 2026-08-03 evening)
 
-Ship-blocking? No — but these three adversarial-review findings (full report:
-`docs/lane-dm-adversarial-review-findings.md`) are **accepted known limits of v1's
-one-shared-JSONL-inbox design**, to be fixed together once the DM feature is deployed and
-live-tested:
+> **Status changed the same day it was written.** The 7.4 ultrareview (report:
+> `docs/lane-dm-ultrareview-findings.md`, verdict NOT READY) found a crash-consistency defect
+> that needs **no concurrency at all**: SessionStart moves the inbox to the terminal `read/`
+> archive *before* digesting or emitting it, and nothing ever scans `read/` again — an
+> interrupted boot loses those messages permanently. That is qualitatively worse than the three
+> races below, which only *delay* a message. **Steve ruled: this rewrite lands BEFORE any deploy
+> — v1 does not ship with a window that silently loses mail.** It also absorbs ultrareview
+> findings UR-1, UR-3 and UR-4a; full disposition of all 10 in `AGENT_BRAIN_DM_GSD_PLAN.md` §7.5.
+
+The three findings below (full report: `docs/lane-dm-adversarial-review-findings.md`) are the
+**known limits of v1's one-shared-JSONL-inbox design** that motivated the rewrite:
 
 - **#1 (HIGH)** a send racing boot-time rotation is permanently stranded in the `read/` archive
   (never surfaced at any boot) — the old "delayed, not lost" acceptance was wrong and is withdrawn;
@@ -57,6 +64,21 @@ live-tested:
 the size cap irrelevant to atomicity, gives claim/ack a natural home. **Cost:** changes the
 storage contract the frozen `test/dm.sh` pins → the suite reopens through the `test-writer` +
 `spec-watchdog` pair. Roughly one session of work.
+
+**Added acceptance criteria from the ultrareview** (these are what make the rewrite ship-blocking,
+not optional polish):
+
+- **Delivery must be recoverable, never terminal-before-success** (UR-1). A message stays
+  replayable until handoff to the session actually succeeded; stale claims are recovered on a
+  later boot. **Prefer duplicate delivery over silent loss.** Test kill-after-claim and
+  digest/emit failure.
+- **A live-observed message must be claimed, not just seen** (UR-3). Today the watcher observes an
+  append and mutates nothing, so the next boot rotates and re-injects a message the lane already
+  acted on. Stable IDs + atomic claim/ack. Test live-read → reboot.
+- **The commit guard's cleanup must not wedge** (UR-4a). Once an inbox is already tracked,
+  `git rm --cached` stages a deletion that the guard's own final check reads as failure — and no
+  retry can clear it. Build and scan a sanitized temporary index; commit that, without pathspec
+  semantics. Test legacy-tracked inbox and repeated `brain commit`.
 
 ## Decisions recorded (won't-do / deferred-by-design)
 

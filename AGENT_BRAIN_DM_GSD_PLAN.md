@@ -534,9 +534,57 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
       SessionStart and validates NOTHING (no symlink check on inbox or `read/`), and
       `_inbox_ensure` never checks the `dm` root — so the symlink hardening is bypassable.
       ⚠ The sandbox blocked `./test/dm.sh` (`mktemp` denied), so the review does NOT claim
-      24/24 green — that gate must be re-run orchestrator-side. **AWAITING STEVE'S CALL on
-      disposition** (several findings overlap the queued v1.1 per-message-queue redesign).
-- `[ ]` 7.5 Address CRITICAL/HIGH from every gate before merge; fix MEDIUM where reasonable.
+      24/24 green — that gate must be re-run orchestrator-side. **Re-run by the orchestrator
+      2026-08-03: 24/24 green, exit 0 (unpiped).**
+      **STEVE RULED 2026-08-03: do the v1.1 per-message-queue rewrite FIRST, deploy once.** No v1
+      deploy with a crash-loses-messages window. Full disposition of all 10 findings in 7.5.
+- `[~]` 7.5 **Disposition of the 10 ultrareview findings — every one has an owner, nothing dropped.**
+      Steve's ruling 2026-08-03: v1.1 rewrite lands before any deploy. Three buckets:
+
+      **A. Absorbed by the v1.1 per-message-queue rewrite** (the redesign already in `ROADMAP.md`;
+      these are its acceptance criteria, not separate work):
+      - `[ ]` **UR-1 (HIGH)** retire-before-deliver loses messages on interrupt → the queue's
+            `pending/claimed/acked` lifecycle, with recovery of stale claims. Prefer duplicate
+            delivery over silent loss.
+      - `[ ]` **UR-3 (MED)** a live-read DM replays as unread at next boot → stable message IDs +
+            atomic claim/ack. Needs a live-read → reboot scenario.
+      - `[ ]` **UR-4a (MED)** `cmd_commit`'s cleanup wedges permanently once an inbox is already
+            tracked (`git rm --cached` stages a deletion the final check reads as failure, forever)
+            → sanitized temporary index, no pathspec commit.
+
+      **B. Small, self-contained code fixes — required before deploy regardless of the rewrite:**
+      - `[ ]` **UR-2 (HIGH)** symlink hardening bypassed: validate `dm` root + lane dir + inbox +
+            `read/` before EVERY read/append/move, and add the checks `_inbox_rotate` lacks
+            entirely. ⚠ POSIX `sh` cannot do `openat`/`O_NOFOLLOW`, so the same-user TOCTOU
+            residual stays a documented limit — close the parity gap, do not overclaim.
+      - `[ ]` **UR-4b (MED)** the ignore check greps `.gitignore` for a literal `dm/` line, which
+            does not establish effective ignore behaviour (a later negation re-includes it) →
+            `git check-ignore --no-index`.
+      - `[ ]` **UR-7 (MED)** `cmd_install` checks neither `mkdir` nor `cp`, so it can print success
+            over a partial/stale skill → check every operation, copy to a same-dir temp and
+            atomically rename. Pre-existing code, but the branch makes it a deploy dependency.
+
+      **C. Procedure + honesty — little or no engine code:**
+      - `[ ]` **UR-5 (MED)** rollback strands pending DMs (old engine cannot read them, and old
+            ignore state may stage the bodies) → `dm/` ignore becomes a permanent forward-compatible
+            invariant; drain/quiesce inboxes before any downgrade. Deploy-runbook item.
+      - `[ ]` **UR-6 (MED)** the atomic swap does not re-arm sessions already running under the old
+            engine → **Phase 5/6 gain an explicit restart-and-ack gate for every active lane before
+            DM is declared live.** Fold into the P5 sequence.
+      - `[ ]` **UR-8 (MED)** `templates/DM-PROTOCOL.md` promises `announce` reaches every lane at
+            next boot; `_recent_journal` surfaces only today's last 5 lines naming the lane or an
+            explicit `@recipient`, so a generic announcement is invisible. → **Narrow the doc to
+            what the code does** (cheap + honest); per-lane journal cursors only if we actually
+            want the capability. A doc-lie is worse than a missing feature — lanes act on it.
+
+      **D. Frozen-suite holes — ride along free** (the suite reopens for the rewrite anyway; both
+      route through `test-writer` + `spec-watchdog`, unconditional):
+      - `[ ]` **UR-9 (MED)** no DM scenario sends JSON-special content, so a naïvely interpolated
+            encoder would pass every assertion → send `"`, `\`, tab and an internal newline; assert
+            one physical record + exact round-trip.
+      - `[ ]` **UR-10 (MED)** the "never journal the body" scenarios reject only literal fragments,
+            so `base64(content)` on the call-log line passes → pin the call-log grammar, or assert
+            body-independence across two different bodies.
 
 **Gate 7.G** `[ ]` **scoped verify** green on the final diff · no unaddressed CRITICAL/HIGH · the five
 "Done when" conditions demonstrably met, each pointing at the scenario in `test/dm.sh` or the P6 run
