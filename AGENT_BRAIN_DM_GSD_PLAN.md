@@ -525,6 +525,17 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
       line count. **PULLED AHEAD of deploy (Steve, 2026-08-03)** — runs on the full branch diff
       (`main...HEAD`) pre-PR; Phase 5 deploy is gated on this returning with CRITICAL/HIGH
       addressed. Brief: `docs/prompts/lane-dm-ultrareview.md`.
+      **RETURNED 2026-08-03 — verdict NOT READY.** 8-reviewer fleet, every candidate re-verified
+      by two non-originating reviewers with confidence scores. **10 findings: 2 HIGH + 8 MEDIUM**
+      — report committed at `docs/lane-dm-ultrareview-findings.md`. Both HIGHs independently
+      confirmed against source by the orchestrator: (1) SessionStart `mv`s the inbox to terminal
+      `read/` BEFORE digesting/emitting, and nothing ever scans `read/` — a crash between the two
+      loses messages permanently, no concurrency needed; (2) `_inbox_rotate` runs FIRST at
+      SessionStart and validates NOTHING (no symlink check on inbox or `read/`), and
+      `_inbox_ensure` never checks the `dm` root — so the symlink hardening is bypassable.
+      ⚠ The sandbox blocked `./test/dm.sh` (`mktemp` denied), so the review does NOT claim
+      24/24 green — that gate must be re-run orchestrator-side. **AWAITING STEVE'S CALL on
+      disposition** (several findings overlap the queued v1.1 per-message-queue redesign).
 - `[ ]` 7.5 Address CRITICAL/HIGH from every gate before merge; fix MEDIUM where reasonable.
 
 **Gate 7.G** `[ ]` **scoped verify** green on the final diff · no unaddressed CRITICAL/HIGH · the five
