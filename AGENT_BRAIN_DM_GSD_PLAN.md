@@ -1,7 +1,8 @@
 # Agent-Brain Lane DM — GSD Plan
 
-**Status:** `[~]` Phase 0 IN PROGRESS — plan review closed + 0.3 seams decided 2026-08-03;
-**next is 0.4/0.5 frozen RED**, which gates all code
+**Status:** `[~]` Phase 0 ✅ CLOSED 2026-08-03 (Gate 0.G: suite FROZEN after a 4-round
+adversarial audit — 24 scenarios, 25 mutations driven, 2 declared residuals); **next is Phase 1
+transport GREEN** against the frozen suite
 **Owner:** @pm · **Repo:** `~/agent-brain` (branch `fix/pretool-collision-warning`) → deployed to `<main-worktree>/.brain/`
 **Evidence:** `docs/research/agent-lane-dm-mechanisms-eval.md` (E0–E15) in `enterprise_research_dashboard-pm`
 **Predecessor:** `~/agent-brain/docs/AGENT-DM-CHANNELS.md` (2026-06-15, superseded in part)
@@ -186,7 +187,7 @@ manufacture evidence of compliance nobody checked.
 
 ---
 
-## Phase 0 — Plan review · seams · frozen RED `[~]`
+## Phase 0 — Plan review · seams · frozen RED `[x]`
 
 - `[x]` 0.1 Fable agent plan review in a fresh session — **READY WITH CHANGES** (1 critical, 3 high,
       5 medium, 3 low, 4 factual errors). Verified plan claims against `bin/brain` source + deployed,
@@ -214,8 +215,9 @@ manufacture evidence of compliance nobody checked.
       broadcast journal line. Journaling stays in the command, never the helper, so one invocation
       = one journal line — the fan-out must not produce 13.
       **(b) Rotation is one new helper; ensure-exists is reused, not duplicated.**
-      `_inbox_rotate <feat>` does the `mv` → `dm/<feat>/read/<ts>.jsonl` (no-op on empty/missing)
-      and prints the archived path. `_hook_session_start` composes: `_inbox_rotate` → inject
+      `_inbox_rotate <feat>` does the `mv` → `dm/<feat>/read/<ts>-<pid>.jsonl` (no-op on
+      empty/missing; the `-<pid>` suffix ratified under 2.1 makes same-second rotations
+      collision-free) and prints the archived path. `_hook_session_start` composes: `_inbox_rotate` → inject
       contents → `cmd_inbox` to re-create the empty inbox (it already owns mkdir+touch+print).
       `_inbox_path` stays the single path authority.
       **(c) Yes — one `make_vault` fixture helper inside `test/dm.sh`.** Builds a throwaway git
@@ -230,19 +232,36 @@ manufacture evidence of compliance nobody checked.
       committed with the vault, and `brain install` cp's *from* it, so the project layer survives
       installs and is only clobbered by the forbidden `init --force` (5.4). Gate 3.G's grep runs
       against this repo's generic template. Deploy consequence folded into 5.3.
-- `[ ]` 0.4 **RED — `test/dm.sh`, authored by `test-writer`.** Captures every gate below as an
+- `[x]` 0.4 **RED — `test/dm.sh`, authored by `test-writer`.** Captures every gate below as an
       executable temp-repo scenario, per `ROADMAP.md:76-78`. **The orchestrator does not write this
       file** — `enforce-tdd-pair.py` denies it at the tool layer, and the rule is unconditional
       regardless. Must fail against the current engine before any GREEN line is written.
-- `[ ]` 0.5 **`spec-watchdog` audit of the frozen suite** — separate pass, dispatched at the finished
+      **Done 2026-08-03:** 24 scenarios (20 red + 4 guards), one `make_vault` fixture, all under
+      `mktemp -d`; shellcheck clean.
+- `[x]` 0.5 **`spec-watchdog` audit of the frozen suite** — separate pass, dispatched at the finished
       files with `Bash` so it can run them. Hunting the hollow suite: an assertion that would pass
       against the unmodified engine, a scenario narrower than the gate it claims to encode, the
       exactly-once check that never actually boots twice.
+      **Done 2026-08-03 — FOUR rounds, not one.** The watchdog built an honest reference
+      implementation (proving every scenario reachable), then drove 25 single-point mutations:
+      round 1 found 6 CRITICALs (deliver-once-ever; truncated body leak; liveness-gated broadcast;
+      archive destroyed by same-name mv; global lock; echo-to-sender), round 2 found the
+      multi-message-queue hole (deliver-newest-only passed) + 3 MAJORs, round 3 found the
+      sender-attribution hole (contents-only injection passed) + the suffix-distinctness
+      overclaim, round 4 returned CLEAN. Two residuals ACCEPTED AND DECLARED in the suite's
+      comments: a clock-derived archive suffix (plan ratifies `-<pid>`; enforced at review) and
+      roster-gaming attribution (no plausible motivation; proximity tightening documented).
 
-**Gate 0.G** `[ ]` 0.3 decisions recorded · `test/dm.sh` **fails** against the current engine (a RED
-suite that passes is not a RED suite) · watchdog pass returns no unaddressed finding
+**Gate 0.G** `[x]` **CLOSED 2026-08-03** — 0.3 decisions recorded · `test/dm.sh` fails against the
+current engine (verified independently by orchestrator AND watchdog: exit 1, 20 non-guard FAIL,
+the 4 passes are exactly the 4 guards) · watchdog round 4 verdict CLEAN, no unaddressed finding
 
 ## Phase 1 — Transport `[ ]` (machinery · `~/agent-brain/bin/brain`)
+
+**Wire format (ratified 2026-08-03, watchdog finding m2):** one jq-encoded JSON object per inbox
+line, keys exactly `from` / `to` / `ts` / `content` — matches the E1–E15 fixtures and the draft
+encoder. The frozen suite pins these keys; changing them is a plan change, not an implementation
+choice.
 
 - `[ ]` 1.1 Register `dm)` and `inbox)` in the dispatch `case` (~L799–816) **and** in `usage()`
       — the single reason the existing code is dead
@@ -283,9 +302,14 @@ shows **no** `.brain/dm/`
 ## Phase 2 — Hook `[ ]` (machinery · same file)
 
 - `[ ]` 2.1 **Rotate, deliver, then arm — in that order.** In `_hook_session_start`, before anything
-      else: if `dm/<me>/inbox.jsonl` is non-empty, `mv` it to `dm/<me>/read/<ts>.jsonl` and inject its
-      contents into the session's startup context alongside the existing "run navigation-standards"
-      block. Then arm the watcher on a now-empty inbox.
+      else: if `dm/<me>/inbox.jsonl` is non-empty, `mv` it to `dm/<me>/read/<ts>-<pid>.jsonl` and
+      inject its contents into the session's startup context alongside the existing "run
+      navigation-standards" block. Then arm the watcher on a now-empty inbox.
+      **Archive name ratified 2026-08-03 (test-writer's open question):** `<ts>` alone is not
+      collision-free — two rotations in the same clock second overwrite each other and the second
+      `mv` silently destroys the first transcript. The `-<pid>` suffix makes uniqueness structural
+      (each boot is its own process); the transcript pointer (1.2) is only honest if archives are
+      durable.
       **Why this order is load-bearing:** the watcher attaches at end-of-file, so anything already in
       the inbox is invisible to it. Without the rotate step, a DM sent while the lane was down is
       **lost, not queued** — the lane boots, starts listening from that instant, and never sees what
