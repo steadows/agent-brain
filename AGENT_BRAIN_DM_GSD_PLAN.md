@@ -2,8 +2,10 @@
 
 **Status:** `[~]` P0–P4 ✅ + gates 7.1 (/simplify) and 7.2 (5-agent review + Codex adversarial)
 ✅ DONE 2026-08-03 — 24/24 green, all review fixes landed. **Steve ruled 2026-08-03: SHIP —
-deploy v1 with the 3 concurrency limits documented (v1.1 queue follow-up in ROADMAP). Next is
-Phase 5 deploy (per the corrected 5.1→5.4 sequence), then P6 live e2e.**
+deploy v1 with the 3 concurrency limits documented (v1.1 queue follow-up in ROADMAP). Steve
+re-sequenced 2026-08-03 (follow-up session): 7.4 ultrareview runs BEFORE deploy, on the branch
+diff pre-PR — same logic that pulled 7.1/7.2 forward. Order is now 7.4 → Phase 5 deploy
+(corrected 5.1→5.4 sequence) → P6 live e2e → 7.3 PR → 7.5 → 7.G.**
 **Owner:** @pm · **Repo:** `~/agent-brain` (branch `fix/pretool-collision-warning`) → deployed to `<main-worktree>/.brain/`
 **Evidence:** `docs/research/agent-lane-dm-mechanisms-eval.md` (E0–E15) in `enterprise_research_dashboard-pm`
 **Predecessor:** `~/agent-brain/docs/AGENT-DM-CHANNELS.md` (2026-06-15, superseded in part)
@@ -430,7 +432,7 @@ Task **3.7** carries the whole remaining rule. **Revisit only if a real deadlock
 dialog in `brain status` · a note **without** it renders unchanged (the field is genuinely optional —
 13 existing notes must not break) · `brain reconcile` does not flag the new field as stealth-structural
 
-## Phase 5 — Deploy `[ ]` (requires P1–P4)
+## Phase 5 — Deploy `[ ]` (requires P1–P4 **and 7.4 ultrareview returned + CRITICAL/HIGH addressed** — re-sequenced by Steve 2026-08-03)
 
 ⚠ **Deploy is machine-wide and instant.** Both hooks resolve the engine through
 `git rev-parse --git-common-dir`, so **every lane in every worktree executes the single deployed
@@ -495,7 +497,7 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
       all three seams verified holding; 9 findings applied as refactor commit `77c67a0` (hot-path
       `_require_brain` short-circuit, `_inbox_ensure` single owner, `_announce_as` seam, altitude
       fix on the false enforcement claim), 4 skipped with reasons. Suite stayed 24/24.
-- `[~]` 7.2 **`/steadows-code-review`** — orchestrator-side (Claude Code), never a Codex skill run. If
+- `[x]` 7.2 **`/steadows-code-review`** — orchestrator-side (Claude Code), never a Codex skill run. If
       its adversarial second-opinion step dispatches Codex, scope that prompt to a **single agent, no
       fan-out**; the fleet belongs to 7.4.
       **Claude pass done 2026-08-03** (5 agents). Findings applied in `4d774f6` + the fix commit —
@@ -507,17 +509,22 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
       printed success **and wrote a false "delivered" line into the committed journal** — now fails
       loudly. Plus a **regression I introduced in 7.1**: `_require_brain`'s short-circuit trusted an
       inherited `BRAIN`, silently redirecting writes. Docs co-change (README/BUILD-SPEC/CHANGELOG/
-      ROADMAP/INDEX) landed in `4d774f6`. **Codex adversarial sweep in flight**
-      (`task-msdqe49w-p6g6z1`, single agent, brief at `docs/prompts/lane-dm-adversarial-review.md`).
+      ROADMAP/INDEX) landed in `4d774f6`. **Codex adversarial sweep DONE 2026-08-03**
+      (`task-msdqe49w-p6g6z1`, single agent, brief at `docs/prompts/lane-dm-adversarial-review.md`):
+      11 findings, report committed at `docs/lane-dm-adversarial-review-findings.md` — 2/3/4/5/7/10
+      fixed in `d5879f5`, 8/9 folded in as Phase 5 plan corrections, 1/6/11 accepted as v1 limits
+      by Steve's ship ruling (v1.1 per-message queue in ROADMAP).
       **Three coverage gaps owed as follow-ups** (frozen suite — route via `test-writer`): direct
       `cmd_announce` coverage, the `@`-less `brain dm <lane>` form, the hook's no-identity exit.
 - `[ ]` 7.3 **PR — Steve clicks it.** `github.com/steadows/agent-brain`; the `gh` CLI here is the work
       EMU account and cannot open it. Base: `fix/pretool-collision-warning` (itself still awaiting its
       own PR — 7.3 may end up merging both).
-- `[ ]` 7.4 **`/steadows-ultrareview`** → dispatched to Codex, **explicitly invoking the skill**.
+- `[~]` 7.4 **`/steadows-ultrareview`** → dispatched to Codex, **explicitly invoking the skill**.
       **Small fleet** — the diff is a few dozen lines of POSIX shell plus markdown. Not the smallest:
       it touches a shared multi-agent vault and a secret-egress path, so size for that, not for the
-      line count.
+      line count. **PULLED AHEAD of deploy (Steve, 2026-08-03)** — runs on the full branch diff
+      (`main...HEAD`) pre-PR; Phase 5 deploy is gated on this returning with CRITICAL/HIGH
+      addressed. Brief: `docs/prompts/lane-dm-ultrareview.md`.
 - `[ ]` 7.5 Address CRITICAL/HIGH from every gate before merge; fix MEDIUM where reasonable.
 
 **Gate 7.G** `[ ]` **scoped verify** green on the final diff · no unaddressed CRITICAL/HIGH · the five
