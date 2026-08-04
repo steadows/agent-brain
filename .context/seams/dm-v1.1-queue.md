@@ -210,8 +210,11 @@ ruling — but the implementation and any future scenario pin epoch seconds.
 consumers: `_hook_session_start` (recover → claim → digest → emit → ack-each) and the new live
 path `cmd_dm_take` (claim → print → ack). contract: claim = `command mv -f --` of
 `pending/<id>.a<k>` → `claimed/<id>.a<k>.c<claim-ts>-<pid>`; on failure re-test the source
-(gone ⇒ lost race, skip silently; present ⇒ real error, warn + stop — decision 6c). recover =
-parse `<claim-ts>` from the name, >600s ⇒ rename back to `pending/<id>.a<k+1>`, except
+(gone ⇒ lost race, skip silently; present ⇒ real error, warn + stop — decision 6c). One
+invocation claims at most 40 messages and prints validated names, never absolute paths; the
+consumer rebuilds each path after the whitespace/glob-safe name split. recover = parse canonical,
+width-bounded decimal components before arithmetic; malformed names route visibly to `failed/`.
+An age >600s ⇒ rename back to `pending/<id>.a<k+1>`, except
 `k+1 > 3` ⇒ `failed/` (decision 6b). ack = rename the FULL claimed name into `read/<id>.a<k>`;
 ENOENT on ack means the claim was recovered out from under us — warn, never die. All through
 `_dm_dir_ok` first. Iteration guard everywhere: `[ -e "$f" ] || [ -L "$f" ] || continue`
@@ -219,14 +222,17 @@ ENOENT on ack means the claim was recovered out from under us — warn, never di
 
 ### `cmd_dm_take` — the live-consumption command (UR-3's fix)
 consumers: the receiving lane's watcher (protocol tells the agent: on inbox activity, run
-`brain dm take`). contract: recover → claim all → print each (digest-bounded) → ack each; exits 0
-with no output when empty. This is what makes a live-observed message *claimed* instead of
-merely *seen* — the next boot cannot replay it.
+`brain dm take`). contract: recover → claim up to 40 → print each (digest-bounded) → ack each.
+One invocation is deliberately BOUNDED and does not loop — the *caller* repeats while `pending/`
+remains nonempty (the protocol template instructs the agent to do exactly that). Exits 0 with no
+output when empty. This is what makes a live-observed message *claimed* instead of merely *seen*
+— the next boot cannot replay it.
 
 ### `_dm_digest` — signature change (EXTEND, in place)
-input becomes a directory-or-file-list of per-message files; keeps `DM_INJECT_MAX_LINES/COLS`
-bounds; fixes the mid-JSON `cut` truncation (defect 5) by truncating the *content field*, not the
-serialized object.
+input becomes a lane plus per-message names. Require exactly one object per file; rebuild only
+string `from`/`to`/`ts`/`content`, bound every field and serialized line, then enforce a final
+aggregate cap. This also fixes the mid-JSON `cut` truncation (defect 5) by shortening fields
+before serialization.
 
 ### Deleted, not extended
 `_inbox_rotate` (its job — batch move + archive naming — no longer exists) · the `<ts>-<pid>`

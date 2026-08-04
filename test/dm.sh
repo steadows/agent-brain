@@ -2071,6 +2071,244 @@ sc_nav_skill_no_erd_referents() {
   need_eq "$n" 0 "project-specific referents in the generic template"
 }
 
+# ══════════════════════════ pre-PR H1–H5 review fixes ════════════════════════════════════
+
+# The implementation names this bound beside the other DM_* constants. Restating the ruled
+# value here makes the H5 boundary falsifiable without sourcing the engine under test.
+DM_CLAIM_MAX_MESSAGES=40
+DM_INJECT_MAX_COLS=2000
+
+# H1 — claimed message identifiers must survive a vault path containing whitespace. This drives
+# the complete public lifecycle: send → SessionStart claim/delivery → ack.
+sc_h1_space_path_round_trip() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  spaced="$base/repo with space"
+  mv "$fx" "$spaced" || { fail "fixture: could not move the vault under a spaced path"; return 0; }
+  fx=$spaced
+
+  run_brain "$fx" alpha dm @bravo "space-path-round-trip-h1"
+  rc=$?
+  need_rc "$rc" 0 "send from a vault path containing a space" || return 0
+
+  ctx=$(hook_context "$fx" bravo)
+  hrc=$?
+  need_rc "$hrc" 0 "SessionStart from a vault path containing a space" || return 0
+  need_str_has "$ctx" "space-path-round-trip-h1" \
+    "H1: the real boot must deliver a DM when the vault path contains a space"
+  need_count "$(q_dir "$fx" bravo pending)" 0 "pending/ after the spaced-path boot"
+  need_count "$(q_dir "$fx" bravo claimed)" 0 "claimed/ after the spaced-path ack"
+  need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the spaced-path delivery"
+}
+
+# H2(a) — a file is the consumer-boundary unit. Multiple JSON values in one file are malformed,
+# must emit nothing, and must remain replayable rather than being acked as several records.
+sc_h2_multi_object_file_refused() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed)
+  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
+  planted="$pd/20260804T120000Z-9201.a0"
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"multi-first-h2"}' > "$planted" \
+    || { fail "fixture: could not write the first planted object"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:01Z",content:"multi-second-h2"}' >> "$planted" \
+    || { fail "fixture: could not write the second planted object"; return 0; }
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc_nonzero "$rc" "H2: taking a file that contains more than one JSON object"
+  need_eq "$(byte_size "$OUT")" 0 "multi-object file output — malformed input must emit nothing"
+  need_count "$(q_dir "$fx" bravo read)" 0 "read/ after a malformed multi-object file"
+  need_count "$cd_" 1 "claimed/ after a malformed multi-object file — it must remain replayable"
+}
+
+# H2(b) — unknown fields are not part of the wire contract and must not cross the consumer
+# boundary. The four contract fields remain intact and the message is acked normally.
+sc_h2_extra_field_stripped() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending)
+  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"extra-field-h2",extra:"must-not-cross"}' \
+    > "$pd/20260804T120000Z-9202.a0" \
+    || { fail "fixture: could not write the extra-field message"; return 0; }
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "take of a valid message carrying an unknown field" || return 0
+  if ! jq -s -e 'length == 1 and (.[0] | keys == ["content","from","to","ts"])' "$OUT" >/dev/null 2>&1; then
+    fail "H2: digest output must reconstruct exactly from/to/ts/content and strip every unknown field"
+  fi
+  need_file_has "$OUT" "extra-field-h2" "the sanitized message content"
+  need_file_lacks "$OUT" "must-not-cross" "the planted unknown field"
+  need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the sanitized message is delivered"
+}
+
+# H2(c) — every contract value is bounded, not only content. An oversized producer-controlled
+# `from` must be shortened before output and the serialized record must remain within the
+# existing per-line injection cap.
+sc_h2_oversized_from_bounded() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending)
+  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
+  huge_from=$(awk 'BEGIN { for (i = 0; i < 6000; i++) printf "f" }')
+  jq -cn --arg f "$huge_from" \
+    '{from:$f,to:"bravo",ts:"2026-08-04T12:00:00Z",content:"oversized-from-h2"}' \
+    > "$pd/20260804T120000Z-9203.a0" \
+    || { fail "fixture: could not write the oversized-from message"; return 0; }
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "take of a message carrying an oversized from value" || return 0
+  size=$(byte_size "$OUT")
+  [ "$size" -le "$((DM_INJECT_MAX_COLS + 1))" ] \
+    || fail "H2: one sanitized digest record is $size bytes, above the $DM_INJECT_MAX_COLS-column bound"
+  if ! jq -s -e --arg original "$huge_from" \
+    'length == 1 and (.[0] | keys == ["content","from","to","ts"]) and (.[0].from | length) < ($original | length)' \
+    "$OUT" >/dev/null 2>&1; then
+    fail "H2: the oversized from value was not bounded while reconstructing the four-field record"
+  fi
+  need_file_has "$OUT" "oversized-from-h2" "content alongside the bounded from value"
+}
+
+# H3(a) — leading-zero decimals are non-canonical and must never reach shell arithmetic. The
+# malformed claim moves visibly to failed/ while an unrelated valid message still delivers.
+sc_h3_leading_zero_claim_survives_boot() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed)
+  mkdir -p "$pd" "$cd_" "$(q_dir "$fx" bravo read)" "$(q_dir "$fx" bravo failed)" \
+    || { fail "fixture: could not create the queue tree"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"bad-leading-zero-h3"}' \
+    > "$cd_/20260804T120000Z-9301.a0.c08-123"
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:01Z",content:"good-after-bad-h3"}' \
+    > "$pd/20260804T120001Z-9302.a0"
+
+  ctx=$(hook_context "$fx" bravo)
+  hrc=$?
+  need_rc "$hrc" 0 "SessionStart with a leading-zero claim epoch" || return 0
+  need_str_has "$ctx" "good-after-bad-h3" \
+    "H3: a malformed claim must not prevent other messages from being delivered"
+  need_str_lacks "$ctx" "bad-leading-zero-h3" "the malformed claim must not be delivered"
+  need_count "$(q_dir "$fx" bravo failed)" 1 "failed/ after rejecting the leading-zero claim"
+  need_count "$cd_" 0 "claimed/ after routing the malformed claim to failed/"
+  need_file_has "$fx/.brain/.hook-errors.log" "20260804T120000Z-9301.a0.c08-123" \
+    "the malformed-claim warning must name the offending file"
+}
+
+# H3(b) — an attempt outside the state-machine range is terminal input, never an operand. It
+# must land in failed/ without wrapping into a negative, permanently unclaimable pending name.
+sc_h3_overrange_attempt_routes_failed() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  cd_=$(q_dir "$fx" bravo claimed); fd=$(q_dir "$fx" bravo failed)
+  mkdir -p "$(q_dir "$fx" bravo pending)" "$cd_" "$(q_dir "$fx" bravo read)" "$fd" \
+    || { fail "fixture: could not create the queue tree"; return 0; }
+  bad_name="20260804T120000Z-9303.a9223372036854775807.c0-123"
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"overrange-attempt-h3"}' \
+    > "$cd_/$bad_name"
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "take with an over-range claim attempt" || return 0
+  need_count "$fd" 1 "failed/ after rejecting the over-range attempt"
+  need_file "$fd/$bad_name" "the over-range claim's visible terminal file"
+  need_count "$(q_dir "$fx" bravo pending)" 0 \
+    "pending/ after the over-range attempt — no wrapped negative name may be created"
+  need_file_has "$ERR" "$bad_name" "the over-range warning must name the offending file"
+
+  run_brain "$fx" bravo status
+  rc=$?
+  need_rc "$rc" 0 "status after routing the over-range claim" || return 0
+  status_has_failed "$OUT" || fail "H3: the terminal failed/ state must be visible in brain status"
+}
+
+# H4 — a jq shim simulates another session recovering the claim after digest but before ack.
+# The digest is delivered, ack warns about ENOENT, and the public command still exits zero.
+sc_h4_disappeared_claim_ack_is_soft() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx"); cd_=$(q_dir "$fx" bravo claimed)
+  run_brain "$fx" alpha dm @bravo "claim-disappeared-h4"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: send" || return 0
+
+  shim_dir="$base/ack-race-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the ack-race shim directory"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: jq vanished after preflight"; return 0; }
+  real_rm=$(command -v rm) || { fail "fixture: rm is unavailable"; return 0; }
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'validation=0\n'
+    printf 'for arg do [ "$arg" = "-e" ] && validation=1; done\n'
+    printf '"%s" "$@"\n' "$real_jq"
+    printf 'rc=$?\n'
+    printf 'if [ "$rc" -eq 0 ] && [ "$validation" -eq 0 ]; then\n'
+    printf '  for file in "$DM_ACK_RACE_CLAIM_DIR"/*; do\n'
+    printf '    [ -e "$file" ] || [ -L "$file" ] || continue\n'
+    printf '    "%s" -f -- "$file"\n' "$real_rm"
+    printf '  done\n'
+    printf 'fi\n'
+    printf 'exit "$rc"\n'
+  } > "$shim_dir/jq"
+  chmod +x "$shim_dir/jq" || { fail "fixture: could not make the jq shim executable"; return 0; }
+
+  DM_ACK_RACE_CLAIM_DIR=$cd_
+  export DM_ACK_RACE_CLAIM_DIR
+  PATH="$shim_dir:$PATH" run_brain "$fx" bravo dm take
+  rc=$?
+  unset DM_ACK_RACE_CLAIM_DIR
+
+  need_rc "$rc" 0 "H4: take after another session recovered the claim before ack"
+  need_file_has "$OUT" "claim-disappeared-h4" "the digest emitted before the simulated recovery"
+  need_file_has "$ERR" "claim disappeared before ack" \
+    "the dedicated ENOENT soft-landing warning"
+  need_file_lacks "$ERR" "refusing non-regular dm message" \
+    "the generic file validator must not intercept the absent-claim soft path"
+}
+
+# H5 — claiming is bounded work. The first invocation owns exactly the fixed batch, leaves the
+# remainder pending, and the next invocation drains every leftover without loss or starvation.
+sc_h5_claim_batch_bounded_and_fair() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx"); pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
+  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
+  backlog=$((DM_CLAIM_MAX_MESSAGES + 3))
+  i=1
+  while [ "$i" -le "$backlog" ]; do
+    seq=$(printf '%03d' "$i")
+    jq -cn --arg content "bounded-batch-$seq-h5" \
+      '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:$content}' \
+      > "$pd/20260804T120000Z-9401-$seq.a0" \
+      || { fail "fixture: could not plant backlog message $i"; return 0; }
+    i=$((i + 1))
+  done
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "first bounded take" || return 0
+  first_out="$base/first-bounded-take.out"
+  cp "$OUT" "$first_out" || { fail "fixture: could not preserve first take output"; return 0; }
+  need_eq "$(line_count "$first_out")" "$DM_CLAIM_MAX_MESSAGES" \
+    "H5: messages delivered by the first claim invocation"
+  need_count "$rd" "$DM_CLAIM_MAX_MESSAGES" \
+    "read/ after the first invocation — exactly one bounded batch must have been claimed"
+  need_count "$pd" 3 "pending/ after the first invocation — the remainder stays claimable"
+  need_count "$(q_dir "$fx" bravo claimed)" 0 "claimed/ after the first batch is acked"
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "second take of the leftover batch" || return 0
+  second_out="$OUT"
+  need_eq "$(line_count "$second_out")" 3 "messages delivered by the second claim invocation"
+  need_count "$rd" "$backlog" "read/ after successive invocations drain the full backlog"
+  need_count "$pd" 0 "pending/ after the second invocation"
+
+  i=1
+  while [ "$i" -le "$backlog" ]; do
+    seq=$(printf '%03d' "$i")
+    seen=$(grep -h -cF -- "bounded-batch-$seq-h5" "$first_out" "$second_out" 2>/dev/null \
+      | awk '{ total += $1 } END { print total + 0 }')
+    need_eq "$seen" 1 "backlog marker $seq across successive bounded takes" || return 0
+    i=$((i + 1))
+  done
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
 printf 'brain lane-DM v1.1 queue RED suite\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
@@ -2128,6 +2366,15 @@ scenario guard "3.G/38  nav-skill-carries-triage-rules"     sc_nav_skill_carries
 scenario red   "3.G/39  UR8-no-false-announce-promise"      sc_ur8_no_false_announce_promise
 scenario guard "3.G/40  nav-skill-line-budget"              sc_nav_skill_line_budget
 scenario guard "3.G/41  nav-skill-no-erd-referents"         sc_nav_skill_no_erd_referents
+
+scenario red   "F.H1/42 space-path-round-trip"              sc_h1_space_path_round_trip
+scenario red   "F.H2/43 multi-object-file-refused"          sc_h2_multi_object_file_refused
+scenario red   "F.H2/44 extra-field-stripped"               sc_h2_extra_field_stripped
+scenario red   "F.H2/45 oversized-from-bounded"             sc_h2_oversized_from_bounded
+scenario red   "F.H3/46 leading-zero-claim-survives-boot"   sc_h3_leading_zero_claim_survives_boot
+scenario red   "F.H3/47 overrange-attempt-routes-failed"    sc_h3_overrange_attempt_routes_failed
+scenario red   "F.H4/48 disappeared-claim-ack-is-soft"      sc_h4_disappeared_claim_ack_is_soft
+scenario red   "F.H5/49 claim-batch-bounded-and-fair"       sc_h5_claim_batch_bounded_and_fair
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'

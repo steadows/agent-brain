@@ -64,7 +64,7 @@ Journal = ephemeral heads-up; connection/presence = durable state. One moment of
   registered queue (status broadcast / merge coordination). `announce` is a today-only journal
   heads-up for lanes explicitly mentioned. The durable **record is a connection note**.
 - **Arm your queue now:** `.brain/bin/brain inbox` prints your `pending/` directory. Watch it for
-  activity; then run `.brain/bin/brain dm take` to claim, print, and acknowledge available DMs.
+  activity; `brain dm take` handles 40 DMs at a time, so repeat it while `pending/` remains nonempty.
 - **Triage by cost, not authority:** read everything · **ack everything, even when deferring** ·
   do it now if small **or if it invalidates your current work** · else finish your task first ·
   **write every deferral down** (punch list / connection note) — context dies at compaction.

@@ -234,8 +234,9 @@ Both are thin wrappers calling `brain hook <event>`; both **fail-open** (drop a 
    - **(b)** cache `BRAIN_FEATURE` for the session.
    - **(b2) recover → claim → deliver → ack (DM).** Recover stale claims (lease
      `DM_CLAIM_MAX_AGE` expired) back to `pending/` — routing a message past `DM_MAX_ATTEMPTS`
-     to terminal `failed/` — then claim everything pending by renaming each message file into
-     `claimed/`, inject the (bounded) digest, and **ack (move to `read/`) only after the
+     to terminal `failed/` — then claim up to 40 pending messages by renaming each into
+     `claimed/` (leaving the remainder pending for the next touch), inject the bounded,
+     four-field digest, and **ack (move to `read/`) only after the
      complete startup payload emitted successfully**. Order is load-bearing: an interrupted
      boot leaves every claimed message replayable at the next queue touch, so delivery is
      **at-least-once** (a crash window duplicates, never loses), and per-message pending files

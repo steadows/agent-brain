@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — lane-to-lane DM
+## v1.1.0 — 2026-08-04 — lane-to-lane DM
 
 Adds a **fast tier** to coordination. Until now every signal travelled at the speed of the
 other lane's next session boot; `brain dm` reaches a running lane in seconds, which removes
@@ -15,8 +15,9 @@ the human from the relay loop between two lanes that are both already awake.
 - **`brain dm @all "<msg>"`** — fans into every registered queue (skipping the sender), for
   status broadcast and merge coordination. Deliberately not gated on who looks "live":
   presence `updated:` is not a liveness signal.
-- **`brain dm take`** — claim, print, and acknowledge this lane's pending DMs: the live
-  consumption path a running lane invokes when its queue watch fires.
+- **`brain dm take`** — claim, print, and acknowledge up to 40 of this lane's pending DMs: the
+  bounded live-consumption path a running lane invokes when its queue watch fires. Further
+  messages stay pending and claimable on the next touch.
 - **`brain inbox [<feature>]`** — prints (and creates) the `pending/` queue directory an
   agent arms its watch on.
 - **Per-message lifecycle: `pending/` → `claimed/` → `read/` (or `failed/`).** Claims carry a
@@ -27,9 +28,11 @@ the human from the relay loop between two lanes that are both already awake.
   its consumer `DM_MAX_ATTEMPTS` times routes to terminal `failed/`, surfaced by
   `brain status`, never silently deleted. Design authority:
   `.context/seams/dm-v1.1-queue.md`.
-- **SessionStart recovers → claims → delivers → acks.** The boot hook injects claimed
-  messages into the startup context and acknowledges them (move to `read/`) **only after the
-  payload emitted successfully**, so an interrupted boot leaves every message replayable —
+- **SessionStart recovers → claims → delivers → acks.** Each boot claims at most 40 messages;
+  the hook injects only one-object, four-field (`from`/`to`/`ts`/`content`) records with bounded
+  fields and a final aggregate cap, while excess messages stay pending for the next touch. It
+  injects claimed messages into the startup context and acknowledges them (move to `read/`)
+  **only after the payload emitted successfully**, so an interrupted boot leaves every message replayable —
   and a DM sent to a *down* lane queues until it wakes. Injected content is bounded so a
   large backlog can't blow the lane's context window.
 - **The journal records a call log, never the message body** — `dm → @lane (transcripts: …)`.
@@ -41,7 +44,7 @@ the human from the relay loop between two lanes that are both already awake.
 - **Protocol** — the always-read nav skill gains the DM tier, triage rules, and the merge
   handshake; `templates/DM-PROTOCOL.md` carries the full dialog/anti-sycophancy/deadlock
   reference on demand, keeping the per-session context tax flat.
-- **`test/dm.sh` + `test/commit-install.sh`** — the repo's first test suites (45 + 15
+- **`test/dm.sh` + `test/commit-install.sh`** — the repo's first test suites (53 + 15
   scenarios, temp-repo fixtures), the thing ROADMAP has wanted since v1.
 
 ## v1.0.1 — 2026-08-02

@@ -1,11 +1,8 @@
 # Agent-Brain Lane DM — GSD Plan
 
-**Status:** `[~]` P0–P4 ✅ + gates 7.1 (/simplify) and 7.2 (5-agent review + Codex adversarial)
-✅ DONE 2026-08-03 — 24/24 green, all review fixes landed. **Steve ruled 2026-08-03: SHIP —
-deploy v1 with the 3 concurrency limits documented (v1.1 queue follow-up in ROADMAP). Steve
-re-sequenced 2026-08-03 (follow-up session): 7.4 ultrareview runs BEFORE deploy, on the branch
-diff pre-PR — same logic that pulled 7.1/7.2 forward. Order is now 7.4 → Phase 5 deploy
-(corrected 5.1→5.4 sequence) → P6 live e2e → 7.3 PR → 7.5 → 7.G.**
+**Status:** `[~]` P0–P4 ✅ + gates 7.1/7.2 + 7.4 ultrareview ✅; v1.1 queue and the
+pre-PR H1–H5 fix round are complete (53/53 DM + 15/15 commit/install under `sh` and `dash`).
+**Next: Phase 5 deploy, after this fix round**, then P6 live e2e → 7.3 PR → 7.G.
 **Owner:** @pm · **Repo:** `~/agent-brain` (branch `fix/pretool-collision-warning`) → deployed to `<main-worktree>/.brain/`
 **Evidence:** `docs/research/agent-lane-dm-mechanisms-eval.md` (E0–E15) in `enterprise_research_dashboard-pm`
 **Predecessor:** `~/agent-brain/docs/AGENT-DM-CHANNELS.md` (2026-06-15, superseded in part)
@@ -570,7 +567,7 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
       Steve's ruling 2026-08-03: v1.1 rewrite lands before any deploy. Three buckets:
 
       **STATUS 2026-08-04: ✅ ALL 10 CLOSED.**
-      - UR-1, UR-2, UR-3, UR-8, UR-9, UR-10 — v1.1 per-message-queue GREEN (45/45 `sh` + `dash`).
+      - UR-1, UR-2, UR-3, UR-8, UR-9, UR-10 — v1.1 per-message-queue GREEN (53/53 `sh` + `dash`).
       - UR-5, UR-6 — deploy procedure, landed as plan tasks **5.6** and **5.5**.
       - UR-4a, UR-4b, UR-7 — GREEN at `9a81bc4` against the frozen `test/commit-install.sh`
         (15/15 `sh` + `dash`), after a 3-round writer/watchdog audit that turned UR-4a into a
@@ -578,39 +575,39 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
         previous one broke them.
       **One PRE-EXISTING defect surfaced and is NOT closed** (deliberately): the legacy-vault
       secret-scan wedge — see `ROADMAP.md` "Known issue" and the UR-4a ruling in the seam map.
-      Next: `/simplify` + `/steadows-code-review` on the branch diff, then Phase 5 deploy.
+      Next: Phase 5 deploy, after this fix round.
 
       **A. Absorbed by the v1.1 per-message-queue rewrite** (the redesign already in `ROADMAP.md`;
       these are its acceptance criteria, not separate work):
-      - `[ ]` **UR-1 (HIGH)** retire-before-deliver loses messages on interrupt → the queue's
+      - `[x]` **UR-1 (HIGH)** retire-before-deliver loses messages on interrupt → the queue's
             `pending/claimed/acked` lifecycle, with recovery of stale claims. Prefer duplicate
             delivery over silent loss.
-      - `[ ]` **UR-3 (MED)** a live-read DM replays as unread at next boot → stable message IDs +
+      - `[x]` **UR-3 (MED)** a live-read DM replays as unread at next boot → stable message IDs +
             atomic claim/ack. Needs a live-read → reboot scenario.
-      - `[ ]` **UR-4a (MED)** `cmd_commit`'s cleanup wedges permanently once an inbox is already
+      - `[x]` **UR-4a (MED)** `cmd_commit`'s cleanup wedges permanently once an inbox is already
             tracked (`git rm --cached` stages a deletion the final check reads as failure, forever)
             → sanitized temporary index, no pathspec commit.
 
       **B. Small, self-contained code fixes — required before deploy regardless of the rewrite:**
-      - `[ ]` **UR-2 (HIGH)** symlink hardening bypassed: validate `dm` root + lane dir + inbox +
+      - `[x]` **UR-2 (HIGH)** symlink hardening bypassed: validate `dm` root + lane dir + inbox +
             `read/` before EVERY read/append/move, and add the checks `_inbox_rotate` lacks
             entirely. ⚠ POSIX `sh` cannot do `openat`/`O_NOFOLLOW`, so the same-user TOCTOU
             residual stays a documented limit — close the parity gap, do not overclaim.
-      - `[ ]` **UR-4b (MED)** the ignore check greps `.gitignore` for a literal `dm/` line, which
+      - `[x]` **UR-4b (MED)** the ignore check greps `.gitignore` for a literal `dm/` line, which
             does not establish effective ignore behaviour (a later negation re-includes it) →
             `git check-ignore --no-index`.
-      - `[ ]` **UR-7 (MED)** `cmd_install` checks neither `mkdir` nor `cp`, so it can print success
+      - `[x]` **UR-7 (MED)** `cmd_install` checks neither `mkdir` nor `cp`, so it can print success
             over a partial/stale skill → check every operation, copy to a same-dir temp and
             atomically rename. Pre-existing code, but the branch makes it a deploy dependency.
 
       **C. Procedure + honesty — little or no engine code:**
-      - `[ ]` **UR-5 (MED)** rollback strands pending DMs (old engine cannot read them, and old
+      - `[x]` **UR-5 (MED)** rollback strands pending DMs (old engine cannot read them, and old
             ignore state may stage the bodies) → `dm/` ignore becomes a permanent forward-compatible
             invariant; drain/quiesce inboxes before any downgrade. Deploy-runbook item.
-      - `[ ]` **UR-6 (MED)** the atomic swap does not re-arm sessions already running under the old
+      - `[x]` **UR-6 (MED)** the atomic swap does not re-arm sessions already running under the old
             engine → **Phase 5/6 gain an explicit restart-and-ack gate for every active lane before
             DM is declared live.** Fold into the P5 sequence.
-      - `[ ]` **UR-8 (MED)** `templates/DM-PROTOCOL.md` promises `announce` reaches every lane at
+      - `[x]` **UR-8 (MED)** `templates/DM-PROTOCOL.md` promises `announce` reaches every lane at
             next boot; `_recent_journal` surfaces only today's last 5 lines naming the lane or an
             explicit `@recipient`, so a generic announcement is invisible. → **Narrow the doc to
             what the code does** (cheap + honest); per-lane journal cursors only if we actually
@@ -618,10 +615,10 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
 
       **D. Frozen-suite holes — ride along free** (the suite reopens for the rewrite anyway; both
       route through `test-writer` + `spec-watchdog`, unconditional):
-      - `[ ]` **UR-9 (MED)** no DM scenario sends JSON-special content, so a naïvely interpolated
+      - `[x]` **UR-9 (MED)** no DM scenario sends JSON-special content, so a naïvely interpolated
             encoder would pass every assertion → send `"`, `\`, tab and an internal newline; assert
             one physical record + exact round-trip.
-      - `[ ]` **UR-10 (MED)** the "never journal the body" scenarios reject only literal fragments,
+      - `[x]` **UR-10 (MED)** the "never journal the body" scenarios reject only literal fragments,
             so `base64(content)` on the call-log line passes → pin the call-log grammar, or assert
             body-independence across two different bodies.
 

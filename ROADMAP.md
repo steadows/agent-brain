@@ -152,7 +152,7 @@ self-tests, so an overnight run can evolve the engine without ever hanging on it
 
 ## Smaller enhancements (nice-to-have)
 
-- **A real test suite.** _Partly delivered:_ `test/dm.sh` (24 scenarios) now exists, built exactly
+- **A real test suite.** _Partly delivered:_ `test/dm.sh` (53 scenarios) now exists, built exactly
   this way — temp-repo fixtures via the `BRAIN_TEST_BRANCH` / `BRAIN_SKILLS_DIR` /
   `BRAIN_GLOBAL_SETTINGS` seams — but it covers the **DM slice only**. The pre-existing surface
   below is still uncovered; extend the same harness rather than starting a second one.

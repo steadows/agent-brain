@@ -16,7 +16,8 @@ For "main moved", **git is the real source of truth** (every lane rebases at sta
 is a courtesy that saves a lane from finding out mid-gate. Do not build correctness on it.
 
 `brain inbox` prints your `pending/` directory. Watch that directory for activity; when it changes,
-run `brain dm take` to atomically claim, print, and acknowledge all available messages.
+run `brain dm take` to atomically claim, print, and acknowledge up to 40 messages. Repeat while
+`pending/` still contains messages; leftovers remain claimable and are never discarded.
 
 ## The six shapes (measured from a live vault, not invented)
 

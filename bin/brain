@@ -23,9 +23,13 @@ DM_INJECT_MAX_COLS=2000
 DM_CLAIM_MAX_AGE=600
 DM_MAX_ATTEMPTS=3
 DM_TEMP_MAX_AGE=300
-# Digest per-message content budget: reserve DM_DIGEST_ENVELOPE cols for the JSON envelope
-# (keys, from/to/ts, separators), then divide by DM_ESCAPE_FACTOR — worst-case JSON escaping
-# (\uXXXX) expands one content char into six output chars.
+DM_CLAIM_MAX_MESSAGES=40
+DM_CLAIM_EPOCH_MAX_DIGITS=10
+DM_CLAIMER_PID_MAX_DIGITS=10
+DM_INJECT_MAX_TOTAL=$((DM_INJECT_MAX_LINES * (DM_INJECT_MAX_COLS + 1)))
+# Digest per-field starting budget: reserve DM_DIGEST_ENVELOPE cols for the JSON envelope,
+# then divide by DM_ESCAPE_FACTOR — worst-case JSON escaping (\uXXXX) expands one character
+# into six output characters. The serializer reduces this budget further when needed.
 DM_DIGEST_ENVELOPE=512
 DM_ESCAPE_FACTOR=6
 
@@ -350,10 +354,23 @@ _dm_id_in_use() { # <lane> <id>
 }
 
 # One id-charset bound for BOTH consume paths (claim + recover). The producer mints [0-9TZ-]
-# ids; anything outside this set could word-split or glob in the `set -- $claims` consume
-# splits, so claim and recover refuse it identically and the whitespace-free split guarantee
-# holds by construction rather than by producer discipline.
+# ids; refusing every shell metacharacter keeps the name-only claim stream safe to split before
+# consumers rebuild absolute paths themselves.
 _dm_id_ok() { case "$1" in ''|*[!0-9:._TZ-]*) return 1 ;; *) return 0 ;; esac; }
+
+# Queue decimals are untrusted filename components. Canonical, width-bounded validation must
+# happen before arithmetic expansion because an invalid operand can terminate the whole shell.
+_dm_decimal_ok() { # <value> <max-digits>
+  _dc_value=$1; _dc_max_digits=$2
+  case "$_dc_value" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; esac
+  [ "${#_dc_value}" -le "$_dc_max_digits" ]
+}
+
+_dm_attempt_ok() { # <value>
+  _at_value=$1
+  _dm_decimal_ok "$_at_value" "${#DM_MAX_ATTEMPTS}" || return 1
+  [ "$_at_value" -le "$DM_MAX_ATTEMPTS" ]
+}
 
 _dm_new_id() { # <lane>
   # One compact stamp per process: a broadcast mints N ids in the same second anyway, and the
@@ -399,6 +416,20 @@ _dm_purge_stale_temps() { # <lane>
     || { _warn "could not sweep stale dm temps under $_pt_pending"; return 1; }
 }
 
+_dm_route_failed() { # <lane> <message-file> <reason>
+  _rf_lane=$1; _rf_file=$2; _rf_reason=$3; _rf_name=${_rf_file##*/}
+  _rf_dest="$BRAIN/dm/$_rf_lane/failed/$_rf_name"
+  [ ! -L "$_rf_dest" ] \
+    || { _warn "refusing symlinked dm failed destination for $_rf_name"; return 1; }
+  if command mv -f -- "$_rf_file" "$_rf_dest" 2>/dev/null; then
+    _warn "$_rf_reason: $_rf_name (routed to failed/@$_rf_lane)"
+    return 0
+  fi
+  [ -e "$_rf_file" ] || [ -L "$_rf_file" ] || return 0
+  _warn "could not route invalid dm message to failed/@$_rf_lane: $_rf_name"
+  return 1
+}
+
 _dm_recover_stale() { # <lane>
   _rs_lane=$1
   _dm_ensure_tree "$_rs_lane" || return 1
@@ -409,15 +440,28 @@ _dm_recover_stale() { # <lane>
     _dm_dir_ok "$_rs_file" || continue
     _rs_name=${_rs_file##*/}
     case "$_rs_name" in *.a*.c*-*) ;; *)
-      _warn "invalid claimed dm name: $_rs_name"; continue ;;
+      _dm_route_failed "$_rs_lane" "$_rs_file" "invalid claimed dm name" || return 1
+      continue ;;
     esac
     _rs_pre=${_rs_name%.c*}; _rs_stamp=${_rs_name##*.c}
     _rs_claim_ts=${_rs_stamp%-*}; _rs_pid=${_rs_stamp##*-}
     _rs_attempt=${_rs_pre##*.a}; _rs_id=${_rs_pre%.a*}
-    case "$_rs_claim_ts" in ''|*[!0-9]*) _warn "invalid claim epoch in $_rs_name"; continue ;; esac
-    case "$_rs_pid" in ''|*[!0-9]*) _warn "invalid claimer pid in $_rs_name"; continue ;; esac
-    case "$_rs_attempt" in ''|*[!0-9]*) _warn "invalid attempt in $_rs_name"; continue ;; esac
-    _dm_id_ok "$_rs_id" || { _warn "invalid message id in $_rs_name"; continue; }
+    if ! _dm_decimal_ok "$_rs_claim_ts" "$DM_CLAIM_EPOCH_MAX_DIGITS"; then
+      _dm_route_failed "$_rs_lane" "$_rs_file" "invalid claim epoch" || return 1
+      continue
+    fi
+    if ! _dm_decimal_ok "$_rs_pid" "$DM_CLAIMER_PID_MAX_DIGITS"; then
+      _dm_route_failed "$_rs_lane" "$_rs_file" "invalid claimer pid" || return 1
+      continue
+    fi
+    if ! _dm_attempt_ok "$_rs_attempt"; then
+      _dm_route_failed "$_rs_lane" "$_rs_file" "invalid delivery attempt" || return 1
+      continue
+    fi
+    if ! _dm_id_ok "$_rs_id"; then
+      _dm_route_failed "$_rs_lane" "$_rs_file" "invalid message id" || return 1
+      continue
+    fi
     [ -n "$_rs_now" ] || _rs_now=$(_now_epoch) || return 1
     _rs_age=$((_rs_now - _rs_claim_ts))
     if [ "$_rs_now" -ge "$_rs_claim_ts" ] && [ "$_rs_age" -le "$DM_CLAIM_MAX_AGE" ]; then
@@ -438,23 +482,25 @@ _dm_recover_stale() { # <lane>
   done
 }
 
-_dm_claim_all() { # <lane> — print the full paths won by this process
+_dm_claim_all() { # <lane> — print the names won by this process
   _ca_lane=$1
   _dm_ensure_tree "$_ca_lane" || return 1
   _ca_pending="$BRAIN/dm/$_ca_lane/pending"; _ca_claimed="$BRAIN/dm/$_ca_lane/claimed"
-  _ca_epoch=""
+  _ca_epoch=""; _ca_count=0
   for _ca_file in "$_ca_pending"/*; do
     [ -e "$_ca_file" ] || [ -L "$_ca_file" ] || continue
+    [ "$_ca_count" -lt "$DM_CLAIM_MAX_MESSAGES" ] || break
     _dm_dir_ok "$_ca_file" || continue
     _ca_name=${_ca_file##*/}; _ca_attempt=${_ca_name##*.a}; _ca_id=${_ca_name%.a*}
-    case "$_ca_attempt" in ''|*[!0-9]*) _warn "invalid pending dm name: $_ca_name"; continue ;; esac
-    if [ "$_ca_id" = "$_ca_name" ] || ! _dm_id_ok "$_ca_id"; then
-      _warn "invalid pending dm name: $_ca_name"; continue
+    if [ "$_ca_id" = "$_ca_name" ] || ! _dm_id_ok "$_ca_id" || ! _dm_attempt_ok "$_ca_attempt"; then
+      _dm_route_failed "$_ca_lane" "$_ca_file" "invalid pending dm name" || return 1
+      continue
     fi
     [ -n "$_ca_epoch" ] || _ca_epoch=$(_now_epoch) || return 1
-    _ca_dest="$_ca_claimed/$_ca_name.c$_ca_epoch-$$"
+    _ca_claim_name="$_ca_name.c$_ca_epoch-$$"; _ca_dest="$_ca_claimed/$_ca_claim_name"
     if command mv -f -- "$_ca_file" "$_ca_dest" 2>/dev/null; then
-      printf '%s\n' "$_ca_dest"
+      printf '%s\n' "$_ca_claim_name"
+      _ca_count=$((_ca_count + 1))
       continue
     fi
     [ -e "$_ca_file" ] || [ -L "$_ca_file" ] || continue
@@ -463,13 +509,16 @@ _dm_claim_all() { # <lane> — print the full paths won by this process
   done
 }
 
-_dm_ack() { # <lane> <full-claimed-path>
-  _ak_lane=$1; _ak_claim=$2
+_dm_ack() { # <lane> <claimed-name>
+  _ak_lane=$1; _ak_name=$2; _ak_claim="$BRAIN/dm/$_ak_lane/claimed/$_ak_name"
   # Claim ensured the tree in every live caller; validate only the read/ dir the mv enters.
   # If it vanished, ack fails and the message stays claimed → lease-recovered, never lost.
   _dm_dir_ok "$BRAIN/dm/$_ak_lane/read" || return 1
+  if [ ! -e "$_ak_claim" ] && [ ! -L "$_ak_claim" ]; then
+    _warn "dm claim disappeared before ack (it may have been recovered): $_ak_name"
+    return 0
+  fi
   _dm_dir_ok "$_ak_claim" || return 1
-  _ak_name=${_ak_claim##*/}
   case "$_ak_name" in *.a*.c*-*) ;; *) _warn "invalid claimed dm name: $_ak_name"; return 1 ;; esac
   _ak_read_name=${_ak_name%.c*}; _ak_dest="$BRAIN/dm/$_ak_lane/read/$_ak_read_name"
   [ ! -L "$_ak_dest" ] || { _warn "refusing symlinked dm ack destination: $_ak_dest"; return 1; }
@@ -482,32 +531,63 @@ _dm_ack() { # <lane> <full-claimed-path>
   return 1
 }
 
-_dm_ack_all() { # <lane> <claimed-path>... — ack each; nonzero if ANY failed (those stay replayable)
+_dm_ack_all() { # <lane> <claimed-name>... — ack each; nonzero if ANY failed (those stay replayable)
   _aa_lane=$1; shift; _aa_rc=0
   for _aa_claim in "$@"; do _dm_ack "$_aa_lane" "$_aa_claim" || _aa_rc=1; done
   return "$_aa_rc"
 }
 
-# Render at most DM_INJECT_MAX_LINES messages with one jq pass. Content is shortened before
-# serialization, so a bound can never cut through JSON syntax.
-_dm_digest() { # <claimed-file>...
-  _dg_count=$#; [ "$_dg_count" -gt 0 ] || return 0
-  _dg_first=$1; _dg_lane_dir=${_dg_first%/claimed/*}
-  _dg_skip=0
-  if [ "$_dg_count" -gt "$DM_INJECT_MAX_LINES" ]; then
-    _dg_skip=$((_dg_count - DM_INJECT_MAX_LINES))
-    printf '(%s earlier message(s) omitted from this bounded view; archive: %s/read/)\n' \
-      "$_dg_skip" "$_dg_lane_dir"
-  fi
-  while [ "$_dg_skip" -gt 0 ]; do shift; _dg_skip=$((_dg_skip - 1)); done
-  for _dg_file in "$@"; do _dm_dir_ok "$_dg_file" || return 1; done
-  _dg_content_max=$(((DM_INJECT_MAX_COLS - DM_DIGEST_ENVELOPE) / DM_ESCAPE_FACTOR))
-  [ "$_dg_content_max" -gt 0 ] || _dg_content_max=1
-  jq -c --argjson max "$_dg_content_max" '
-    if type != "object" or (.content | type) != "string" then error("invalid dm object")
-    else .content = .content[0:$max]
-    end
-  ' "$@" 2>/dev/null
+# Validate one object per file, then rebuild only the bounded wire contract. The recursive bound
+# preserves the existing content head when ordinary metadata fits, shrinking all four fields only
+# when JSON escaping would otherwise push the serialized record over the column cap.
+_dm_digest() { # <lane> <claimed-name>...
+  _dg_lane=$1; shift; _dg_count=$#
+  [ "$_dg_count" -gt 0 ] || return 0
+  [ "$_dg_count" -le "$DM_INJECT_MAX_LINES" ] \
+    || { _warn "dm digest batch for @$_dg_lane exceeds $DM_INJECT_MAX_LINES messages"; return 1; }
+  _dg_dir="$BRAIN/dm/$_dg_lane/claimed"
+  _dm_dir_ok "$_dg_dir" || return 1
+  for _dg_name in "$@"; do
+    case "$_dg_name" in ''|*/*) _warn "invalid claimed dm name in digest for @$_dg_lane: $_dg_name"; return 1 ;; esac
+    _dg_file="$_dg_dir/$_dg_name"
+    _dm_dir_ok "$_dg_file" || return 1
+    jq -e -s '
+      length == 1
+      and (.[0] | type) == "object"
+      and (.[0].from | type) == "string"
+      and (.[0].to | type) == "string"
+      and (.[0].ts | type) == "string"
+      and (.[0].content | type) == "string"
+    ' "$_dg_file" >/dev/null 2>&1 \
+      || { _warn "invalid dm object in $_dg_file"; return 1; }
+  done
+  _dg_field_max=$(((DM_INJECT_MAX_COLS - DM_DIGEST_ENVELOPE) / DM_ESCAPE_FACTOR))
+  [ "$_dg_field_max" -gt 0 ] || _dg_field_max=1
+  (
+    cd "$_dg_dir" || exit 1
+    jq -c -s -r \
+      --argjson field_max "$_dg_field_max" \
+      --argjson line_max "$DM_INJECT_MAX_COLS" \
+      --argjson total_max "$DM_INJECT_MAX_TOTAL" '
+      def bounded($limit):
+        . as $message
+        | {
+            from: $message.from[0:$limit],
+            to: $message.to[0:$limit],
+            ts: $message.ts[0:$limit],
+            content: $message.content[0:$limit]
+          } as $record
+        | if (($record | tojson | length) <= $line_max) or $limit <= 1
+          then $record
+          else ($message | bounded((($limit / 2) | floor)))
+          end;
+      map(bounded($field_max) | tojson) as $records
+      | (reduce $records[] as $record (0; . + ($record | length) + 1)) as $total
+      | if $total > $total_max then error("dm digest exceeds aggregate cap")
+        else $records[]
+        end
+    ' "$@" 2>/dev/null
+  )
 }
 
 cmd_dm_take() {
@@ -517,10 +597,10 @@ cmd_dm_take() {
   _dm_recover_stale "$_dt_lane" || return 1
   _dt_claims=$(_dm_claim_all "$_dt_lane") || return 1
   [ -n "$_dt_claims" ] || return 0
-  # Queue grammar forbids whitespace, so splitting the newline-delimited claim paths is safe.
+  # Only validated queue names cross this split; absolute paths are rebuilt after it.
   # shellcheck disable=SC2086
   set -- $_dt_claims
-  _dt_digest=$(_dm_digest "$@") \
+  _dt_digest=$(_dm_digest "$_dt_lane" "$@") \
     || { _warn "could not digest claimed dm messages for @$_dt_lane"; return 1; }
   if ! printf '%s\n' "$_dt_digest"; then
     _warn "could not emit claimed dm messages for @$_dt_lane; leaving them replayable"
@@ -1162,10 +1242,10 @@ _hook_session_start() {
   _ib="$BRAIN/dm/$_feat/pending"
   _dm_block=""; _digest_ok=0
   if _claims=$(_dm_claim_all "$_feat") && [ -n "$_claims" ]; then
-    # Queue grammar forbids whitespace, so splitting the newline-delimited claim paths is safe.
+    # Only validated queue names cross this split; absolute paths are rebuilt after it.
     # shellcheck disable=SC2086
     set -- $_claims
-    if _digest=$(_dm_digest "$@"); then
+    if _digest=$(_dm_digest "$_feat" "$@"); then
       _dm_block="Unread DMs delivered while you were away:
 $_digest
 
