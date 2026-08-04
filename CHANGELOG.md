@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.2.0 — 2026-08-04 — the claim layer is deleted
+
+Steve's ruling (`.context/seams/dm-v1.1-queue.md` § v1.2), after three consecutive adversarial
+gates each landed their HIGH findings inside the claim/lease/recovery/budget subsystem: **one
+active session per lane is the operating model** (parallel work spawns a second lane, the
+`graph`/`graph-secondary` pattern), so a per-message claim protocol was arbitrating between
+sessions the system already declares unsupported.
+
+- **Deleted:** `claimed/` as a state · claim timestamps/PIDs · `DM_CLAIM_MAX_AGE` leases ·
+  stale-claim recovery · the `.a<k>` attempt counter · the poison cap · the background lease
+  sweeper · the cross-state transition budget · `_dm_decimal_ok`/`_dm_attempt_ok`. Net
+  **−126 lines**.
+- **Consume is now:** a bounded batch from `pending/` → validate each message independently →
+  emit → move only successfully-emitted files to `read/` (collision-safe via the shared
+  `_dm_collision_dest` bump idiom). Emit-before-move is unchanged and load-bearing.
+- **Contract stated honestly: at-least-once.** A crash between emit and archive may replay a
+  message; it is never lost. "Exactly once" wording struck from the plan; digest records now
+  carry the message `id` so a replay is recognizable.
+- **Quarantine only on structural proof.** The digest's jq exit codes are translated (its own
+  `error()` = proof; any system error = transient, message stays pending) — a v1.2 GREEN bug
+  caught by the frozen suite under real dash, where a closed stdout misrouted a healthy
+  message to `failed/`. `dm take` now refuses an unusable stdout outright, leaving everything
+  pending; a global `jq` preflight failure does the same.
+- **Suite rewritten and frozen first** (54 scenarios: 46 guard / 8 RED at freeze): claim-era
+  scenarios retired — including the disjoint-concurrent-consumers requirement, which encoded
+  the rejected contract — and crash-window, isolation, backlog-continuation, collision and
+  quarantine scenarios added. Key instruments proven by mutation before freeze.
+
 ## v1.1.0 — 2026-08-04 — lane-to-lane DM
 
 Adds a **fast tier** to coordination. Until now every signal travelled at the speed of the

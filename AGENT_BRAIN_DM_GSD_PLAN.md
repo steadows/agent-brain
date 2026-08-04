@@ -1,8 +1,10 @@
 # Agent-Brain Lane DM — GSD Plan
 
-**Status:** `[~]` P0–P4 ✅ + gates 7.1/7.2 + 7.4 ultrareview ✅; v1.1 queue and the
-pre-PR H1–H5 fix round are complete (53/53 DM + 15/15 commit/install under `sh` and `dash`).
-**Next: Phase 5 deploy, after this fix round**, then P6 live e2e → 7.3 PR → 7.G.
+**Status:** `[~]` P0–P4 ✅ + gates 7.1/7.2 + 7.4 ultrareview ✅; **v1.2 (claim layer DELETED
+per the acked ruling in `.context/seams/dm-v1.1-queue.md` § v1.2) is GREEN** — suite rewritten
+and frozen (54 scenarios), engine at commit `6d9199a`, 54/54 DM + 15/15 commit/install under
+`sh` AND **real dash** (rewritten-shebang engine, not the harness-only invocation).
+**Next: Phase 5 deploy**, then P6 live e2e → 7.3 PR → 7.G.
 **Owner:** @pm · **Repo:** `~/agent-brain` (branch `fix/pretool-collision-warning`) → deployed to `<main-worktree>/.brain/`
 **Evidence:** `docs/research/agent-lane-dm-mechanisms-eval.md` (E0–E15) in `enterprise_research_dashboard-pm`
 **Predecessor:** `~/agent-brain/docs/AGENT-DM-CHANNELS.md` (2026-06-15, superseded in part)
@@ -112,7 +114,9 @@ hook fix this depends on.
 ## Done when
 
 `brain dm @<lane>` reaches a **running** lane in seconds and a **dormant** lane at its next boot,
-exactly once; `brain dm @all` reaches the whole crew; no message body ever enters a commit; and two
+**at-least-once — never lost; a crash window may replay a message, and each digest line carries the
+message `id` so a replay is recognizable**; `brain dm @all` reaches the whole crew; no message body
+ever enters a commit; and two
 real lanes hold a technical dialog in which the responder finds a **planted flaw** and, on a sound
 proposal, declines to invent one. Anything short of all five is not done.
 
@@ -241,7 +245,7 @@ manufacture evidence of compliance nobody checked.
 - `[x]` 0.5 **`spec-watchdog` audit of the frozen suite** — separate pass, dispatched at the finished
       files with `Bash` so it can run them. Hunting the hollow suite: an assertion that would pass
       against the unmodified engine, a scenario narrower than the gate it claims to encode, the
-      exactly-once check that never actually boots twice.
+      no-replay check that never actually boots twice.
       **Done 2026-08-03 — FOUR rounds, not one.** The watchdog built an honest reference
       implementation (proving every scenario reachable), then drove 25 single-point mutations:
       round 1 found 6 CRITICALs (deliver-once-ever; truncated body leak; liveness-gated broadcast;
@@ -315,8 +319,10 @@ shows **no** `.brain/dm/`
       the inbox is invisible to it. Without the rotate step, a DM sent while the lane was down is
       **lost, not queued** — the lane boots, starts listening from that instant, and never sees what
       is sitting above it. This is the whole read/unread mechanic.
-      **Why `mv` and not read-in-place:** delivery must be **exactly once**. Left in place, the same
-      message is re-injected every session forever.
+      **Why `mv` and not read-in-place:** a delivered message must leave `pending/` — left in place,
+      the same message is re-injected every session forever. (v1.2 ruling: the contract is
+      **at-least-once** — a crash between emit and archive may replay a message once at the next
+      boot; it is never lost. "Exactly once" was the v1.1-era wording and was struck.)
       **Why the hook and not an instruction:** "check your inbox at boot" is compliance an agent can
       skip; a hook is machinery that runs whether or not the agent is paying attention. Precedent for
       the failure mode: the collision warning that never fired, and the agent-frontmatter `hooks:`
@@ -324,15 +330,17 @@ shows **no** `.brain/dm/`
 - `[x]` 2.2 Extend the same injected block with the arm-your-inbox instruction carrying the concrete
       `cmd_inbox` path
 
-**Gate 2.G** `[~]` **scriptable clauses PASSED 2026-08-03** (offline delivery, exactly-once,
-collision-free archives — all green in the frozen suite). **The live-arming clause is deferred to
+**Gate 2.G** `[~]` **scriptable clauses PASSED 2026-08-03** (offline delivery, no replay after a
+clean delivery, collision-free archives — all green in the then-frozen v1.1 suite; re-proven in the
+v1.2 suite). **The live-arming clause is deferred to
 P6 by design** — "a cold lane arms the Monitor unprompted, mid-task delivery" needs a real Claude
 session, which is exactly scenarios 6.1/6.2; it cannot be a `test/dm.sh` scenario. Full gate text:
 **scoped verify**, plus: cold scratch lane arms the Monitor **unprompted** and a DM
 from another process arrives mid-task · **offline delivery:** send to a lane that is **not running**,
 then boot it — it reports the message as part of waking up, `inbox.jsonl` is empty, and the line is in
-`read/<ts>.jsonl` · **exactly-once:** boot that same lane a second time and it does **not** re-report
-the message
+`read/<ts>.jsonl` · **no-replay:** boot that same lane a second time and it does **not** re-report
+the message (v1.2 contract: at-least-once — a replay is possible only across a crash window,
+never after a clean delivery)
 
 ## Phase 3 — Protocol `[x]` (convention · `templates/navigation-standards.SKILL.md`) — CONCURRENT with P1/P2
 
@@ -508,13 +516,13 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
 - `[ ]` 6.5 Convergence writes a `connections/` note recording the contested point
 - `[ ]` 6.6 `git status` in the **real main worktree** (`<main>/`, not the scratch fixtures 6.1 uses)
       shows no `.brain/dm/` churn, and `git log -p` on the journal shows no DM body
-- `[ ]` 6.7 **Queue-lifecycle e2e (v1.1) — the crash window, live.** The unit suite proves it with
-      hand-minted claims; prove it once with real sessions. (a) DM a lane, let it boot, **kill the
-      session between claim and emit**, boot again → the message IS delivered (lease recovery,
-      UR-1); (b) after a normal delivery, boot again → it is NOT replayed (ack worked, UR-3);
-      (c) two live sessions of ONE lane both take → each gets a disjoint set, nothing double-acted
-      (finding #11); (d) confirm `failed/` is empty across the run — a message landing there during
-      a healthy e2e means the attempt counter is bumping when it should not.
+- `[ ]` 6.7 **Queue-lifecycle e2e (v1.2) — the crash window, live.** The unit suite proves it with
+      fixtures; prove it once with real sessions. (a) DM a lane, **kill the session mid-take before
+      the digest is emitted**, boot again → the message IS delivered (nothing leaves `pending/`
+      until emitted); (b) after a normal delivery, boot again → it is NOT replayed; (c) confirm no
+      `claimed/` directory ever appears anywhere under `dm/` (the layer is deleted — its
+      reappearance means a stale engine is running); (d) confirm `failed/` is empty across the run —
+      quarantine requires structural proof, and a healthy run must produce none.
 
 ## Phase 7 — Review gates & ship `[ ]` (requires P6)
 

@@ -65,6 +65,13 @@ is not.
 > races below, which only *delay* a message. **Steve ruled: this rewrite lands BEFORE any deploy
 > — v1 does not ship with a window that silently loses mail.** It also absorbs ultrareview
 > findings UR-1, UR-3 and UR-4a; full disposition of all 10 in `AGENT_BRAIN_DM_GSD_PLAN.md` §7.5.
+>
+> **v1.2 (2026-08-04): the rewrite landed, then lost its claim tier.** Three further gates
+> (pre-PR review, final ultrareview, ultra round 2) each put their HIGH findings inside the
+> claim/lease/recovery/budget subsystem; Steve ruled **delete it** (seam map § v1.2 — one active
+> session per lane; parallel work is a second lane). Suite rewritten and frozen first (54
+> scenarios), engine GREEN at `6d9199a`: 54/54 + 15/15 under `sh` AND real dash. Contract stated
+> honestly as at-least-once; quarantine only on structural proof. See `CHANGELOG.md` v1.2.0.
 
 The three findings below (full report: `docs/lane-dm-adversarial-review-findings.md`) are the
 **known limits of v1's one-shared-JSONL-inbox design** that motivated the rewrite:
@@ -109,6 +116,24 @@ citations (maildir/dirq/SQS), and the discarded alternatives — is at
 `.context/seams/dm-v1.1-queue.md` (local, per-worktree). RED tests pin THAT contract.
 
 ## Decisions recorded (won't-do / deferred-by-design)
+
+### v1.2 re-triage of the deferred review MEDIUMs (2026-08-04)
+
+The three review rounds left 12 deferred MEDIUMs. Re-triaged against the v1.2 engine:
+
+**Evaporated with the claim layer** (verified gone from `bin/brain`): poison-cap visibility ·
+temp-sweep coupling (`find -mmin` no longer exists) · lease ergonomics.
+
+**Carry — pre-existing, none ship-blocking, file as PR follow-ups:**
+- `cmd_commit`'s `commit-tree` → index-reset race, and the unborn-HEAD CAS (commit path
+  untouched by v1.2)
+- `_feat_ok` / body-cap locale divergence (byte-count sites pin `LC_ALL=C` at 3 places; the
+  flagged validation-path divergence is unaddressed)
+- `brain inbox` `@`-prefix + unregistered-lane inconsistencies
+- jq **≥ 1.6** requirement undeclared in docs (`utf8bytelength`, 2 live sites — the take
+  preflight now probes for it at runtime, so an old jq fails safe to everything-pending, but
+  the dependency floor is still not written down)
+- `_atomic_place` succeeds when the destination is a directory
 
 - **`whoami` worktree-path fallback for detached HEAD — NOT building.**
   When a feature merges and `/wrap` deletes the branch, the worktree parks at a detached `origin/main`

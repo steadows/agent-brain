@@ -18,8 +18,14 @@ For "main moved", **git is the real source of truth** (every lane rebases at sta
 is a courtesy that saves a lane from finding out mid-gate. Do not build correctness on it.
 
 `<brain> inbox` prints your `pending/` directory. Watch that directory for activity; when it changes,
-run `<brain> dm take` to atomically claim, print, and acknowledge up to 40 messages. Repeat while
-`pending/` still contains messages; leftovers remain claimable and are never discarded.
+run `<brain> dm take` to print and archive up to 40 messages. Repeat while `pending/` still contains
+messages; leftovers stay queued and are never discarded.
+
+**Delivery is at-least-once, never-lost.** A crash at the wrong instant can replay a message at the
+next boot — that is the deliberate trade: a duplicate costs a re-read, a loss breaks the feature's
+only promise. Every digest line carries the message `id`; before re-acting on a repeat, treat side
+effects as idempotent or check the durable record (git, presence notes, `connections/`) — a decision
+that exists only in an inbox did not happen anyway.
 
 ## The six shapes (measured from a live vault, not invented)
 
