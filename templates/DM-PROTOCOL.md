@@ -7,13 +7,16 @@ when you're actually in a DM exchange. Read it before your first dialog, not eve
 
 | Tier | Mechanism | Reaches | Job |
 |---|---|---|---|
-| **Fast** | `brain dm` → inbox, watched live | a **running** lane, in seconds | the nudge |
-| **Everyone-eventually** | `brain announce` → journal | every lane, at its next boot | the broadcast |
+| **Fast** | `brain dm` → per-message queue, watched live | a **running** lane, in seconds | the nudge |
+| **Journal heads-up** | `brain announce` → journal | explicitly mentioned lanes, from today's journal at boot | the heads-up |
 | **Permanent** | `connections/` note | anyone reading the vault, forever | the **record** |
 
 A DM is a signal, never the record — a decision that exists only in an inbox did not happen.
 For "main moved", **git is the real source of truth** (every lane rebases at start); the broadcast
 is a courtesy that saves a lane from finding out mid-gate. Do not build correctness on it.
+
+`brain inbox` prints your `pending/` directory. Watch that directory for activity; when it changes,
+run `brain dm take` to atomically claim, print, and acknowledge all available messages.
 
 ## The six shapes (measured from a live vault, not invented)
 

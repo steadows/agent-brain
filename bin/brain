@@ -8,18 +8,21 @@
 # (the portable equivalent — mkdir is atomic create on POSIX filesystems).
 
 set -u
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # Clear the vault-resolution sentinel at process entry: it is a marker for "this process ran
 # brain_root()", and an inherited value would let a caller's environment stand in for that.
 _BRAIN_RESOLVED=""
 
-# DM bounds. The body cap keeps the lock-free append below PIPE_BUF (where a single append is
-# atomic) and keeps one message from dominating a recipient's boot context; the inject caps keep
-# a large unread backlog from blowing that context window entirely.
+# DM bounds. One file per message removes the old append-atomicity rationale; the body cap now
+# bounds storage and digest work. The lease and attempt cap make interrupted delivery recoverable
+# without letting a poison message loop forever.
 DM_MAX_BODY=4096
 DM_INJECT_MAX_LINES=40
 DM_INJECT_MAX_COLS=2000
+DM_CLAIM_MAX_AGE=600
+DM_MAX_ATTEMPTS=3
+DM_TEMP_MAX_AGE=300
 
 # ── Root discovery (fix A) — the one function everything reuses ───────────────────────────────
 # --git-common-dir resolves to the MAIN worktree's .git from any sibling worktree, so the brain
@@ -46,6 +49,25 @@ _main_remote() { _r=$(_main_ref); printf '%s\n' "${_r%%/*}"; }
 _main_branch() { _r=$(_main_ref); printf '%s\n' "${_r#*/}"; }
 _warn()     { printf 'brain: %s\n' "$*" >&2; }
 _die()      { _warn "$*"; exit 1; }
+
+# Write producer output to a same-directory dot-temp, then atomically replace the destination.
+# Same-directory rename is process-crash-safe; POSIX sh cannot promise power-loss durability.
+_atomic_place() { # <content-producer> <dest> [producer-args...]
+  [ "$#" -ge 2 ] || return 2
+  _ap_producer=$1; _ap_dest=$2; shift 2
+  _ap_dir=${_ap_dest%/*}; _ap_n=0; _ap_tmp="$_ap_dir/.tmp-$$"
+  while [ -e "$_ap_tmp" ] || [ -L "$_ap_tmp" ]; do
+    _ap_n=$((_ap_n + 1)); _ap_tmp="$_ap_dir/.tmp-$$-$_ap_n"
+  done
+  if ! "$_ap_producer" "$@" > "$_ap_tmp"; then
+    rm -f -- "$_ap_tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! command mv -f -- "$_ap_tmp" "$_ap_dest" 2>/dev/null; then
+    rm -f -- "$_ap_tmp" 2>/dev/null || true
+    return 1
+  fi
+}
 
 # repo-root-relative path for an (absolute or relative) file path
 _relpath() {
@@ -112,14 +134,19 @@ _path_match() {
   esac
 }
 
-# Replace a single frontmatter key's value in place (inline form).
-_set_fm_inline() {
-  _f=$1; _k=$2; _v=$3
-  awk -v key="$_k" -v val="$_v" '
+# Render one frontmatter key replacement; `_set_fm_inline` owns atomic placement.
+_render_fm_inline() { # <source> <key> <value>
+  _rfi_source=$1; _rfi_key=$2; _rfi_value=$3
+  awk -v key="$_rfi_key" -v val="$_rfi_value" '
     /^---[[:space:]]*$/ { fence++; print; next }
     fence == 1 && !done && index($0, key ":") == 1 { print key ": " val; done=1; next }
     { print }
-  ' "$_f" > "$_f.tmp" && mv "$_f.tmp" "$_f"
+  ' "$_rfi_source"
+}
+
+_set_fm_inline() {
+  _sfi_file=$1; _sfi_key=$2; _sfi_value=$3
+  _atomic_place _render_fm_inline "$_sfi_file" "$_sfi_file" "$_sfi_key" "$_sfi_value"
 }
 
 # Atomic mkdir lock (flock replacement — macOS has no flock).
@@ -204,92 +231,286 @@ cmd_announce() {
 # ── dm (direct lane-to-lane message; the fast path, NOT the record) ──────────────────────────
 # The journal stays the durable record and connections stay the state. A DM is the SIGNAL that
 # something changed — it exists to cut unblock latency from "next session boot" to seconds.
-# A feature slug becomes a path segment under .brain/dm/, so validate it once here — every
-# inbox path in the engine flows through this function, and `brain dm`/`brain inbox` are on the
-# hook allowlist, i.e. callable without a permission prompt.
+# Queue entries move pending → claimed → read, with stale claims retried and poison messages
+# retained in failed/. Rename arbitration is the only concurrency control; this path takes no lock.
 _feat_ok() {
   case "$1" in
-    ''|.*|*/*|*'..'*|*' '*) return 1 ;;
+    ''|.*|-*|*'..'*|*[!A-Za-z0-9._-]*) return 1 ;;
   esac
+  [ "${#1}" -le 128 ] || return 1
   return 0
 }
 
-_inbox_path() {
-  _feat_ok "$1" || _die "brain: invalid feature name '$1' (bare slug, no path separators)"
-  printf '%s\n' "$BRAIN/dm/$1/inbox.jsonl"
+# Validate the queue path component-by-component. POSIX sh has no openat/O_NOFOLLOW, so this
+# refuses observed links but cannot close a same-user check/use race.
+_dm_dir_ok() { # <dm-root|lane-dir|state-dir|message-file>
+  _do_path=$1; _do_root="$BRAIN/dm"
+  [ ! -L "$_do_root" ] && [ -d "$_do_root" ] \
+    || { _warn "dm queue root is not a real directory: $_do_root"; return 1; }
+  [ "$_do_path" = "$_do_root" ] && return 0
+  case "$_do_path" in
+    "$_do_root"/*) _do_rest=${_do_path#"$_do_root"/} ;;
+    *) _warn "dm queue path escapes the queue root: $_do_path"; return 1 ;;
+  esac
+
+  _do_lane=${_do_rest%%/*}
+  _feat_ok "$_do_lane" || { _warn "invalid dm lane component: $_do_lane"; return 1; }
+  _do_lane_path="$_do_root/$_do_lane"
+  [ ! -L "$_do_lane_path" ] && [ -d "$_do_lane_path" ] \
+    || { _warn "dm lane is not a real directory: $_do_lane_path"; return 1; }
+  [ "$_do_rest" = "$_do_lane" ] && return 0
+
+  _do_tail=${_do_rest#*/}; _do_state=${_do_tail%%/*}
+  case "$_do_state" in pending|claimed|read|failed) ;; *)
+    _warn "invalid dm queue state: $_do_state"; return 1 ;;
+  esac
+  _do_state_path="$_do_lane_path/$_do_state"
+  [ ! -L "$_do_state_path" ] && [ -d "$_do_state_path" ] \
+    || { _warn "dm state is not a real directory: $_do_state_path"; return 1; }
+  [ "$_do_tail" = "$_do_state" ] && return 0
+
+  _do_name=${_do_tail#*/}
+  case "$_do_name" in ''|*/*) _warn "invalid dm message path: $_do_path"; return 1 ;; esac
+  [ ! -L "$_do_path" ] && [ -f "$_do_path" ] \
+    || { _warn "refusing non-regular dm message: $_do_path"; return 1; }
 }
 
-# The single owner of inbox creation: ensure a lane's inbox exists, print its path.
-# Returns non-zero if the inbox cannot be created — a caller that ignores that would report a
-# delivery that never happened.
-_inbox_ensure() {
-  _ie=$(_inbox_path "$1") || return 1
-  # Refuse symlinked lane dirs / inboxes: a link would let a send append to — and boot delivery
-  # inject the contents of — a file outside the vault entirely.
-  [ -L "${_ie%/*}" ] && { _warn "brain: $1's dm directory is a symlink — refusing"; return 1; }
-  [ -d "${_ie%/*}" ] || mkdir -p "${_ie%/*}" 2>/dev/null || return 1
-  [ -L "$_ie" ] && { _warn "brain: $1's inbox is a symlink — refusing"; return 1; }
-  # `: >>` not `: >` — a plain truncating redirect races another sender that created and wrote
-  # between our -f test and this line, erasing their message while both report success.
-  [ -f "$_ie" ] || : >> "$_ie" 2>/dev/null || return 1
-  [ -f "$_ie" ] || return 1
-  printf '%s\n' "$_ie"
+_dm_make_dir() { # <path>
+  _md_path=$1
+  [ -L "$_md_path" ] && { _warn "refusing symlinked dm directory: $_md_path"; return 1; }
+  if [ -e "$_md_path" ] && [ ! -d "$_md_path" ]; then
+    _warn "refusing non-directory dm component: $_md_path"; return 1
+  fi
+  if [ ! -d "$_md_path" ]; then
+    mkdir "$_md_path" 2>/dev/null || {
+      [ -d "$_md_path" ] && [ ! -L "$_md_path" ] || {
+        _warn "could not create dm directory: $_md_path"; return 1;
+      }
+    }
+  fi
+  [ -d "$_md_path" ] && [ ! -L "$_md_path" ]
 }
 
-# Print this lane's inbox path — what the agent arms its Monitor on at session start.
+_dm_ensure_tree() { # <lane>
+  _et_lane=$1
+  _feat_ok "$_et_lane" || { _warn "invalid feature name '$_et_lane' (bare slug only)"; return 1; }
+  _et_root="$BRAIN/dm"; _et_lane_dir="$_et_root/$_et_lane"
+  _dm_make_dir "$_et_root" || return 1
+  _dm_dir_ok "$_et_root" || return 1
+  _dm_make_dir "$_et_lane_dir" || return 1
+  _dm_dir_ok "$_et_lane_dir" || return 1
+  for _et_state in pending claimed read failed; do
+    _dm_make_dir "$_et_lane_dir/$_et_state" || return 1
+    _dm_dir_ok "$_et_lane_dir/$_et_state" || return 1
+  done
+}
+
+# Print this lane's pending directory — what the agent arms at session start.
 cmd_inbox() {
   _require_brain
   _feat=${1:-$(cmd_whoami)}
   [ -n "$_feat" ] || _die "usage: brain inbox [<feature>]   (no feature given and whoami is empty)"
-  _inbox_ensure "$_feat"
+  _dm_ensure_tree "$_feat" || return 1
+  printf '%s\n' "$BRAIN/dm/$_feat/pending"
 }
 
-# The single send path (seam 0.3a): jq-encode + one O_APPEND printf. One JSON object per line
-# (wire format ratified: from/to/ts/content) so a quote or newline in the body can never break
-# the receiver's line framing. Deliberately NO lock (task 1.4): a single sub-PIPE_BUF append is
-# atomic, and _lock_acquire has no staleness break — one killed sender would wedge the
-# recipient's inbox forever. Journaling stays with the callers: one command invocation = one
-# journal line, never one per recipient.
-_dm_send() { # <from> <to> <msg> <ts> — non-zero on ANY failure to store the message
-  _sb=$(_inbox_ensure "$2") || return 1
-  _sl=$(jq -cn --arg f "$1" --arg t "$2" --arg ts "$4" --arg c "$3" \
-    '{from:$f,to:$t,ts:$ts,content:$c}' 2>/dev/null) \
-    || _die "brain dm: jq failed to encode the message"
-  printf '%s\n' "$_sl" >> "$_sb" || return 1
+_dm_id_in_use() { # <lane> <id>
+  _iu_lane=$1; _iu_id=$2
+  for _iu_state in pending claimed read failed; do
+    for _iu_file in "$BRAIN/dm/$_iu_lane/$_iu_state/$_iu_id".a*; do
+      [ -e "$_iu_file" ] || [ -L "$_iu_file" ] || continue
+      return 0
+    done
+  done
+  return 1
 }
 
-# Rotate a non-empty inbox to the read archive and print the archived path; silent no-op on a
-# missing/empty inbox (seam 0.3b). `mv` (not read-in-place) is what makes boot delivery
-# exactly-once; `<ts>-<pid>` (task 2.1) makes same-second rotations collision-free — each boot
-# is its own process, so $$ differs even when the clock does not.
-# Returns 0 (silent) when there is nothing to rotate, 0 + the archive path on success, and
-# non-zero when rotation FAILED — the caller must tell those apart, because a failed rotation
-# leaves real unread messages sitting in the inbox where nothing else will surface them.
-_inbox_rotate() {
-  _ri=$(_inbox_path "$1") || return 1
-  [ -s "$_ri" ] || return 0
-  _rr="${_ri%/*}/read"                       # derived from the path authority, not rebuilt
-  if [ ! -d "$_rr" ]; then mkdir -p "$_rr" || return 1; fi
-  _ra="$_rr/$(_now_compact)-$$.jsonl"
-  mv "$_ri" "$_ra" || return 1
-  printf '%s\n' "$_ra"
+_dm_new_id() { # <lane>
+  _ni_lane=$1; _ni_base="$(_now_compact)-$$"; _ni_id=$_ni_base; _ni_n=0
+  while _dm_id_in_use "$_ni_lane" "$_ni_id"; do
+    _ni_n=$((_ni_n + 1)); _ni_id="$_ni_base-$_ni_n"
+  done
+  printf '%s\n' "$_ni_id"
 }
 
-# Bounded render of a jsonl transcript for injection into a session's startup context: an
-# unbounded backlog would otherwise consume the receiving lane's context window.
-_dm_digest() {
-  _dgn=$(wc -l < "$1" 2>/dev/null | tr -d ' ') || _dgn=0
-  [ -n "$_dgn" ] || _dgn=0
-  if [ "$_dgn" -gt "$DM_INJECT_MAX_LINES" ]; then
-    printf '(%s earlier message(s) omitted — full transcript: %s)\n' \
-      "$((_dgn - DM_INJECT_MAX_LINES))" "$1"
-    tail -n "$DM_INJECT_MAX_LINES" "$1" | cut -c1-"$DM_INJECT_MAX_COLS"
-  else
-    cut -c1-"$DM_INJECT_MAX_COLS" < "$1"
+_dm_write_json() { # <from> <to> <msg> <ts>
+  jq -cn --arg f "$1" --arg t "$2" --arg c "$3" --arg ts "$4" \
+    '{from:$f,to:$t,ts:$ts,content:$c}' 2>/dev/null
+}
+
+# One message is one JSON object, made visible only by the final same-directory rename.
+_dm_send() { # <from> <to> <msg> <ts>
+  _ds_from=$1; _ds_to=$2; _ds_msg=$3; _ds_ts=$4
+  _dm_ensure_tree "$_ds_to" || return 1
+  _ds_id=$(_dm_new_id "$_ds_to") || return 1
+  _ds_dest="$BRAIN/dm/$_ds_to/pending/$_ds_id.a0"
+  _atomic_place _dm_write_json "$_ds_dest" "$_ds_from" "$_ds_to" "$_ds_msg" "$_ds_ts"
+}
+
+_dm_purge_stale_temps() { # <lane>
+  _pt_lane=$1; _pt_pending="$BRAIN/dm/$_pt_lane/pending"; _pt_regular=0
+  _dm_dir_ok "$_pt_pending" || return 1
+  for _pt_file in "$_pt_pending"/.tmp-*; do
+    [ -e "$_pt_file" ] || [ -L "$_pt_file" ] || continue
+    if [ -L "$_pt_file" ] || [ ! -f "$_pt_file" ]; then
+      _warn "refusing non-regular dm temp: $_pt_file"
+      continue
+    fi
+    _pt_regular=1
+  done
+  [ "$_pt_regular" = 1 ] || return 0
+  _pt_minutes=$((DM_TEMP_MAX_AGE / 60))
+  # The expanded direct children are pruned, so one find pass never descends into a planted dir.
+  find "$_pt_pending"/.tmp-* -prune -type f -mmin "+$_pt_minutes" \
+    -exec rm -f -- {} + 2>/dev/null \
+    || { _warn "could not sweep stale dm temps under $_pt_pending"; return 1; }
+}
+
+_dm_recover_stale() { # <lane>
+  _rs_lane=$1
+  _dm_ensure_tree "$_rs_lane" || return 1
+  _dm_purge_stale_temps "$_rs_lane" || return 1
+  _rs_claimed="$BRAIN/dm/$_rs_lane/claimed"; _rs_now=""
+  for _rs_file in "$_rs_claimed"/*; do
+    [ -e "$_rs_file" ] || [ -L "$_rs_file" ] || continue
+    _dm_dir_ok "$_rs_file" || continue
+    _rs_name=${_rs_file##*/}
+    case "$_rs_name" in *.a*.c*-*) ;; *)
+      _warn "invalid claimed dm name: $_rs_name"; continue ;;
+    esac
+    _rs_pre=${_rs_name%.c*}; _rs_stamp=${_rs_name##*.c}
+    _rs_claim_ts=${_rs_stamp%-*}; _rs_pid=${_rs_stamp##*-}
+    _rs_attempt=${_rs_pre##*.a}; _rs_id=${_rs_pre%.a*}
+    case "$_rs_claim_ts:$_rs_pid:$_rs_attempt:$_rs_id" in
+      *[!0-9:._TZ-]*) _warn "invalid claimed dm name: $_rs_name"; continue ;;
+    esac
+    case "$_rs_claim_ts" in ''|*[!0-9]*) _warn "invalid claim epoch in $_rs_name"; continue ;; esac
+    case "$_rs_pid" in ''|*[!0-9]*) _warn "invalid claimer pid in $_rs_name"; continue ;; esac
+    case "$_rs_attempt" in ''|*[!0-9]*) _warn "invalid attempt in $_rs_name"; continue ;; esac
+    [ -n "$_rs_id" ] || { _warn "missing message id in $_rs_name"; continue; }
+    [ -n "$_rs_now" ] || _rs_now=$(date -u +%s) || return 1
+    _rs_age=$((_rs_now - _rs_claim_ts))
+    if [ "$_rs_now" -ge "$_rs_claim_ts" ] && [ "$_rs_age" -le "$DM_CLAIM_MAX_AGE" ]; then
+      continue
+    fi
+    _rs_next=$((_rs_attempt + 1))
+    if [ "$_rs_next" -gt "$DM_MAX_ATTEMPTS" ]; then
+      _rs_dest="$BRAIN/dm/$_rs_lane/failed/$_rs_id.a$_rs_next"
+    else
+      _rs_dest="$BRAIN/dm/$_rs_lane/pending/$_rs_id.a$_rs_next"
+    fi
+    if command mv -f -- "$_rs_file" "$_rs_dest" 2>/dev/null; then
+      continue
+    fi
+    [ -e "$_rs_file" ] || [ -L "$_rs_file" ] || continue
+    _warn "could not recover stale dm claim: $_rs_file"
+    return 1
+  done
+}
+
+_dm_claim_all() { # <lane> — print the full paths won by this process
+  _ca_lane=$1
+  _dm_ensure_tree "$_ca_lane" || return 1
+  _ca_pending="$BRAIN/dm/$_ca_lane/pending"; _ca_claimed="$BRAIN/dm/$_ca_lane/claimed"
+  _ca_epoch=""
+  for _ca_file in "$_ca_pending"/*; do
+    [ -e "$_ca_file" ] || [ -L "$_ca_file" ] || continue
+    _dm_dir_ok "$_ca_file" || continue
+    _ca_name=${_ca_file##*/}; _ca_attempt=${_ca_name##*.a}; _ca_id=${_ca_name%.a*}
+    case "$_ca_attempt" in ''|*[!0-9]*) _warn "invalid pending dm name: $_ca_name"; continue ;; esac
+    [ -n "$_ca_id" ] && [ "$_ca_id" != "$_ca_name" ] \
+      || { _warn "invalid pending dm name: $_ca_name"; continue; }
+    [ -n "$_ca_epoch" ] || _ca_epoch=$(date -u +%s) || return 1
+    _ca_dest="$_ca_claimed/$_ca_name.c$_ca_epoch-$$"
+    if command mv -f -- "$_ca_file" "$_ca_dest" 2>/dev/null; then
+      printf '%s\n' "$_ca_dest"
+      continue
+    fi
+    [ -e "$_ca_file" ] || [ -L "$_ca_file" ] || continue
+    _warn "could not claim pending dm: $_ca_file"
+    return 1
+  done
+}
+
+_dm_ack() { # <lane> <full-claimed-path>
+  _ak_lane=$1; _ak_claim=$2
+  _dm_ensure_tree "$_ak_lane" || return 1
+  _dm_dir_ok "$_ak_claim" || return 1
+  _ak_name=${_ak_claim##*/}
+  case "$_ak_name" in *.a*.c*-*) ;; *) _warn "invalid claimed dm name: $_ak_name"; return 1 ;; esac
+  _ak_read_name=${_ak_name%.c*}; _ak_dest="$BRAIN/dm/$_ak_lane/read/$_ak_read_name"
+  [ ! -L "$_ak_dest" ] || { _warn "refusing symlinked dm ack destination: $_ak_dest"; return 1; }
+  if command mv -f -- "$_ak_claim" "$_ak_dest" 2>/dev/null; then return 0; fi
+  if [ ! -e "$_ak_claim" ] && [ ! -L "$_ak_claim" ]; then
+    _warn "dm claim disappeared before ack (it may have been recovered): $_ak_name"
+    return 0
   fi
+  _warn "could not ack dm claim: $_ak_name"
+  return 1
+}
+
+# Render at most DM_INJECT_MAX_LINES messages with one jq pass. Content is shortened before
+# serialization, so a bound can never cut through JSON syntax.
+_dm_digest() { # <claimed-file>...
+  _dg_count=$#; [ "$_dg_count" -gt 0 ] || return 0
+  _dg_first=$1; _dg_lane_dir=${_dg_first%/claimed/*}
+  _dg_skip=0
+  if [ "$_dg_count" -gt "$DM_INJECT_MAX_LINES" ]; then
+    _dg_skip=$((_dg_count - DM_INJECT_MAX_LINES))
+    printf '(%s earlier message(s) omitted from this bounded view; archive: %s/read/)\n' \
+      "$_dg_skip" "$_dg_lane_dir"
+  fi
+  while [ "$_dg_skip" -gt 0 ]; do shift; _dg_skip=$((_dg_skip - 1)); done
+  for _dg_file in "$@"; do _dm_dir_ok "$_dg_file" || return 1; done
+  _dg_content_max=$(((DM_INJECT_MAX_COLS - 512) / 6))
+  [ "$_dg_content_max" -gt 0 ] || _dg_content_max=1
+  jq -c --argjson max "$_dg_content_max" '
+    if type != "object" or (.content | type) != "string" then error("invalid dm object")
+    else .content = .content[0:$max]
+    end
+  ' "$@" 2>/dev/null
+}
+
+cmd_dm_take() {
+  _require_brain
+  _dt_lane=$(cmd_whoami)
+  [ -n "$_dt_lane" ] || _die "brain dm take: whoami is empty"
+  _dm_recover_stale "$_dt_lane" || return 1
+  _dt_claims=$(_dm_claim_all "$_dt_lane"); _dt_claim_rc=$?
+  [ "$_dt_claim_rc" = 0 ] || return 1
+  [ -n "$_dt_claims" ] || return 0
+  # Queue grammar forbids whitespace, so splitting the newline-delimited claim paths is safe.
+  # shellcheck disable=SC2086
+  set -- $_dt_claims
+  _dt_digest=$(_dm_digest "$@") \
+    || { _warn "could not digest claimed dm messages for @$_dt_lane"; return 1; }
+  if ! printf '%s\n' "$_dt_digest"; then
+    _warn "could not emit claimed dm messages for @$_dt_lane; leaving them replayable"
+    return 1
+  fi
+  _dt_ack_rc=0
+  for _dt_claim in "$@"; do _dm_ack "$_dt_lane" "$_dt_claim" || _dt_ack_rc=1; done
+  return "$_dt_ack_rc"
+}
+
+_dm_failed_count() { # <lane>
+  _fc_dir="$BRAIN/dm/$1/failed"; _fc_count=0
+  [ -e "$_fc_dir" ] || [ -L "$_fc_dir" ] || { printf '0\n'; return 0; }
+  _dm_dir_ok "$_fc_dir" || return 1
+  for _fc_file in "$_fc_dir"/*; do
+    [ -e "$_fc_file" ] || [ -L "$_fc_file" ] || continue
+    _dm_dir_ok "$_fc_file" || continue
+    _fc_count=$((_fc_count + 1))
+  done
+  printf '%s\n' "$_fc_count"
 }
 
 cmd_dm() {
+  if [ "${1:-}" = "take" ]; then
+    [ "$#" = 1 ] || _die "usage: brain dm take"
+    cmd_dm_take
+    return $?
+  fi
   _require_brain
   _to=${1:-}; _msg=${2:-}
   [ -n "$_to" ] && [ -n "$_msg" ] || _die "usage: brain dm @<feature>|@all \"<msg>\""
@@ -297,16 +518,15 @@ cmd_dm() {
   # whoami already falls back to BRAIN_FEATURE, so empty here can only mean "system"
   _from=$(cmd_whoami); _from=${_from:-system}
   _ts=$(_now_iso)
-  # Bound the body: the lock-free append is atomic only below PIPE_BUF, and a huge body would
-  # also dominate the recipient's boot context. Anything larger belongs in a connection note.
+  # The cap bounds queue storage and digest work. Larger payloads belong in a connection note.
   [ "${#_msg}" -le "$DM_MAX_BODY" ] || \
     _die "brain dm: message too long (${#_msg} > $DM_MAX_BODY chars) — put it in a connections/ note and DM the pointer"
 
   if [ "$_to" = "all" ]; then
     # Broadcast (task 1.6): every registered presence note, skip self only. Deliberately NOT
     # gated on status or updated: — presence `updated:` is unreliable, and writing one line
-    # into a dormant lane's inbox is harmless (delivered at its next boot by the rotation).
-    _n=0
+    # into a dormant lane's queue is harmless (delivered at its next boot).
+    _n=0; _failed=""
     for _pn in "$BRAIN"/presence/*.md; do
       [ -e "$_pn" ] || continue
       _rcpt=$(_agent_slug "$_pn")
@@ -319,7 +539,7 @@ cmd_dm() {
       fi
     done
     [ "$_n" -gt 0 ] || _die "brain dm: broadcast delivered to nobody${_failed:+ (failed:$_failed)}"
-    _announce_as "$_from" "dm → @all (broadcast to $_n inboxes; transcripts under .brain/dm/)${_failed:+ — FAILED:$_failed}" \
+    _announce_as "$_from" "dm → @all (broadcast to $_n queues; transcripts under .brain/dm/)${_failed:+ — FAILED:$_failed}" \
       || _warn "brain dm: broadcast DELIVERED but the journal call-log line FAILED — audit trail incomplete"
     printf 'dm → @all (%s inboxes)%s\n' "$_n" "${_failed:+ — FAILED:$_failed}"
     [ -z "${_failed:-}" ]      # partial delivery is a non-zero exit, not a success
@@ -331,14 +551,14 @@ cmd_dm() {
   # A failed store must never be announced as a delivery — the journal is committed, so a false
   # "delivered" line is worse than a loud failure.
   _dm_send "$_from" "$_to" "$_msg" "$_ts" \
-    || _die "brain dm: could not write to @$_to's inbox — nothing sent (check .brain/dm/$_to/)"
+    || _die "brain dm: could not write to @$_to's queue — nothing sent (check .brain/dm/$_to/)"
   # Call-log line, never the body (task 1.2, Steve's call): the journal is committed and the
   # secret scan cannot see a mid-line body; the pointer keeps the transcript retrievable.
   # Vault-relative on purpose — this line is committed and read on other machines, where an
-  # absolute path is meaningless; and name where it moves, since boot rotation archives it.
+  # absolute path is meaningless.
   # The message IS delivered by now, so a journal failure must not read as "resend" — report it
   # as an audit-log failure with its own exit code.
-  _announce_as "$_from" "dm → @$_to (transcript: .brain/dm/$_to/inbox.jsonl, then read/ once delivered)" \
+  _announce_as "$_from" "dm → @$_to (transcripts: .brain/dm/$_to/)" \
     || _warn "brain dm: DELIVERED to @$_to but the journal call-log line FAILED — audit trail incomplete, do not resend"
   printf 'dm → @%s\n' "$_to"
 }
@@ -414,6 +634,14 @@ cmd_status() {
   # hook-error breadcrumbs
   [ -s "$BRAIN/.hook-errors.log" ] && \
     printf '\n⚠ hook errors logged — see .brain/.hook-errors.log\n'
+
+  # Poison messages are terminal but never silent or auto-deleted.
+  if [ -n "$_me" ]; then
+    _failed_count=$(_dm_failed_count "$_me" 2>/dev/null) || _failed_count=0
+    [ "$_failed_count" -gt 0 ] 2>/dev/null && \
+      printf '\n⚠ %s DM message(s) failed permanently — inspect .brain/dm/%s/failed/\n' \
+        "$_failed_count" "$_me"
+  fi
 
   # recent journal lines relevant to me
   if [ -n "$_me" ]; then
@@ -740,12 +968,17 @@ cmd_revert() {
     printf 'brain: reverted commit %s\n' "$_id"; return 0
   fi
   if [ -f "$BRAIN/CHANGES.md" ] && grep -q " $_id — " "$BRAIN/CHANGES.md"; then
-    grep -v " $_id — " "$BRAIN/CHANGES.md" > "$BRAIN/CHANGES.md.tmp" && mv "$BRAIN/CHANGES.md.tmp" "$BRAIN/CHANGES.md"
+    _atomic_place _render_without_change "$BRAIN/CHANGES.md" "$BRAIN/CHANGES.md" "$_id" \
+      || _die "could not rewrite CHANGES.md while reverting $_id"
     rm -f "$BRAIN/proposals/applied/$_id.md"
     cmd_announce "reverted convention change $_id"
     printf 'brain: reverted convention change %s (removed from CHANGES.md)\n' "$_id"; return 0
   fi
   _die "no change found for id: $_id"
+}
+
+_render_without_change() { # <source> <change-id>
+  awk -v marker=" $2 — " 'index($0, marker) == 0 { print }' "$1"
 }
 
 # ── hooks ────────────────────────────────────────────────────────────────────────────────────
@@ -780,36 +1013,44 @@ _hook_session_start() {
     esac
     exit 0                               # non-feature branch → silent
   fi
-  # (b2) rotate → deliver → arm, in that order (task 2.1): the watcher attaches at end-of-file,
-  # so anything already in the inbox would be invisible — rotate it out, inject it, then
-  # re-create the empty inbox to arm on. `mv` makes delivery exactly-once across boots.
-  _arc=$(_inbox_rotate "$_feat"); _rot_rc=$?
-  _ib=$(cmd_inbox "$_feat")
-  _dm_block=""
-  if [ -n "$_arc" ]; then
-    _dm_block="Unread DMs delivered while you were away (archived: $_arc):
-$(_dm_digest "$_arc")
+  # (b2) Recover → claim → digest. Ack happens only after the complete SessionStart payload was
+  # emitted successfully, so an interrupted boot leaves every message replayable.
+  _dm_recover_stale "$_feat" || true
+  _claims=$(_dm_claim_all "$_feat"); _claim_rc=$?
+  _ib=$(cmd_inbox "$_feat") || _ib="$BRAIN/dm/$_feat/pending"
+  _dm_block=""; _digest_ok=0
+  if [ "$_claim_rc" = 0 ] && [ -n "$_claims" ]; then
+    # Queue grammar forbids whitespace, so splitting the newline-delimited claim paths is safe.
+    # shellcheck disable=SC2086
+    set -- $_claims
+    if _digest=$(_dm_digest "$@"); then
+      _dm_block="Unread DMs delivered while you were away:
+$_digest
 
 "
-  elif [ "$_rot_rc" != 0 ] && [ -s "$_ib" ]; then
-    # Rotation failed but messages are really there: deliver in place rather than boot silent.
-    # This trades exactly-once for at-least-once (they re-report next boot) — the honest trade,
-    # and the _warn reaches .hook-errors.log via cmd_hook's stderr redirect.
-    _warn "brain: could not rotate @$_feat's inbox — delivering in place; fix perms under .brain/dm/$_feat/"
-    _dm_block="Unread DMs — NOT archived, inbox rotation FAILED, so these repeat next boot:
-$(_dm_digest "$_ib")
-
-"
+      _digest_ok=1
+    else
+      _warn "could not digest claimed dm messages for @$_feat; leaving them replayable"
+    fi
   fi
   # (c) cheap auto-fixes, robust to a never-wraps agent
   cmd_reconcile >/dev/null 2>&1 || true
   # (d) inject the protocol nudge + live state
   _st=$(cmd_status 2>/dev/null)
-  _emit_session_ctx "${_dm_block}Run the **navigation-standards** skill now (the Agent-Brain coordination protocol).
+  if _emit_session_ctx "${_dm_block}Run the **navigation-standards** skill now (the Agent-Brain coordination protocol).
 
-Your DM inbox — arm a watch on it for lane-to-lane messages: $_ib
+Your DM pending queue — arm a watch on directory activity: $_ib
+On activity, claim and consume it with: .brain/bin/brain dm take
 
-$_st"
+$_st"; then
+    if [ "$_digest_ok" = 1 ]; then
+      _ack_rc=0
+      for _claim in "$@"; do _dm_ack "$_feat" "$_claim" || _ack_rc=1; done
+      [ "$_ack_rc" = 0 ] || _warn "one or more DMs were emitted but could not be acked; they remain replayable"
+    fi
+  else
+    _warn "could not emit SessionStart context; claimed DMs remain replayable"
+  fi
   exit 0
 }
 
@@ -983,8 +1224,9 @@ brain — Agent Brain coordination vault (v1, filesystem-only)
   brain new-feature <slug>              register one feature (run once)
   brain whoami                          resolve the current feature (empty = not a brain branch)
   brain announce "<msg>"                append a line to today's journal
-  brain dm @<feature>|@all "<msg>"      direct-message a lane's inbox (@all = every lane but you)
-  brain inbox [<feature>]               print (and create) a lane's DM inbox path
+  brain dm @<feature>|@all "<msg>"      direct-message a lane's queue (@all = every lane but you)
+  brain dm take                         claim, print, and acknowledge this lane's pending DMs
+  brain inbox [<feature>]               print (and create) a lane's pending/ queue directory
   brain status                          live dashboard (features, connections, banners)
   brain reconcile [--check]             validate + cheap auto-fixes (--check = validate only)
   brain commit                          durability: path-scoped, locked, secret-scanned, ff-only

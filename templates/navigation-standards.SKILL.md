@@ -61,10 +61,10 @@ Journal = ephemeral heads-up; connection/presence = durable state. One moment of
 
 ## DM — the fast tier (signal, never the record)
 - `brain dm @<lane> "<msg>"` → their inbox in seconds (the nudge); `brain dm @all` fans to every
-  registered inbox (status broadcast / merge coordination); `announce` reaches everyone at next
-  boot. The durable **record is a connection note** — a decision only in an inbox did not happen.
-- **Arm your inbox now:** `.brain/bin/brain inbox` prints the path — watch it for new JSON lines
-  (`from/to/ts/content`). DMs sent while you were down arrive at boot, exactly once.
+  registered queue (status broadcast / merge coordination). `announce` is a today-only journal
+  heads-up for lanes explicitly mentioned. The durable **record is a connection note**.
+- **Arm your queue now:** `.brain/bin/brain inbox` prints your `pending/` directory. Watch it for
+  activity; then run `.brain/bin/brain dm take` to claim, print, and acknowledge available DMs.
 - **Triage by cost, not authority:** read everything · **ack everything, even when deferring** ·
   do it now if small **or if it invalidates your current work** · else finish your task first ·
   **write every deferral down** (punch list / connection note) — context dies at compaction.
