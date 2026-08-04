@@ -329,3 +329,139 @@ archive-name recipe and its comment block · `_inbox_ensure`'s append-creation s
   explicit-mention — verified at `bin/brain:347`).
 - Deploy runbook additions (UR-5 rollback drain, UR-6 restart-and-ack gate) are plan-phase edits,
   not engine code.
+
+---
+
+# v1.2 — DELETE THE CLAIM LAYER (design decision, 2026-08-04)
+
+**Status: DECIDED by Steve 2026-08-04. Supersedes decisions 4, 6, 6b, 6c below for the consume
+path. Send-side atomicity (decision 3) is UNCHANGED.** No source code has been written against
+this yet — this section lands first, on its own, per the architecture-first rule.
+
+## What forced it
+
+Three consecutive adversarial gates on the v1.1 queue: 5 HIGH, then 6 HIGH, then 5 HIGH. Rounds
+2 and 3 each closed findings and *introduced new HIGH defects*. In round 3, **all five HIGH
+findings were inside the claim/lease/recovery/budget layer** — measured at ~211 lines of a
+1628-line engine plus 14 `DM_*` constants.
+
+The complexity is endogenous, and traces two chains:
+
+```
+claim → hidden crash state → lease → invisible expiry → background sweeper → transition budget
+attempt suffix → filename arithmetic → NAME_MAX overflow → collision machinery
+```
+
+Every HIGH finding sits on one of those chains.
+
+## The contradiction that was never settled
+
+Four project statements could not all be true at once:
+
+| Source | Claim |
+|---|---|
+| `AGENT_BRAIN_DM_GSD_PLAN.md:115` (+ 4 more sites) | delivery **exactly once** |
+| `test/dm.sh` Q.T/15 (frozen) | two concurrent consumers get **disjoint** sets |
+| This seam map + `CHANGELOG.md` | **at-least-once**; duplicates explicitly acceptable |
+| `docs/BUILD-SPEC.md:292` | **one active session per feature** — a must-hold invariant |
+
+The claim layer exists to serve *exactly-once + disjoint*. The at-least-once contract says it is
+unnecessary. Three review rounds hardened machinery whose necessity had never been decided.
+
+## The ruling
+
+**One active session per lane. Parallel work spawns a SECOND LANE, not a second session** —
+the pattern already proven live by `graph` + `graph-secondary`. `BUILD-SPEC:292` was right; the
+plan's "exactly once" language and Q.T/15's disjoint-consumers requirement are the errors.
+
+A per-message lease was therefore arbitrating between two sessions that — in that state — are
+already clobbering each other's single-writer presence note and shared work. It defended one
+symptom of a condition the system declares unsupported.
+
+**Cross-machine note (verified 2026-08-04):** `dm/` is gitignored and `cmd_commit` un-tracks it,
+so queues never travel between machines. Two same-lane sessions on *different* machines hold
+independent mailboxes — no collision, and no cross-machine delivery. The committed
+`presence/<lane>.md` is the only genuine cross-machine single-writer concern, and it is
+independent of DM.
+
+## Delete
+
+`claimed/` as a state · claim timestamps and claimer PIDs · `DM_CLAIM_MAX_AGE` leases ·
+stale-claim recovery · the delivery-attempt counter (`.a<k>`) · the poison cap and
+`DM_MAX_ATTEMPTS` · the background lease sweeper (`_dm_arm_lease_sweep`) · the shared
+cross-state transition budget · `_dm_decimal_ok` / `_dm_attempt_ok` (their only consumers are
+claim-name arithmetic).
+
+**Consume becomes:** read a bounded number of `pending/` entries → validate each independently →
+emit → move only the successfully-emitted files into `read/`.
+
+## Must survive (do not lose these in the simplification)
+
+1. **Atomic send** — unique stable id, dot-temp, same-directory rename into `pending/`. Unchanged.
+2. **Emit-before-move** — the load-bearing order from UR-1. Nothing leaves `pending/` until it has
+   been emitted. Emit/validate/rename failure leaves the source pending. *This is why v1.2 does
+   not reintroduce v1.0's loss bug: v1.0 moved to a terminal state BEFORE emitting.*
+3. **Per-message isolation** — a malformed file must never suppress a valid peer (round-3 HIGH #2).
+4. **A simple batch bound** — one "process at most K entries" cap plus aggregate output caps. The
+   original H5 (unbounded startup work on a dormant lane's backlog) remains valid WITHOUT claims.
+   If entries remain, the emitted context must explicitly instruct continuation — do not rely on
+   a new directory event firing.
+5. **Destination collision protection** — never a blind `mv -f` into `read/`; an occupied archive
+   destination must not overwrite an earlier transcript.
+6. **Consumer-boundary hardening** — path/symlink component checks, exactly one JSON object per
+   file, four bounded fields, byte-based (`utf8bytelength`) line and aggregate caps, journal body
+   exclusion, `dm/` gitignore self-heal. All independent of claims.
+7. **Absolute engine resolution** — the deploy-model fix. Unchanged.
+8. **Expose the message id in the digest** — if duplicates are a public contract, the receiving
+   agent needs to recognise a replay. Currently only `from`/`to`/`ts`/`content` are rendered.
+
+## Poison, without a counter
+
+The v1.1 poison cap did not defend what it claimed to. **Ack fires immediately after the hook
+writes its output — before the receiving agent has acted on the content** (`bin/brain` SessionStart
+path). So the attempt counter counted digest/emit/ack failures, not "this instruction derailed the
+agent." The SQS dead-letter analogy assumes a receive that spans processing; ours completes before
+processing starts. Worse, a *global* failure (e.g. an incompatible `jq`) would terminalise healthy
+messages wholesale.
+
+Replacement: preflight global dependencies once — a global failure leaves everything pending;
+quarantine only a file **proven structurally invalid** against the wire contract; leave valid
+messages retryable indefinitely, which is what the loss-biased contract actually asks for.
+
+**Age-based expiry (the research note's suggestion) is REJECTED for this product:** a dormant lane
+is explicitly allowed to receive an old broadcast at its next boot, so age is not evidence of poison.
+
+## Migration (blocking, before any deploy)
+
+The live vault is still pre-DM, so there is no `claimed/` state in the field today — but a v1.1
+build must not be deployed and then replaced without draining. If any `claimed/` entries or
+detached sweeper processes exist, requeue and quiesce them first: the v1.1 sweeper is a detached
+recursive process that can wake *after* an engine swap and mutate the old layout.
+
+## Suite consequences
+
+The 60-scenario suite is **not** a reason to keep the design — its own header defers to this map,
+and it pins claim names, leases, attempts and recovery. It proves conformance to the chosen
+mechanism, not that the mechanism earns its cost.
+
+Retire the claim-specific scenarios (incl. Q.T/15's disjoint-consumers requirement, which encodes
+the rejected contract). Keep: atomic send, offline delivery, no replay after successful ack, emit
+failure retaining the message, bounds, malformed-file isolation, symlink refusal, journal secrecy,
+deployment resolution, archive collision safety. Add: crash before emit; crash after emit before
+rename; an early malformed entry not blocking later valid ones; bounded-backlog continuation;
+occupied `read/` destination preserved.
+
+## Docs to reconcile in the same change
+
+`AGENT_BRAIN_DM_GSD_PLAN.md` — remove "exactly once" (5 sites) and the disjoint-consumer gate;
+`templates/DM-PROTOCOL.md` — state plainly that delivery can replay and that side effects should be
+idempotent or checked against durable state; `CHANGELOG.md` — v1.2 entry.
+
+## Evidence trail
+
+`docs/reviews/lane-dm-v11-pre-pr-code-review.md` · `docs/reviews/lane-dm-v11-final-ultrareview-findings.md`
+· `docs/reviews/lane-dm-v11-ultrareview-round2-findings.md` ·
+`docs/research/directory-queue-claim-protocol-necessity.md` (maildir has no claim state; dirq has a
+claim but **no attempt counter and no dead-letter**; Postfix bounds poison by age not retries; SQS's
+visibility timeout is documented as a *multi-consumer* mechanism) ·
+`docs/prompts/lane-dm-simplification-consult.md` (the consult: simplify, 87% confidence).
