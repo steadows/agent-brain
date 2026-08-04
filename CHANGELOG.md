@@ -6,31 +6,43 @@ Adds a **fast tier** to coordination. Until now every signal travelled at the sp
 other lane's next session boot; `brain dm` reaches a running lane in seconds, which removes
 the human from the relay loop between two lanes that are both already awake.
 
-- **`brain dm @<feature> "<msg>"`** — one jq-encoded JSON line (`from`/`to`/`ts`/`content`)
-  appended to `.brain/dm/<feature>/inbox.jsonl`. No lock on the send path: a single
-  sub-`PIPE_BUF` append is atomic, and a lock with no staleness break would let one killed
-  sender wedge a lane's inbox permanently. Bodies are capped (`DM_MAX_BODY`) to keep that
-  premise true.
-- **`brain dm @all "<msg>"`** — fans into every registered inbox (skipping the sender), for
+- **`brain dm @<feature> "<msg>"`** — one jq-encoded JSON message (`from`/`to`/`ts`/`content`)
+  written as **its own file** into `.brain/dm/<feature>/pending/`, made visible only by the
+  final same-directory rename (maildir-style send). No lock on the send path — rename
+  arbitration is the only concurrency control, and a lock with no staleness break would let
+  one killed sender wedge a lane's queue permanently. Bodies are capped (`DM_MAX_BODY`) to
+  bound storage and digest work.
+- **`brain dm @all "<msg>"`** — fans into every registered queue (skipping the sender), for
   status broadcast and merge coordination. Deliberately not gated on who looks "live":
   presence `updated:` is not a liveness signal.
-- **`brain inbox [<feature>]`** — prints (and creates) the inbox path an agent watches.
-- **SessionStart now rotates → delivers → arms.** A DM sent to a lane that is *down* used to
-  be lost, because a watcher attaches at end-of-file. The hook now `mv`s a non-empty inbox to
-  `dm/<lane>/read/<ts>-<pid>.jsonl`, injects it into the startup context, then arms on an
-  empty file — so delivery is **exactly once**, and a dormant lane reads its mail when it
-  wakes. Injected content is bounded so a large backlog can't blow the lane's context window.
-- **The journal records a call log, never the message body** — `dm → @lane (transcript: …)`.
+- **`brain dm take`** — claim, print, and acknowledge this lane's pending DMs: the live
+  consumption path a running lane invokes when its queue watch fires.
+- **`brain inbox [<feature>]`** — prints (and creates) the `pending/` queue directory an
+  agent arms its watch on.
+- **Per-message lifecycle: `pending/` → `claimed/` → `read/` (or `failed/`).** Claims carry a
+  wall-clock lease (`DM_CLAIM_MAX_AGE`); an interrupted consumer's messages are recovered to
+  `pending/` at the next queue touch and redelivered. Delivery is **at-least-once** — a crash
+  window can duplicate a message, never lose one — and **process-crash-safe** (POSIX sh
+  cannot fsync, so power-loss durability is deliberately not claimed). A message that defeats
+  its consumer `DM_MAX_ATTEMPTS` times routes to terminal `failed/`, surfaced by
+  `brain status`, never silently deleted. Design authority:
+  `.context/seams/dm-v1.1-queue.md`.
+- **SessionStart recovers → claims → delivers → acks.** The boot hook injects claimed
+  messages into the startup context and acknowledges them (move to `read/`) **only after the
+  payload emitted successfully**, so an interrupted boot leaves every message replayable —
+  and a DM sent to a *down* lane queues until it wakes. Injected content is bounded so a
+  large backlog can't blow the lane's context window.
+- **The journal records a call log, never the message body** — `dm → @lane (transcripts: …)`.
   `journal/` is committed and the secret scan is line-anchored, so a body written mid-line
   would be invisible to it. `dm/` is gitignored, and `brain commit` now self-heals that
-  invariant (and un-stages inboxes) for vaults initialised before this feature.
+  invariant (and un-tracks/un-stages queue files) for vaults initialised before this feature.
 - **`dialog_with:`** — optional presence field, surfaced by `brain status`, so a lane-to-lane
   dialog left open an hour later is visible rather than silent.
 - **Protocol** — the always-read nav skill gains the DM tier, triage rules, and the merge
   handshake; `templates/DM-PROTOCOL.md` carries the full dialog/anti-sycophancy/deadlock
   reference on demand, keeping the per-session context tax flat.
-- **`test/dm.sh`** — the repo's first test suite (24 scenarios, temp-repo fixtures), the thing
-  ROADMAP has wanted since v1.
+- **`test/dm.sh` + `test/commit-install.sh`** — the repo's first test suites (45 + 15
+  scenarios, temp-repo fixtures), the thing ROADMAP has wanted since v1.
 
 ## v1.0.1 — 2026-08-02
 

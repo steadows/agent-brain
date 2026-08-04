@@ -81,14 +81,22 @@ Portable POSIX sh, no Claude-specific deps. Subcommands:
   `owns_branches` (precise rule + the four real features in **§2a**); (3) on multi-match, disambiguate
   by `current_worktree`; (4) still ambiguous → **print nothing + exit non-zero** (refuse to guess).
   Empty result = not a brain branch.
-- **`brain dm @<feature>|@all "<msg>"`** — the **fast tier**: append one jq-encoded JSON line
-  (`from`/`to`/`ts`/`content`) to `dm/<feature>/inbox.jsonl`, reaching a running lane in seconds;
-  `@all` fans into every registered inbox but the sender's (never gated on apparent liveness).
-  **No lock** on the send path (a single sub-`PIPE_BUF` append is atomic; a lock with no staleness
-  break would let one killed sender wedge an inbox forever) and the body is length-capped to keep
-  that true. The journal gets a **call-log line only, never the body** — `journal/` is committed
-  and the secret scan is line-anchored, so a mid-line body would be invisible to it.
-- **`brain inbox [<feature>]`** — print (and create) the inbox path an agent watches.
+- **`brain dm @<feature>|@all "<msg>"`** — the **fast tier**: write one jq-encoded JSON message
+  (`from`/`to`/`ts`/`content`) as its own file into `dm/<feature>/pending/` (maildir-style:
+  dot-temp + same-directory rename, visible only when complete), reaching a running lane in
+  seconds; `@all` fans into every registered queue but the sender's (never gated on apparent
+  liveness). **No lock** on the send or consume path — rename arbitration is the only
+  concurrency control; a lock with no staleness break would let one killed sender wedge a queue
+  forever. The body is length-capped to bound storage and digest work. The journal gets a
+  **call-log line only, never the body** — `journal/` is committed and the secret scan is
+  line-anchored, so a mid-line body would be invisible to it. (Queue design authority:
+  `.context/seams/dm-v1.1-queue.md`.)
+- **`brain dm take`** — claim, print, and ack this lane's pending DMs (the live consumption
+  path). Messages move `pending/` → `claimed/` → `read/`, with lease-based stale-claim recovery
+  and a `DM_MAX_ATTEMPTS` poison cap routing to terminal `failed/` — delivery is
+  **at-least-once** and **process-crash-safe** (POSIX sh cannot fsync; power loss is out of scope).
+- **`brain inbox [<feature>]`** — print (and create) the `pending/` queue directory an agent
+  arms its watch on.
 - **`brain announce "<msg>"`** — atomic-append `- <ISO-time> <feature> — <msg>` to today's journal
   (auto-creates the daily file). The single canonical journal writer (agents + hooks).
 - **`brain status`** — print the text dashboard: active features (status active/blocked, or idle with
@@ -224,12 +232,15 @@ Both are thin wrappers calling `brain hook <event>`; both **fail-open** (drop a 
      (slug from branch; harmless if ignored on a non-brain worktree — an optional committed
      `templates/non-brain-globs` suppresses it). Keeps M9 (agent onboards itself; human never runs it).
    - **(b)** cache `BRAIN_FEATURE` for the session.
-   - **(b2) rotate → deliver → arm (DM).** If `dm/<me>/inbox.jsonl` is non-empty, `mv` it to
-     `dm/<me>/read/<ts>-<pid>.jsonl`, inject its (bounded) contents, then arm on the now-empty
-     inbox. Order is load-bearing: a watcher attaches at end-of-file, so mail already sitting in
-     the inbox is invisible to it — without the rotate a DM to a *down* lane is lost, not queued.
-     `mv` (not read-in-place) is what makes delivery **exactly once**. A failed rotation warns to
-     `.hook-errors.log` and delivers in place rather than booting silent.
+   - **(b2) recover → claim → deliver → ack (DM).** Recover stale claims (lease
+     `DM_CLAIM_MAX_AGE` expired) back to `pending/` — routing a message past `DM_MAX_ATTEMPTS`
+     to terminal `failed/` — then claim everything pending by renaming each message file into
+     `claimed/`, inject the (bounded) digest, and **ack (move to `read/`) only after the
+     complete startup payload emitted successfully**. Order is load-bearing: an interrupted
+     boot leaves every claimed message replayable at the next queue touch, so delivery is
+     **at-least-once** (a crash window duplicates, never loses), and per-message pending files
+     mean a DM to a *down* lane queues instead of vanishing. The injected context also arms the
+     live path: it names `dm/<me>/pending/` and the `brain dm take` consume command.
    - **(c)** run `brain reconcile` (cheap auto-fixes — robust to never-wraps).
    - **(d)** inject "run the `navigation-standards` skill" + `brain status` (incl. relevant **recent
      journal lines** since `updated`, the agents+connections summary, and the `CHANGES`/error banners).
