@@ -569,10 +569,16 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
 - `[~]` 7.5 **Disposition of the 10 ultrareview findings — every one has an owner, nothing dropped.**
       Steve's ruling 2026-08-03: v1.1 rewrite lands before any deploy. Three buckets:
 
-      **STATUS 2026-08-04: 6 of 10 CLOSED** by the v1.1 GREEN commit (UR-1, UR-2, UR-3, UR-8,
-      UR-9, UR-10 — verified in the committed diff, 45/45 suite green on `sh` and `dash`).
-      Remaining: UR-4a / UR-4b / UR-7 (code — RED in flight at `test/commit-install.sh`) and
-      UR-5 / UR-6 (procedure — now landed as plan tasks 5.5 and 5.6).
+      **STATUS 2026-08-04: ✅ ALL 10 CLOSED.**
+      - UR-1, UR-2, UR-3, UR-8, UR-9, UR-10 — v1.1 per-message-queue GREEN (45/45 `sh` + `dash`).
+      - UR-5, UR-6 — deploy procedure, landed as plan tasks **5.6** and **5.5**.
+      - UR-4a, UR-4b, UR-7 — GREEN at `9a81bc4` against the frozen `test/commit-install.sh`
+        (15/15 `sh` + `dash`), after a 3-round writer/watchdog audit that turned UR-4a into a
+        **four-way** constraint; constraints 3 and 4 were each found because the fix for the
+        previous one broke them.
+      **One PRE-EXISTING defect surfaced and is NOT closed** (deliberately): the legacy-vault
+      secret-scan wedge — see `ROADMAP.md` "Known issue" and the UR-4a ruling in the seam map.
+      Next: `/simplify` + `/steadows-code-review` on the branch diff, then Phase 5 deploy.
 
       **A. Absorbed by the v1.1 per-message-queue rewrite** (the redesign already in `ROADMAP.md`;
       these are its acceptance criteria, not separate work):
