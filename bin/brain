@@ -23,6 +23,11 @@ DM_INJECT_MAX_COLS=2000
 DM_CLAIM_MAX_AGE=600
 DM_MAX_ATTEMPTS=3
 DM_TEMP_MAX_AGE=300
+# Digest per-message content budget: reserve DM_DIGEST_ENVELOPE cols for the JSON envelope
+# (keys, from/to/ts, separators), then divide by DM_ESCAPE_FACTOR — worst-case JSON escaping
+# (\uXXXX) expands one content char into six output chars.
+DM_DIGEST_ENVELOPE=512
+DM_ESCAPE_FACTOR=6
 
 # ── Root discovery (fix A) — the one function everything reuses ───────────────────────────────
 # --git-common-dir resolves to the MAIN worktree's .git from any sibling worktree, so the brain
@@ -38,7 +43,8 @@ brain_root() {
 
 # ── Small helpers ────────────────────────────────────────────────────────────────────────────
 _now_iso()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
-_now_compact() { date -u +%Y%m%dT%H%M%SZ; }   # filename-safe clock (dm read archives)
+_now_compact() { date -u +%Y%m%dT%H%M%SZ; }   # filename-safe clock (dm message IDs)
+_now_epoch()   { date -u +%s; }               # epoch clock (dm claim stamps + lease math)
 _today()    { date -u +%Y-%m-%d; }
 # Test seam: BRAIN_TEST_BRANCH overrides the resolved branch (used by the smoke test only).
 _branch()   { printf '%s\n' "${BRAIN_TEST_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)}"; }
@@ -69,17 +75,10 @@ _atomic_place() { # <content-producer> <dest> [producer-args...]
   fi
 }
 
-# repo-root-relative path for an (absolute or relative) file path
-_relpath() {
-  case "$1" in
-    "$ROOT"/*) printf '%s\n' "${1#"$ROOT"/}" ;;
-    *)         printf '%s\n' "$1" ;;
-  esac
-}
-
-# Repo-relative from the MAIN root or the caller's own worktree root. Needed by the pre-tool
-# hook: agents live in sibling worktrees, whose absolute paths never carry the $ROOT prefix,
-# so plain _relpath left them absolute and _path_match (exact-match) could never fire.
+# Repo-relative path from the MAIN root or the caller's own worktree root. The pre-tool hook
+# needs the worktree case: agents live in sibling worktrees, whose absolute paths never carry
+# the $ROOT prefix, so a ROOT-only strip would leave them absolute and _path_match
+# (exact-match) could never fire.
 _relpath_any() {
   case "$1" in "$ROOT"/*) printf '%s\n' "${1#"$ROOT"/}"; return 0 ;; esac
   _wt=$(git rev-parse --show-toplevel 2>/dev/null) || _wt=""
@@ -104,12 +103,34 @@ _fm() {
   ' "$1" 2>/dev/null
 }
 
+# All four presence display fields in ONE awk pass (status, phase, current_ticket,
+# dialog_with), US-delimited (0x1F cannot appear in a frontmatter scalar). Same first-match +
+# comment-strip semantics as _fm; one fork per note instead of four in the status loop.
+_fm_presence() { # <file>
+  awk '
+    BEGIN { n = split("status phase current_ticket dialog_with", k, " ") }
+    /^---[[:space:]]*$/ { fence++; if (fence >= 2) exit; next }
+    fence == 1 {
+      for (i = 1; i <= n; i++) {
+        if (!(i in v) && index($0, k[i] ":") == 1) {
+          line = $0
+          sub(/^[^:]*:[[:space:]]*/, "", line)
+          sub(/[[:space:]]+#.*$/, "", line)
+          sub(/[[:space:]]+$/, "", line)
+          v[i] = line
+        }
+      }
+    }
+    END { printf "%s\037%s\037%s\037%s\n", v[1], v[2], v[3], v[4] }
+  ' "$1" 2>/dev/null
+}
+
 # A YAML inline list ("[a, b]" / '["a","b"]') → space-separated bare tokens.
 _list_field() {
   _fm "$1" "$2" | tr -d '[]' | tr -d '"' | tr -d "'" | tr ',' ' '
 }
 _owns_tokens() { _list_field "$1" owns_branches; }
-_agent_slug()  { b=$(basename "$1"); printf '%s\n' "${b%.md}"; }
+_agent_slug()  { _as_b=${1##*/}; printf '%s\n' "${_as_b%.md}"; }   # pure PE — no basename fork
 
 # Branch → positional slug (§2a): first token after the "<alpha>-<num>" ticket in feat/…; else
 # the whole branch name. graph⊄langgraph and the cockpit double-match are killed by this + exact
@@ -241,11 +262,14 @@ _feat_ok() {
   return 0
 }
 
+# A directory that exists and is not a symlink — the one predicate every queue level must pass.
+_real_dir() { [ ! -L "$1" ] && [ -d "$1" ]; }
+
 # Validate the queue path component-by-component. POSIX sh has no openat/O_NOFOLLOW, so this
 # refuses observed links but cannot close a same-user check/use race.
 _dm_dir_ok() { # <dm-root|lane-dir|state-dir|message-file>
   _do_path=$1; _do_root="$BRAIN/dm"
-  [ ! -L "$_do_root" ] && [ -d "$_do_root" ] \
+  _real_dir "$_do_root" \
     || { _warn "dm queue root is not a real directory: $_do_root"; return 1; }
   [ "$_do_path" = "$_do_root" ] && return 0
   case "$_do_path" in
@@ -256,7 +280,7 @@ _dm_dir_ok() { # <dm-root|lane-dir|state-dir|message-file>
   _do_lane=${_do_rest%%/*}
   _feat_ok "$_do_lane" || { _warn "invalid dm lane component: $_do_lane"; return 1; }
   _do_lane_path="$_do_root/$_do_lane"
-  [ ! -L "$_do_lane_path" ] && [ -d "$_do_lane_path" ] \
+  _real_dir "$_do_lane_path" \
     || { _warn "dm lane is not a real directory: $_do_lane_path"; return 1; }
   [ "$_do_rest" = "$_do_lane" ] && return 0
 
@@ -265,7 +289,7 @@ _dm_dir_ok() { # <dm-root|lane-dir|state-dir|message-file>
     _warn "invalid dm queue state: $_do_state"; return 1 ;;
   esac
   _do_state_path="$_do_lane_path/$_do_state"
-  [ ! -L "$_do_state_path" ] && [ -d "$_do_state_path" ] \
+  _real_dir "$_do_state_path" \
     || { _warn "dm state is not a real directory: $_do_state_path"; return 1; }
   [ "$_do_tail" = "$_do_state" ] && return 0
 
@@ -283,25 +307,25 @@ _dm_make_dir() { # <path>
   fi
   if [ ! -d "$_md_path" ]; then
     mkdir "$_md_path" 2>/dev/null || {
-      [ -d "$_md_path" ] && [ ! -L "$_md_path" ] || {
+      _real_dir "$_md_path" || {
         _warn "could not create dm directory: $_md_path"; return 1;
       }
     }
   fi
-  [ -d "$_md_path" ] && [ ! -L "$_md_path" ]
+  _real_dir "$_md_path"
 }
 
 _dm_ensure_tree() { # <lane>
   _et_lane=$1
   _feat_ok "$_et_lane" || { _warn "invalid feature name '$_et_lane' (bare slug only)"; return 1; }
-  _et_root="$BRAIN/dm"; _et_lane_dir="$_et_root/$_et_lane"
-  _dm_make_dir "$_et_root" || return 1
-  _dm_dir_ok "$_et_root" || return 1
+  # _dm_make_dir's postcondition IS _dm_dir_ok's per-level predicate (_real_dir), the lane was
+  # just _feat_ok'd, and the state names are literals — a second validation pass here would
+  # re-prove what this walk just established. Consumers still _dm_dir_ok at point of use.
+  _et_lane_dir="$BRAIN/dm/$_et_lane"
+  _dm_make_dir "$BRAIN/dm" || return 1
   _dm_make_dir "$_et_lane_dir" || return 1
-  _dm_dir_ok "$_et_lane_dir" || return 1
   for _et_state in pending claimed read failed; do
     _dm_make_dir "$_et_lane_dir/$_et_state" || return 1
-    _dm_dir_ok "$_et_lane_dir/$_et_state" || return 1
   done
 }
 
@@ -325,8 +349,17 @@ _dm_id_in_use() { # <lane> <id>
   return 1
 }
 
+# One id-charset bound for BOTH consume paths (claim + recover). The producer mints [0-9TZ-]
+# ids; anything outside this set could word-split or glob in the `set -- $claims` consume
+# splits, so claim and recover refuse it identically and the whitespace-free split guarantee
+# holds by construction rather than by producer discipline.
+_dm_id_ok() { case "$1" in ''|*[!0-9:._TZ-]*) return 1 ;; *) return 0 ;; esac; }
+
 _dm_new_id() { # <lane>
-  _ni_lane=$1; _ni_base="$(_now_compact)-$$"; _ni_id=$_ni_base; _ni_n=0
+  # One compact stamp per process: a broadcast mints N ids in the same second anyway, and the
+  # bump loop below already arbitrates same-base collisions.
+  [ -n "${_DM_ID_TS:-}" ] || _DM_ID_TS=$(_now_compact)
+  _ni_lane=$1; _ni_base="$_DM_ID_TS-$$"; _ni_id=$_ni_base; _ni_n=0
   while _dm_id_in_use "$_ni_lane" "$_ni_id"; do
     _ni_n=$((_ni_n + 1)); _ni_id="$_ni_base-$_ni_n"
   done
@@ -381,14 +414,11 @@ _dm_recover_stale() { # <lane>
     _rs_pre=${_rs_name%.c*}; _rs_stamp=${_rs_name##*.c}
     _rs_claim_ts=${_rs_stamp%-*}; _rs_pid=${_rs_stamp##*-}
     _rs_attempt=${_rs_pre##*.a}; _rs_id=${_rs_pre%.a*}
-    case "$_rs_claim_ts:$_rs_pid:$_rs_attempt:$_rs_id" in
-      *[!0-9:._TZ-]*) _warn "invalid claimed dm name: $_rs_name"; continue ;;
-    esac
     case "$_rs_claim_ts" in ''|*[!0-9]*) _warn "invalid claim epoch in $_rs_name"; continue ;; esac
     case "$_rs_pid" in ''|*[!0-9]*) _warn "invalid claimer pid in $_rs_name"; continue ;; esac
     case "$_rs_attempt" in ''|*[!0-9]*) _warn "invalid attempt in $_rs_name"; continue ;; esac
-    [ -n "$_rs_id" ] || { _warn "missing message id in $_rs_name"; continue; }
-    [ -n "$_rs_now" ] || _rs_now=$(date -u +%s) || return 1
+    _dm_id_ok "$_rs_id" || { _warn "invalid message id in $_rs_name"; continue; }
+    [ -n "$_rs_now" ] || _rs_now=$(_now_epoch) || return 1
     _rs_age=$((_rs_now - _rs_claim_ts))
     if [ "$_rs_now" -ge "$_rs_claim_ts" ] && [ "$_rs_age" -le "$DM_CLAIM_MAX_AGE" ]; then
       continue
@@ -418,9 +448,10 @@ _dm_claim_all() { # <lane> — print the full paths won by this process
     _dm_dir_ok "$_ca_file" || continue
     _ca_name=${_ca_file##*/}; _ca_attempt=${_ca_name##*.a}; _ca_id=${_ca_name%.a*}
     case "$_ca_attempt" in ''|*[!0-9]*) _warn "invalid pending dm name: $_ca_name"; continue ;; esac
-    [ -n "$_ca_id" ] && [ "$_ca_id" != "$_ca_name" ] \
-      || { _warn "invalid pending dm name: $_ca_name"; continue; }
-    [ -n "$_ca_epoch" ] || _ca_epoch=$(date -u +%s) || return 1
+    if [ "$_ca_id" = "$_ca_name" ] || ! _dm_id_ok "$_ca_id"; then
+      _warn "invalid pending dm name: $_ca_name"; continue
+    fi
+    [ -n "$_ca_epoch" ] || _ca_epoch=$(_now_epoch) || return 1
     _ca_dest="$_ca_claimed/$_ca_name.c$_ca_epoch-$$"
     if command mv -f -- "$_ca_file" "$_ca_dest" 2>/dev/null; then
       printf '%s\n' "$_ca_dest"
@@ -434,7 +465,9 @@ _dm_claim_all() { # <lane> — print the full paths won by this process
 
 _dm_ack() { # <lane> <full-claimed-path>
   _ak_lane=$1; _ak_claim=$2
-  _dm_ensure_tree "$_ak_lane" || return 1
+  # Claim ensured the tree in every live caller; validate only the read/ dir the mv enters.
+  # If it vanished, ack fails and the message stays claimed → lease-recovered, never lost.
+  _dm_dir_ok "$BRAIN/dm/$_ak_lane/read" || return 1
   _dm_dir_ok "$_ak_claim" || return 1
   _ak_name=${_ak_claim##*/}
   case "$_ak_name" in *.a*.c*-*) ;; *) _warn "invalid claimed dm name: $_ak_name"; return 1 ;; esac
@@ -447,6 +480,12 @@ _dm_ack() { # <lane> <full-claimed-path>
   fi
   _warn "could not ack dm claim: $_ak_name"
   return 1
+}
+
+_dm_ack_all() { # <lane> <claimed-path>... — ack each; nonzero if ANY failed (those stay replayable)
+  _aa_lane=$1; shift; _aa_rc=0
+  for _aa_claim in "$@"; do _dm_ack "$_aa_lane" "$_aa_claim" || _aa_rc=1; done
+  return "$_aa_rc"
 }
 
 # Render at most DM_INJECT_MAX_LINES messages with one jq pass. Content is shortened before
@@ -462,7 +501,7 @@ _dm_digest() { # <claimed-file>...
   fi
   while [ "$_dg_skip" -gt 0 ]; do shift; _dg_skip=$((_dg_skip - 1)); done
   for _dg_file in "$@"; do _dm_dir_ok "$_dg_file" || return 1; done
-  _dg_content_max=$(((DM_INJECT_MAX_COLS - 512) / 6))
+  _dg_content_max=$(((DM_INJECT_MAX_COLS - DM_DIGEST_ENVELOPE) / DM_ESCAPE_FACTOR))
   [ "$_dg_content_max" -gt 0 ] || _dg_content_max=1
   jq -c --argjson max "$_dg_content_max" '
     if type != "object" or (.content | type) != "string" then error("invalid dm object")
@@ -476,8 +515,7 @@ cmd_dm_take() {
   _dt_lane=$(cmd_whoami)
   [ -n "$_dt_lane" ] || _die "brain dm take: whoami is empty"
   _dm_recover_stale "$_dt_lane" || return 1
-  _dt_claims=$(_dm_claim_all "$_dt_lane"); _dt_claim_rc=$?
-  [ "$_dt_claim_rc" = 0 ] || return 1
+  _dt_claims=$(_dm_claim_all "$_dt_lane") || return 1
   [ -n "$_dt_claims" ] || return 0
   # Queue grammar forbids whitespace, so splitting the newline-delimited claim paths is safe.
   # shellcheck disable=SC2086
@@ -488,18 +526,17 @@ cmd_dm_take() {
     _warn "could not emit claimed dm messages for @$_dt_lane; leaving them replayable"
     return 1
   fi
-  _dt_ack_rc=0
-  for _dt_claim in "$@"; do _dm_ack "$_dt_lane" "$_dt_claim" || _dt_ack_rc=1; done
-  return "$_dt_ack_rc"
+  _dm_ack_all "$_dt_lane" "$@"
 }
 
 _dm_failed_count() { # <lane>
   _fc_dir="$BRAIN/dm/$1/failed"; _fc_count=0
   [ -e "$_fc_dir" ] || [ -L "$_fc_dir" ] || { printf '0\n'; return 0; }
   _dm_dir_ok "$_fc_dir" || return 1
+  # Display-only count — the dir was just validated; a per-entry _dm_dir_ok walk moves nothing
+  # through the filesystem and any odd entry still belongs in the "inspect failed/" total.
   for _fc_file in "$_fc_dir"/*; do
     [ -e "$_fc_file" ] || [ -L "$_fc_file" ] || continue
-    _dm_dir_ok "$_fc_file" || continue
     _fc_count=$((_fc_count + 1))
   done
   printf '%s\n' "$_fc_count"
@@ -577,13 +614,16 @@ cmd_status() {
   [ -n "$_me" ] && printf 'You are: %s\n' "$_me"
 
   printf '\nActive features:\n'
+  _us=$(printf '\037')
   for _f in "$BRAIN"/presence/*.md; do
     [ -e "$_f" ] || continue
-    _st=$(_fm "$_f" status); _sl=$(_agent_slug "$_f")
-    _ph=$(_fm "$_f" phase); _tk=$(_fm "$_f" current_ticket)
-    # optional dialog_with (task 4.2), read OUTSIDE the status branch: an open dialog on an
-    # idle/done lane is the stale state this field exists to expose, so it must not hide there.
-    _dw=$(_fm "$_f" dialog_with)
+    _sl=$(_agent_slug "$_f")
+    # One awk pass per note. dialog_with (task 4.2) is read OUTSIDE the status branch: an open
+    # dialog on an idle/done lane is the stale state the field exists to expose.
+    _pf=$(_fm_presence "$_f")
+    _st=${_pf%%"$_us"*}; _pf=${_pf#*"$_us"}
+    _ph=${_pf%%"$_us"*}; _pf=${_pf#*"$_us"}
+    _tk=${_pf%%"$_us"*}; _dw=${_pf#*"$_us"}
     case "$_st" in
       active|blocked)
         printf '  • %-18s [%s] %s %s\n' "$_sl" "$_st" "${_ph:-—}" "${_tk:+($_tk)}"
@@ -635,8 +675,9 @@ cmd_status() {
   [ -s "$BRAIN/.hook-errors.log" ] && \
     printf '\n⚠ hook errors logged — see .brain/.hook-errors.log\n'
 
-  # Poison messages are terminal but never silent or auto-deleted.
-  if [ -n "$_me" ]; then
+  # Poison messages are terminal but never silent or auto-deleted. The -d gate keeps the
+  # common no-failures boot from paying a subshell fork just to hear "0".
+  if [ -n "$_me" ] && [ -d "$BRAIN/dm/$_me/failed" ]; then
     _failed_count=$(_dm_failed_count "$_me" 2>/dev/null) || _failed_count=0
     [ "$_failed_count" -gt 0 ] 2>/dev/null && \
       printf '\n⚠ %s DM message(s) failed permanently — inspect .brain/dm/%s/failed/\n' \
@@ -655,10 +696,11 @@ cmd_new_feature() {
   _require_brain
   _slug=${1:-}; [ -n "$_slug" ] || _die "usage: brain new-feature <slug>"
   _feat_ok "$_slug" || _die "invalid feature slug: '$_slug' (bare slug, no path separators)"
-  # 'all' would be swallowed by the dm broadcast keyword and 'system' is the unresolved-sender
-  # fallback — a lane registered under either becomes unreachable by name.
+  # 'all' would be swallowed by the dm broadcast keyword, 'system' is the unresolved-sender
+  # fallback, and 'take' is the dm consume keyword — a lane registered under any of these
+  # becomes unreachable (or reachable only in @-prefixed form) by name.
   case "$_slug" in
-    all|system) _die "reserved feature name: '$_slug' (brain dm @all is the broadcast; 'system' is the fallback author)" ;;
+    all|system|take) _die "reserved feature name: '$_slug' ('brain dm @all' broadcasts; 'system' is the fallback author; 'brain dm take' consumes)" ;;
   esac
   _note="$BRAIN/presence/$_slug.md"
   [ -f "$_note" ] && _die "feature already registered: $_slug"
@@ -1077,14 +1119,23 @@ _emit_session_ctx() {
     '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}' 2>/dev/null \
     || printf '%s\n' "$1"
 }
-_emit_pretool() {
-  # non-blocking: allow + surface the warning to the agent.
-  # Must be additionalContext — permissionDecisionReason is only rendered on ask/deny
-  # decisions and is silently dropped on allow (verified empirically 2026-08-01, DM-mechanisms
-  # eval E2/E9 — the eval doc lives with the consuming project, not in this repo).
-  jq -n --arg r "$1" \
-    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",additionalContext:$r}}' 2>/dev/null \
-    || printf '%s\n' "$1"
+_emit_pretool() { # <decision: allow|ask> <text>
+  # Field placement is empirical (2026-08-01, DM-mechanisms eval E2/E9 — the eval doc lives
+  # with the consuming project, not in this repo): permissionDecisionReason renders ONLY on
+  # ask/deny and is silently dropped on allow; allow surfaces via additionalContext. Both
+  # branches degrade to raw text if jq is missing, so a collision warning is never swallowed.
+  case "$1" in
+    ask)
+      jq -n --arg r "$2" \
+        '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"ask",permissionDecisionReason:$r}}' 2>/dev/null \
+        || printf '%s\n' "$2"
+      ;;
+    *)
+      jq -n --arg r "$2" \
+        '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",additionalContext:$r}}' 2>/dev/null \
+        || printf '%s\n' "$2"
+      ;;
+  esac
 }
 
 _hook_session_start() {
@@ -1106,10 +1157,11 @@ _hook_session_start() {
   # (b2) Recover → claim → digest. Ack happens only after the complete SessionStart payload was
   # emitted successfully, so an interrupted boot leaves every message replayable.
   _dm_recover_stale "$_feat" || true
-  _claims=$(_dm_claim_all "$_feat"); _claim_rc=$?
-  _ib=$(cmd_inbox "$_feat") || _ib="$BRAIN/dm/$_feat/pending"
+  # The queue path is a fixed composition; recover/claim just ensured the tree exists, so
+  # re-deriving it through cmd_inbox would only re-walk the tree to print the same string.
+  _ib="$BRAIN/dm/$_feat/pending"
   _dm_block=""; _digest_ok=0
-  if [ "$_claim_rc" = 0 ] && [ -n "$_claims" ]; then
+  if _claims=$(_dm_claim_all "$_feat") && [ -n "$_claims" ]; then
     # Queue grammar forbids whitespace, so splitting the newline-delimited claim paths is safe.
     # shellcheck disable=SC2086
     set -- $_claims
@@ -1134,9 +1186,8 @@ On activity, claim and consume it with: .brain/bin/brain dm take
 
 $_st"; then
     if [ "$_digest_ok" = 1 ]; then
-      _ack_rc=0
-      for _claim in "$@"; do _dm_ack "$_feat" "$_claim" || _ack_rc=1; done
-      [ "$_ack_rc" = 0 ] || _warn "one or more DMs were emitted but could not be acked; they remain replayable"
+      _dm_ack_all "$_feat" "$@" \
+        || _warn "one or more DMs were emitted but could not be acked; they remain replayable"
     fi
   else
     _warn "could not emit SessionStart context; claimed DMs remain replayable"
@@ -1171,10 +1222,9 @@ _hook_pre_tool() {
 
   # decision: non-blocking allow by default. ask is forbidden without an attached human (fix K).
   if [ "${BRAIN_PRETOOL_MODE:-allow}" = "ask" ] && [ -t 1 ]; then
-    jq -n --arg r "Shared-surface collision: $_collisions. Coordinate before proceeding." \
-      '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"ask",permissionDecisionReason:$r}}' 2>/dev/null
+    _emit_pretool ask "Shared-surface collision: $_collisions. Coordinate before proceeding."
   else
-    _emit_pretool "Shared-surface collision (proceeding; logged to journal): $_collisions"
+    _emit_pretool allow "Shared-surface collision (proceeding; logged to journal): $_collisions"
   fi
   exit 0
 }
@@ -1213,27 +1263,36 @@ cmd_hook() {
 }
 
 # ── install (machine-global pieces that do NOT travel with git) ───────────────────────────────
-_filter_global_settings() {
-  jq --arg ss "$_rgs_ss" --arg pt "$_rgs_pt" --arg dir "$BRAIN" --arg allow "Bash($BRAIN/bin/brain:*)" '
+# The permissions merge BOTH settings surfaces share (additionalDirectories + the brain
+# allowlist entry). jq program text in a sh variable: expanded once, never re-expanded, so the
+# jq $-variables pass through literally.
+# shellcheck disable=SC2016  # $dir/$allow are jq variables, literal by design
+_JQ_PERMISSIONS_MERGE='
+    .permissions = (.permissions // {}) |
+    .permissions.additionalDirectories = ((.permissions.additionalDirectories // []) + [$dir] | unique) |
+    .permissions.allow = ((.permissions.allow // []) + [$allow] | unique)
+  '
+
+_filter_global_settings() { # <session-dispatcher> <pretool-dispatcher>
+  jq --arg ss "$1" --arg pt "$2" --arg dir "$BRAIN" --arg allow "Bash($BRAIN/bin/brain:*)" '
     .hooks = (.hooks // {}) |
     .hooks.SessionStart = (.hooks.SessionStart // []) |
     .hooks.PreToolUse = (.hooks.PreToolUse // []) |
     (if ([.hooks.SessionStart[]?.hooks[]?.command] | index($ss)) then .
      else .hooks.SessionStart += [{"hooks":[{"type":"command","command":$ss}]}] end) |
     (if ([.hooks.PreToolUse[]?.hooks[]?.command] | index($pt)) then .
-     else .hooks.PreToolUse += [{"matcher":"Bash|Edit|Write|MultiEdit","hooks":[{"type":"command","command":$pt}]}] end) |
-    .permissions = (.permissions // {}) |
-    .permissions.additionalDirectories = ((.permissions.additionalDirectories // []) + [$dir] | unique) |
-    .permissions.allow = ((.permissions.allow // []) + [$allow] | unique)
-  '
+     else .hooks.PreToolUse += [{"matcher":"Bash|Edit|Write|MultiEdit","hooks":[{"type":"command","command":$pt}]}] end) |'"$_JQ_PERMISSIONS_MERGE"
 }
 
-_render_global_settings() { # <source> <session-dispatcher> <pretool-dispatcher>
-  _rgs_source=$1; _rgs_ss=$2; _rgs_pt=$3
-  if [ -f "$_rgs_source" ]; then
-    _filter_global_settings < "$_rgs_source"
+# Seed a settings filter from the existing file, or from an empty object on first install.
+# Redirect (not cat|pipe) so an unreadable source fails the producer instead of silently
+# feeding the filter empty input.
+_render_settings() { # <filter-fn> <source> [filter-args...]
+  _rset_filter=$1; _rset_source=$2; shift 2
+  if [ -f "$_rset_source" ]; then
+    "$_rset_filter" "$@" < "$_rset_source"
   else
-    printf '{}\n' | _filter_global_settings
+    printf '{}\n' | "$_rset_filter" "$@"
   fi
 }
 
@@ -1253,7 +1312,7 @@ cmd_install() {
   mkdir -p "$_gs_dir" || _die "could not create global settings directory: $_gs_dir"
   _disp_ss='d="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0; case "$d" in /*) ;; *) d="$(cd "$d" 2>/dev/null && pwd)" || exit 0;; esac; r="$(dirname "$d")"; [ -x "$r/.brain/bin/brain" ] && exec "$r/.brain/bin/brain" hook session-start || exit 0'
   _disp_pt='d="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0; case "$d" in /*) ;; *) d="$(cd "$d" 2>/dev/null && pwd)" || exit 0;; esac; r="$(dirname "$d")"; [ -x "$r/.brain/bin/brain" ] && exec "$r/.brain/bin/brain" hook pre-tool || exit 0'
-  _atomic_place _render_global_settings "$_gs" "$_gs" "$_disp_ss" "$_disp_pt" \
+  _atomic_place _render_settings "$_gs" _filter_global_settings "$_gs" "$_disp_ss" "$_disp_pt" \
     || _die "failed to merge global settings"
 
   printf 'brain: installed nav skill → %s\n' "$_skills/SKILL.md"
@@ -1261,20 +1320,7 @@ cmd_install() {
 }
 
 _filter_project_settings() {
-  jq --arg dir "$BRAIN" --arg allow "Bash($BRAIN/bin/brain:*)" '
-    .permissions = (.permissions // {}) |
-    .permissions.additionalDirectories = ((.permissions.additionalDirectories // []) + [$dir] | unique) |
-    .permissions.allow = ((.permissions.allow // []) + [$allow] | unique)
-  '
-}
-
-_render_project_settings() { # <source>
-  _rps_source=$1
-  if [ -f "$_rps_source" ]; then
-    _filter_project_settings < "$_rps_source"
-  else
-    printf '{}\n' | _filter_project_settings
-  fi
+  jq --arg dir "$BRAIN" --arg allow "Bash($BRAIN/bin/brain:*)" "$_JQ_PERMISSIONS_MERGE"
 }
 
 _write_project_settings() {
@@ -1282,7 +1328,7 @@ _write_project_settings() {
   # dispatcher to avoid double-fire). .claude/settings.json is gitignored → main-worktree-local.
   _sf="$ROOT/.claude/settings.json"
   mkdir -p "$ROOT/.claude" || { _warn "could not create project settings directory"; return 1; }
-  _atomic_place _render_project_settings "$_sf" "$_sf" \
+  _atomic_place _render_settings "$_sf" _filter_project_settings "$_sf" \
     || { _warn "could not write project settings"; return 1; }
 }
 
