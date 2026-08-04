@@ -1,50 +1,76 @@
 #!/usr/bin/env sh
-# test/dm.sh — RED-phase suite for the Agent-Brain lane-DM feature, v1.1 per-message queue.
+# test/dm.sh — RED-phase suite for the Agent-Brain lane-DM feature, v1.2 (claim layer DELETED).
 #
 # AUTHORITY (in precedence order):
-#   1. .context/seams/dm-v1.1-queue.md — THE design authority. Storage layout (decision 1),
-#      send = temp+atomic-rename (2), message-ID/filename grammar (3), claim (4), ack (5),
-#      lease-based stale-claim recovery (6), poison cap → failed/ (6b), claim-loss vs real
-#      error (6c), durability boundary (6d), wire format (7), and the New seams section
-#      (_atomic_place, _dm_dir_ok, _dm_new_id, _dm_claim_all/_dm_recover_stale/_dm_ack,
-#      cmd_dm_take, the _dm_digest signature change, and what is DELETED not extended).
-#   2. docs/lane-dm-ultrareview-findings.md — UR-1..UR-10. This suite makes UR-1, UR-2, UR-3,
-#      UR-9 and UR-10 falsifiable.
-#   3. ROADMAP.md "v1.1 — DM per-message queue" — the added acceptance criteria.
-#   4. AGENT_BRAIN_DM_GSD_PLAN.md §7.5 — disposition of all 10 findings.
-# Implementation code is EVIDENCE, never authority. Where this suite pins something the seam
-# map leaves open, the scenario comment says so out loud and names the choice that was forced.
+#   1. .context/seams/dm-v1.1-queue.md, the `# v1.2` section (lines 335-467) — THE design
+#      authority, DECIDED by Steve 2026-08-04. It supersedes decisions 4, 6, 6b and 6c for the
+#      consume path; send-side atomicity (decisions 2 + 3) is explicitly UNCHANGED. Its "Delete"
+#      list, its 8-item "Must survive" checklist, its "Poison, without a counter" ruling and its
+#      "Suite consequences" retire/keep/add lists are this file's spec.
+#   2. The same map's surviving v1.1 sections — decision 2 (dot-temp + same-directory rename),
+#      decision 3 (message ID = filename = <_now_compact>-<pid>[+ collision bump]), decision 7
+#      (wire format from/to/ts/content), decision 8 (DM_MAX_BODY kept), the `_dm_dir_ok` and
+#      `_dm_digest` seams, and the altitude decision "no lock anywhere on the queue path".
+#   3. docs/lane-dm-ultrareview-findings.md — UR-1 (emit before the terminal move), UR-2 (symlink
+#      component refusal), UR-3 (a live-observed message is really consumed), UR-8 (no false
+#      announce promise), UR-9/UR-10 (round-trip + body-independent journal).
+# Implementation code is EVIDENCE, never authority. Where this suite pins something the map
+# leaves open, the scenario comment says so out loud and names the choice that was forced.
 #
-# WHAT REPLACED WHAT: the v1 suite pinned the single shared dm/<lane>/inbox.jsonl and its
-# boot-time rotate→deliver ordering. Both are deleted by the redesign, so every transport and
-# hook scenario here is new or re-pinned. Scenarios whose OBSERVABLE behaviour survives the
-# rewrite (journal pointer-not-body, secret-body-never-journalled, self-send, unknown
-# recipient, broadcast-not-to-self, gitignore, no-lock, dialog_with presence, nav-skill
-# template) are carried forward, re-pinned to the new storage layout where they touch storage.
+# WHAT REPLACED WHAT: the v1.1 suite (60 scenarios) pinned `claimed/` as a state, claim
+# timestamps and claimer PIDs, the DM_CLAIM_MAX_AGE lease, stale-claim recovery, the `.a<k>`
+# delivery-attempt suffix, the poison cap / DM_MAX_ATTEMPTS, the detached lease sweeper, the
+# shared transition budget, and — at Q.T/15 — two concurrent consumers receiving DISJOINT sets.
+# Every one of those is deleted by the v1.2 ruling; Q.T/15 in particular encodes the
+# exactly-once contract Steve REJECTED ("one active session per lane; delivery is at-least-once;
+# duplicates acceptable"). All of them are retired here rather than weakened.
+#
+# FIXTURE GRAMMAR DISCIPLINE (the reason this suite has `plant_message` / `clone_queued`):
+# v1.1 requires a queued file to be named `<id>.a<k>`; v1.2 deletes the suffix. A guard that
+# hardcodes either spelling is a guard that must break at GREEN. So NO fixture here writes a
+# queue filename by hand: every planted entry gets its name from a real `brain dm` send (its
+# BYTES are then overwritten), or is cloned off such a name. Only the RED scenarios that pin the
+# v1.2 grammar itself mention `.a<k>` — to forbid it.
 #
 # SAFETY: every scenario runs inside a throwaway git repo under a single mktemp -d root.
 # The engine is never invoked with a real repository as CWD, and HOME is redirected into
 # the fixture so no machine-global file can be touched. The secret probe string and every
 # symlink target exist only in this file and inside those throwaway repos. Scenarios that
 # chmod a directory read-only restore the mode BEFORE any early return, so the EXIT trap can
-# still descend and remove the scratch root.
+# still descend and remove the scratch root. `assert_disposable` runs in the PARENT shell
+# (inside `_brain_env_run`, before the subshell) — never inside `_brain_exec`, where a `fatal`
+# would kill only the subshell and the breach would render as PASS.
 #
 # DECLARED GAPS (absence here is a decision, not an oversight):
-#   · UR-4a / UR-4b (`brain commit`) and UR-7 (`cmd_install`) have NO scenario in this file. The
-#     seam map sequences them "with the rewrite, not inside it" (§"UR fixes riding along — small,
-#     self-contained — sequenced with the rewrite, not inside it"), so they need their own RED
-#     pass against the commit/install paths, not a DM-transport scenario. [F13]
-#   · `_atomic_place`'s "temp cleaned up on FAILURE" limb is only partially covered. Q.S/2, Q.S/8
-#     and Q.S/9 assert no `.tmp-*` residue after a completed send and after both refusal paths,
-#     and Q.R/25 covers the stale-temp sweep — but a temp abandoned by a crash BETWEEN create and
-#     rename is not drivable from the CLI (there is no injectable failure point inside the
-#     helper), so no scenario claims it. Cover it in a unit harness if the helper grows one. [F12]
+#   · UR-4a / UR-4b (`brain commit`) and UR-7 (`cmd_install`) have NO scenario in this file —
+#     they live in test/commit-install.sh, which is frozen and out of scope for v1.2. [F13]
+#   · `_atomic_place`'s "temp cleaned up on FAILURE" limb: V.S/3, V.S/11 and V.S/12 assert no
+#     `.tmp-*` residue after a completed send and after both refusal paths, but a temp abandoned
+#     by a crash BETWEEN create and rename is not drivable from the CLI. Not claimed. [F12]
+#   · The `.tmp-*` STALE-SWEEP (v1.1's DM_TEMP_MAX_AGE=300, dirq maxtemp) has no scenario. It was
+#     specified inside seam decision 6, which v1.2 supersedes "for the consume path" — and the
+#     sweep is a SEND-side concern reached only from the deleted `_dm_recover_stale`. Whether it
+#     survives is genuinely unresolved by the map. V.S/16 keeps the load-bearing half (a dot-temp
+#     is invisible to every reader and is never delivered) and asserts nothing about ageing.
+#     NON-BLOCKING open question — see the hand-off report. [F14]
+#   · Two concurrent consumers of one lane: deliberately absent. The v1.2 ruling declares one
+#     active session per lane, so a disjointness requirement would encode a rejected contract.
+#   · SEND-side atomicity has no ENGINE-side witness. Must-survive #1's "dot-temp + same-directory
+#     rename" is proven only from the READER side — V.S/3 and V.S/11/12 assert no `.tmp-*` residue
+#     survives a completed or refused send, and V.S/16 asserts a dot-temp is invisible to every
+#     reader and never delivered. Nothing here observes the rename itself: there is no CLI-drivable
+#     interruption point inside `_atomic_place`, and manufacturing one would cost a bespoke
+#     harness for a property the reader-side assertions already bound. Declared, not claimed. [L8]
+#   · The per-invocation batch size K is NOT pinned — only that a bound exists (V.N/50 caps
+#     delivery at DM_INJECT_MAX_LINES over a 45-entry backlog), that bounding destroys nothing,
+#     and that successive invocations drain the remainder without starvation. The map says "one
+#     'process at most K entries' cap" and deliberately does not name K, so pinning a value here
+#     would invent a ruling. A map decision, not an oversight. [L9]
 #
-# RED DISCIPLINE: scenarios pinning v1.1 behaviour MUST fail against the current engine —
-# the commands and directories do not exist yet. Scenarios labelled "guard:" are regression
-# guards that legitimately pass today and must keep passing. Every guard was mutation-probed
-# against a deliberately non-compliant copy of bin/brain and shown to REJECT it, so a green
-# guard means the behaviour is present, not that the assertion is toothless.
+# RED DISCIPLINE: scenarios labelled "red" pin v1.2 behaviour and MUST fail against the current
+# v1.1 engine. Scenarios labelled "guard:" are regression guards that pass against the current
+# engine today and must keep passing through GREEN — they are the "keep" list of the map's
+# Suite-consequences section, restated so that nothing they assert depends on deleted machinery.
 #
 # Usage: test/dm.sh          BRAIN_BIN=<path> overrides the engine under test.
 
@@ -65,13 +91,11 @@ DM_PROTOCOL="$REPO_ROOT/templates/DM-PROTOCOL.md"
 FIXTURE_BRANCH="main"
 FIXTURE_MAIN_REF="origin/main"
 
-# Constants the seam map ratifies. Restated here so a scenario reads against a NAME, and so a
-# change to either constant surfaces as one edit rather than scattered magic numbers.
-DM_CLAIM_MAX_AGE=600      # seam decision 6  — stale-claim lease, seconds (dirq maxlock)
-DM_MAX_ATTEMPTS=3         # seam decision 6b — deliveries before a message routes to failed/
-DM_TEMP_MAX_AGE=300       # seam decision 6  — stale .tmp-* purge, seconds (dirq maxtemp)
-DM_MAX_BODY=4096          # seam decision 8  — body cap KEPT (rationale rewritten, value unchanged)
-DM_INJECT_MAX_LINES=40    # seam "injection bounds" — USE as-is
+# The bounds v1.2 KEEPS. DM_CLAIM_MAX_AGE, DM_MAX_ATTEMPTS, DM_TEMP_MAX_AGE and the shared
+# transition budget are gone with the claim layer and are deliberately not restated here.
+DM_MAX_BODY=4096          # seam decision 8  — body cap kept (rationale rewritten, value unchanged)
+DM_INJECT_MAX_LINES=40    # seam "injection bounds" — USE as-is; also the v1.2 batch ceiling
+DM_INJECT_MAX_COLS=2000   # seam "injection bounds" — BYTE cap per emitted line
 
 # ── counters / current-scenario state ────────────────────────────────────────────────────
 TOTAL=0
@@ -193,8 +217,8 @@ make_vault() {
 }
 
 # The engine invocation itself. Kept separate from the stream plumbing so the SAME environment
-# is used whether the caller wants captured streams, tag-scoped streams (concurrency), or a
-# CLOSED stdout (the emit-failure instrument). Always run inside ( ) — it cd's and exec's.
+# is used whether the caller wants captured streams or a CLOSED stdout (the emit-failure
+# instrument). Always run inside ( ) — it cd's and exec's.
 _brain_exec() {
   _be_repo=$1; _be_id=$2; shift 2
   _be_base=$(dirname "$_be_repo")
@@ -211,8 +235,10 @@ _brain_exec() {
 }
 
 # _brain_env_run <outfile|'-'> <errfile> <repo> <identity> [args...]
-# '-' as the outfile CLOSES stdout instead of redirecting it — that is how Q.R/24 drives the
-# "emit failed, so the message must NOT be retired" limb of UR-1.
+# '-' as the outfile CLOSES stdout instead of redirecting it — that is how V.N/47 drives the
+# "emit failed, so the message must stay pending" limb of must-survive #2.
+# The disposability interlock lives HERE, in the parent shell: inside `_brain_exec`'s subshell a
+# `fatal` would kill only the subshell and the breach would render as PASS.
 _brain_env_run() {
   _br_out=$1; _br_err=$2; shift 2
   assert_disposable "$1"
@@ -233,19 +259,9 @@ run_brain() {
   _brain_env_run "$OUT" "$ERR" "$@"
 }
 
-# run_brain_tagged <tag> <repo> <identity> [args...] — tag-scoped stream files so two
-# invocations can run CONCURRENTLY without clobbering each other's captures. Does NOT touch
-# $OUT/$ERR. Safe to background:  run_brain_tagged a "$fx" bravo dm take &
-run_brain_tagged() {
-  _rt_tag=$1; shift
-  _rt_base=$(dirname "$1")
-  _brain_env_run "$_rt_base/last.$_rt_tag.out" "$_rt_base/last.$_rt_tag.err" "$@"
-}
-tagged_out() { printf '%s' "$(dirname "$1")/last.$2.out"; }
-tagged_err() { printf '%s' "$(dirname "$1")/last.$2.err"; }
-
-# ── queue-layout helpers (seam decision 1) ───────────────────────────────────────────────
-# q_dir <repo> <lane> <state>  where state ∈ pending | claimed | read | failed
+# ── queue-layout helpers (seam decision 1, minus the deleted claimed/ state) ──────────────
+# q_dir <repo> <lane> <state>  where state ∈ pending | read | failed
+# (`claimed` is named in exactly one scenario — V.N/46 — to assert it does NOT exist.)
 q_dir() { printf '%s' "$1/.brain/dm/$2/$3"; }
 
 # journal entry lines ("- <ts> <feat> — <msg>") across every journal file in the vault
@@ -256,6 +272,13 @@ journal_since() { journal_entries "$1" | tail -n +"$(($2 + 1))"; }
 
 line_count() { [ -f "$1" ] || { printf '0'; return 0; }; wc -l < "$1" | tr -d ' \n'; }
 byte_size()  { [ -f "$1" ] || { printf '0'; return 0; }; wc -c < "$1" | tr -d ' \n'; }
+
+# Longest line of <file> in BYTES. LC_ALL=C is load-bearing: awk's length() counts characters in
+# a UTF-8 locale, and the wire caps the map names are byte caps (`utf8bytelength`).
+max_line_bytes() {
+  [ -f "$1" ] || { printf '0'; return 0; }
+  LC_ALL=C awk '{ n = length($0); if (n > m) m = n } END { printf "%d", m + 0 }' "$1" 2>/dev/null
+}
 
 # Every queue iteration in this suite uses the seam's own guard — `[ -e ] || [ -L ]` — so a
 # BROKEN symlink planted in a queue directory is COUNTED, not silently invisible to the test.
@@ -276,9 +299,9 @@ first_file() {
   return 1
 }
 
-# Dot-prefixed entries — the temp names (seam decision 2: temp = `.tmp-<id>` inside pending/).
-# A plain `for f in dir/*` never sees them, which is exactly the property the design relies on;
-# this helper is how the suite checks the invariant the reader glob cannot.
+# Dot-prefixed entries — the temp names (seam decision 2, UNCHANGED by v1.2: the temp is
+# `.tmp-<id>` inside pending/ itself). A plain `for f in dir/*` never sees them, which is exactly
+# the property the design relies on; this helper is how the suite checks what the glob cannot.
 count_dotfiles() {
   _cd=0
   for _cd_f in "$1"/.*; do
@@ -289,27 +312,10 @@ count_dotfiles() {
   printf '%s' "$_cd"
 }
 
-# <id> is the IMMUTABLE substring the seam requires be preserved across every transition
-# (decision 6b, Bernstein's "preserve the uniq string" rule): strip the `.a<k>[...]` tail.
+# The immutable message id. Under v1.2 the filename IS the id; under the v1.1 engine it carries a
+# `.a<k>` tail. Stripping a `.a*` suffix that may not be there makes every id-preservation
+# assertion in this file grammar-agnostic — it reads the same id from either engine.
 msg_id_of() { _mi=${1##*/}; printf '%s' "${_mi%.a*}"; }
-
-# delivery-attempt counter k from `<id>.a<k>` / `<id>.a<k>.c<ts>-<pid>`; non-zero if absent.
-attempt_of() {
-  _ao=${1##*/}
-  case "$_ao" in *.a[0-9]*) ;; *) return 1 ;; esac
-  _ao=${_ao#*.a}; _ao=${_ao%%.*}
-  case "$_ao" in ''|*[!0-9]*) return 1 ;; esac
-  printf '%s' "$_ao"
-}
-
-# <claim-ts> from `.c<claim-ts>-<claimer-pid>`; non-zero if the name carries no claim stamp.
-claim_ts_of() {
-  _ct=${1##*/}
-  case "$_ct" in *.c*) ;; *) return 1 ;; esac
-  _ct=${_ct##*.c}
-  case "$_ct" in *-*) ;; *) return 1 ;; esac
-  printf '%s' "${_ct%-*}"
-}
 
 # the message id of whichever file in <dir> carries <needle> in its BODY (order-free lookup)
 id_of_body() {
@@ -333,21 +339,35 @@ str_has() { case "$1" in *"$2"*) return 0 ;; esac; return 1; }
 
 err_tail() { tr '\n' ' ' < "$ERR" 2>/dev/null | cut -c1-160; }
 
-# `brain status` ECHOES recent journal lines verbatim. The DM call-log pointer wording is GREEN's
-# to rewrite and may legitimately contain the word "failed", so a control that grepped ALL of
-# status would fire on the echo rather than on the failed-queue banner. Q.R/22's controls
-# therefore look ONLY at status's own rendering.
+# `brain status` ECHOES recent journal lines verbatim, and the DM call-log pointer wording may
+# legitimately contain the word "failed", so a control that grepped ALL of status would fire on
+# the echo rather than on the quarantine banner. This looks ONLY at status's own rendering.
 # The filter is anchored to the REAL journal entry format written by _announce_as —
-# `- <ISO-8601-ts> <feat> — <msg>` — not to a bare "- " prefix: a failed-queue banner rendered as
-# a column-0 markdown bullet would be eaten by the looser filter and falsely red Q.R/22. [F3/R2-3]
+# `- <ISO-8601-ts> <feat> — <msg>` — not to a bare "- " prefix. [F3/R2-3]
 status_has_failed() { grep -vE '^- [0-9]{4}-[0-9]{2}-[0-9]{2}T' "$1" 2>/dev/null | grep -qi 'failed'; }
 
 # Journal-line SHAPE: the line with every digit removed. Timestamps, pids and message ids are
 # all digit-bearing, so two sends of two different bodies must produce the SAME shape — while a
 # base64/hex/encoded body leaves differing letters behind and breaks the equality. This is
-# UR-10's "compare journal payloads for two different bodies and require body-independence"
-# branch, chosen because the seam map does not pin the call-log grammar itself.
+# UR-10's "compare journal payloads for two different bodies and require body-independence".
 journal_shape() { printf '%s' "$1" | tr -d '0-9'; }
+
+# The startup context the SessionStart hook injects.
+hook_context() { # <repo> <identity> → prints additionalContext, non-zero if it can't
+  run_brain "$1" "$2" hook session-start
+  _hc_rc=$?
+  [ "$_hc_rc" = "0" ] || return 1
+  jq -e -r '.hookSpecificOutput.additionalContext // empty' "$OUT" 2>/dev/null
+}
+
+# Must-survive #4: "If entries remain, the emitted context must explicitly instruct
+# continuation — do not rely on a new directory event firing." The map does not pin the WORDING,
+# so this is a broad alternation, and V.N/50 pairs it with a NEGATIVE CONTROL fixture whose
+# backlog fits in one batch: the phrase must be ABSENT there. That control is what stops the
+# alternation from being satisfied by boilerplate the boot always prints.
+continuation_signal() { # <context-string>
+  printf '%s' "$1" | grep -qiE 'remain|more (dm|message)|still (queued|pending)|again'
+}
 
 # ── assertion helpers — each records a reason and returns 1 so callers can short-circuit ─
 fail() {
@@ -434,13 +454,52 @@ need_dir_lacks_id() { # <dir> <id> <label>
   fail "$3: an entry carrying message id '$2' IS under $1 and must not be"
 }
 
-# grammar gate for a queued message name (seam decisions 3 + 6b):
-#   <_now_compact>-<pid>[-<n>]  .a<k>        where _now_compact is %Y%m%dT%H%M%SZ
-need_queue_name() { # <path> <label>
+# The message must still be SOMEWHERE the engine can reach — the loss guard that is neutral
+# between v1.1 (which parks a mid-flight message in claimed/) and v1.2 (which leaves it in
+# pending/). The v1.2-specific "and it is in pending/" claim is asserted only by the RED
+# scenarios V.N/47, V.N/48 and V.N/51, where it is the thing under test.
+need_not_lost() { # <repo> <lane> <needle> <label>
+  need_tree_has "$1/.brain/dm/$2" "$3" "$4 (the message must not be destroyed by a failed transition)"
+}
+
+# Every rendered digest record must be a JSON object carrying all four contract fields, with no
+# key outside {from,to,ts,content,id}.
+#
+# SUPERSET-BOUNDED on purpose. The v1.1 suite asserted `keys == ["content","from","to","ts"]`,
+# which is unsatisfiable against must-survive #8 (the message id must be exposed and the map does
+# not say how). This restores everything that equality actually bought — one value per record,
+# object-ness, all four fields present, unknown producer fields refused — while PERMITTING `id`.
+# It does not REQUIRE `id`: that is V.N/52's job, and double-pinning it here would make three
+# guards flip red for a reason they are not about.
+need_digest_records_wellformed() { # <file> <label>
+  jq -e -s '
+    length > 0
+    and (map(
+      (type == "object")
+      and (has("from") and has("to") and has("ts") and has("content"))
+      and (((keys) - ["content", "from", "id", "to", "ts"]) | length == 0)
+    ) | all)
+  ' "$1" >/dev/null 2>&1 && return 0
+  fail "$2: the emitted digest is not a sequence of well-formed records — each must parse as a JSON object carrying from/to/ts/content, with no key outside {from,to,ts,content,id}"
+}
+
+# v1.2 queue-name grammar: `<_now_compact>-<pid>[-<n>]`, with NO delivery-attempt suffix and no
+# claim stamp. Authority: seam decision 3 ("Message ID = filename = <_now_compact>-<pid> + a
+# collision bump"), which the v1.2 ruling leaves UNCHANGED, minus `.a<k>` and `.c<ts>-<pid>`,
+# which its Delete list removes ("the delivery-attempt counter (`.a<k>`)", "claim timestamps and
+# claimer PIDs").
+need_v12_queue_name() { # <path> <label>
   _nq=${1##*/}
-  printf '%s' "$_nq" | grep -qE '^[0-9]{8}T[0-9]{6}Z-[0-9][0-9]*(-[0-9][0-9]*)?\.a[0-9][0-9]*$' \
-    && return 0
-  fail "$2: '$_nq' does not match the ratified name grammar <ts>-<pid>[-<n>].a<k> (seam decisions 3 + 6b; <ts> is _now_compact's %Y%m%dT%H%M%SZ)"
+  case "$_nq" in
+    *.a[0-9]*)
+      fail "$2: '$_nq' still carries a .a<k> delivery-attempt suffix — the v1.2 Delete list removes the attempt counter"
+      return 1 ;;
+    *.c[0-9]*)
+      fail "$2: '$_nq' still carries a .c<claim-ts>-<pid> claim stamp — the v1.2 Delete list removes claim timestamps and claimer PIDs"
+      return 1 ;;
+  esac
+  printf '%s' "$_nq" | grep -qE '^[0-9]{8}T[0-9]{6}Z-[0-9][0-9]*(-[0-9][0-9]*)?$' && return 0
+  fail "$2: '$_nq' does not match the v1.2 name grammar <ts>-<pid>[-<n>] (seam decision 3, unchanged; _now_compact is %Y%m%dT%H%M%SZ)"
 }
 
 # ── instruments ──────────────────────────────────────────────────────────────────────────
@@ -464,79 +523,55 @@ make_readonly_dir() {
   return 0
 }
 
-# mint_stuck_claim <repo> <lane> — leave ONE genuinely engine-minted claim stuck in claimed/:
-# claimed but never acked. That is precisely UR-1's kill-after-claim state.
+# plant_message <repo> <lane> <marker> — send a REAL message from alpha carrying <marker>, then
+# print the path of the file the engine queued for it.
 #
-# HOW: pre-create read/ read-only, so the claim (pending/ → claimed/) succeeds while the ack
-# rename (claimed/<name> → read/<id>.a<k>) gets EACCES. The mode is restored before returning.
-#
-# ENGINE-MINTED IS PRIMARY; hand-minted is the fallback. The seam map has since RULED the
-# encoding — "<claim-ts> encoding — RULED: Unix epoch seconds (gap (a) closed 2026-08-04)" — so a
-# hand-minted claim name is now authority-grounded rather than an invented ruling. The fallback
-# exists because a fail-CLOSED engine (one that refuses to claim while read/ is unwritable — a
-# shape the seam does not forbid) would otherwise silently kill Q.R/20/21/22 instead of testing
-# them. `age_claim` still detects either encoding, so the ruling forces no test change. [F5]
-#
-# ⚠ WHEN THE FALLBACK FIRES the claim NAME was written by this fixture, so Q.R/20's name-shape
-# assertions are then checking the fixture, not the engine. The engine's own claim and ack naming
-# is pinned independently by Q.T/12 and Q.B/16, neither of which uses this instrument.
-#
-# prints the claimed file path; rc 1 = fixture error, 2 = instrument blind, 4 = nothing in
-# pending/ to claim (i.e. the SEND seam is what is missing, not the claim seam).
-mint_stuck_claim() {
-  _ms_fx=$1; _ms_lane=$2
-  make_readonly_dir "$(q_dir "$_ms_fx" "$_ms_lane" read)"
-  _ms_rc=$?
-  [ "$_ms_rc" = 0 ] || return "$_ms_rc"
-
-  run_brain "$_ms_fx" "$_ms_lane" dm take
-  chmod 755 "$(q_dir "$_ms_fx" "$_ms_lane" read)" 2>/dev/null || true
-
-  if _ms_c=$(first_file "$(q_dir "$_ms_fx" "$_ms_lane" claimed)"); then
-    printf '%s' "$_ms_c"; return 0
-  fi
-  # fallback: the engine declined to claim — hand-mint the same state. Authority for the epoch
-  # encoding: seam map, "<claim-ts> encoding — RULED: Unix epoch seconds".
-  _ms_p=$(first_file "$(q_dir "$_ms_fx" "$_ms_lane" pending)") || return 4
-  mkdir -p "$(q_dir "$_ms_fx" "$_ms_lane" claimed)" || return 1
-  _ms_hand="$(q_dir "$_ms_fx" "$_ms_lane" claimed)/${_ms_p##*/}.c$(date -u +%s)-1"
-  mv "$_ms_p" "$_ms_hand" || return 1
-  printf '%s' "$_ms_hand"
+# WHY THIS EXISTS (and why it is the cheapest thing that works): several wire-contract fixtures
+# cannot be produced through the CLI at all — a second JSON object in one file, an unknown field,
+# a 6 KB `from`, multibyte in `to`/`ts`, invalid JSON. The v1.1 suite hand-wrote the filenames,
+# which hardcoded `<id>.a<k>` into eleven fixtures. v1.2 deletes that suffix, so every one of
+# those guards would have had to break at GREEN. Letting the ENGINE mint the name and overwriting
+# only the file's BYTES keeps the fixture valid under both grammars, with no name parsing, no
+# grammar table and no per-engine branch.
+plant_message() {
+  _pm_fx=$1; _pm_lane=$2; _pm_marker=$3
+  run_brain "$_pm_fx" alpha dm "@$_pm_lane" "$_pm_marker" || return 1
+  for _pm_f in "$(q_dir "$_pm_fx" "$_pm_lane" pending)"/*; do
+    [ -e "$_pm_f" ] || continue
+    if grep -qF -- "$_pm_marker" "$_pm_f" 2>/dev/null; then printf '%s' "$_pm_f"; return 0; fi
+  done
+  return 1
 }
 
-# Turn a mint_stuck_claim rc into ONE precise scenario failure. Called by every consumer so the
-# same diagnosis is reported identically wherever the instrument could not be built.
-mint_failed() { # <rc>
-  case "$1" in
-    2) fail "instrument blind: a rename into a 0500 directory still succeeds (running as root?) — the stuck-claim instrument cannot be built on this machine" ;;
-    4) fail "no message in pending/ to claim — the send did not land as a per-message file, so the claim/recovery seam cannot be reached yet (fix the send path first)" ;;
-    *) fail "stuck-claim fixture failed (rc=$1) — neither 'brain dm take' nor the hand-minted fallback could leave a claim in claimed/" ;;
-  esac
+# clone_queued <src-file> <count> <marker-prefix> — mint <count> additional queued entries whose
+# NAMES are derived from an engine-minted one, so a large backlog costs one engine invocation
+# instead of N. The bump is inserted before whatever suffix the engine uses (`.a0` under v1.1,
+# none under v1.2), which is exactly seam decision 3's `-<n>` collision bump in both grammars.
+# Each clone carries `<marker-prefix><NN>-marker` so deliveries can be counted individually.
+clone_queued() {
+  _cq_src=$1; _cq_n=$2; _cq_pre=$3
+  _cq_dir=${_cq_src%/*}; _cq_base=${_cq_src##*/}
+  _cq_id=${_cq_base%%.*}; _cq_sfx=${_cq_base#"$_cq_id"}
+  _cq_i=1
+  while [ "$_cq_i" -le "$_cq_n" ]; do
+    jq -cn --arg c "$_cq_pre$(printf '%02d' "$_cq_i")-marker" \
+      '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:$c}' \
+      > "$_cq_dir/$_cq_id-$_cq_i$_cq_sfx" || return 1
+    _cq_i=$((_cq_i + 1))
+  done
 }
 
-# age_claim <claimed-file> <seconds-back> — rewrite the claim's <claim-ts> to <seconds-back>
-# in the past, preserving <id>, .a<k> and the claimer-pid component. Detects the encoding
-# rather than assuming it: all-digits ⇒ epoch seconds, `<digits>T<digits>Z` ⇒ _now_compact.
-# Anything else is an unrecognised encoding and returns non-zero (an actionable RED, never a
-# silent skip). Prints the new path.
-age_claim() {
-  _ac_f=$1; _ac_back=$2
-  _ac_b=${_ac_f##*/}; _ac_d=${_ac_f%/*}
-  _ac_ts=$(claim_ts_of "$_ac_f") || return 1
-  case "$_ac_ts" in
-    ''|*[!0-9TZ]*) return 1 ;;
-  esac
-  case "$_ac_ts" in
-    *T*Z) _ac_min=$(( (_ac_back + 59) / 60 ))   # round UP: never land ON the lease boundary
-          _ac_new=$(date -u -v-"$_ac_min"M +%Y%m%dT%H%M%SZ 2>/dev/null \
-                 || date -u -d "$_ac_min minutes ago" +%Y%m%dT%H%M%SZ 2>/dev/null) ;;
-    *)    _ac_new=$(( _ac_ts - _ac_back )) ;;
-  esac
-  [ -n "$_ac_new" ] || return 1
-  _ac_pre=${_ac_b%.c*}
-  _ac_pid=${_ac_b##*-}
-  mv "$_ac_f" "$_ac_d/$_ac_pre.c$_ac_new-$_ac_pid" || return 1
-  printf '%s' "$_ac_d/$_ac_pre.c$_ac_new-$_ac_pid"
+# drain_takes <repo> <lane> <max-invocations> — run `brain dm take` until pending/ is empty or
+# the invocation budget runs out. Prints the number of invocations used. Used only to prove the
+# bounded batch RESUMES (must-survive #4), never to define the bound.
+drain_takes() {
+  _dt_fx=$1; _dt_lane=$2; _dt_max=$3; _dt_i=0
+  while [ "$_dt_i" -lt "$_dt_max" ]; do
+    [ "$(count_files "$(q_dir "$_dt_fx" "$_dt_lane" pending)")" = 0 ] && break
+    run_brain "$_dt_fx" "$_dt_lane" dm take
+    _dt_i=$((_dt_i + 1))
+  done
+  printf '%s' "$_dt_i"
 }
 
 # ── scenario runner ──────────────────────────────────────────────────────────────────────
@@ -558,16 +593,14 @@ scenario() { # <kind: red|guard> <name> <function>
   fi
 }
 
-# ══════════════════════════ Q.S — send / storage layout ══════════════════════════════════
+# ══════════════════════════ V.S — send / storage layout (all guards) ═════════════════════
+# Must-survive #1 (atomic send: unique stable id, dot-temp, same-directory rename) and the
+# journal-secrecy half of #6. Nothing in this section touches the deleted claim layer.
 
-# Q.S/1 — `brain inbox` prints the pending/ DIRECTORY to arm on, and the retired single-inbox
+# V.S/1 — `brain inbox` prints the pending/ DIRECTORY to arm on, and the retired single-inbox
 # file is never created.
-#   PROVES     the arming target moved from a FILE to a DIRECTORY (seam, "Deleted, not
-#              extended": _inbox_ensure's append-creation semantics die; cmd_inbox "now ensures
-#              the directory tree and prints the pending/ dir to arm on").
-#   DOES NOT   pin which of claimed/ read/ failed/ are created eagerly — the seam says "the
-#   PROVE      directory tree" without enumerating, so only pending/ is required here. An
-#              engine that also pre-creates the others passes.
+#   DOES NOT   pin which sibling state directories are created eagerly — the map says "the
+#   PROVE      directory tree" without enumerating. V.N/46 is what forbids `claimed/`.
 sc_inbox_prints_pending_dir() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
 
@@ -585,16 +618,16 @@ sc_inbox_prints_pending_dir() {
   esac
   case "$path" in
     */dm/alpha/pending) ;;
-    *) fail "brain inbox must print the pending/ DIRECTORY (seam: cmd_inbox ensures the tree and prints pending/), got: $path" ;;
+    *) fail "brain inbox must print the pending/ DIRECTORY to arm on, got: $path" ;;
   esac
   need_real_dir "$path" "the printed arming target"
   need_file_absent "$fx/.brain/dm/alpha/inbox.jsonl" \
-    "the retired single-shared-inbox file (v1.1 deletes it; nothing may re-create it)"
+    "the retired single-shared-inbox file (nothing may re-create it)"
 }
 
-# Q.S/1b — the dispatcher and usage() must both know the live-consumption command. Without
+# V.S/2 — the dispatcher and usage() must both know the live-consumption command. Without
 # `dm take` in usage(), UR-3's fix is undiscoverable by the agent that has to run it.
-sc_usage_lists_dm_inbox_and_take() {
+sc_usage_lists_dm_and_take() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
 
   run_brain "$fx" alpha help
@@ -603,18 +636,16 @@ sc_usage_lists_dm_inbox_and_take() {
   need_file_has "$OUT" "brain announce" "usage() baseline (an existing command is listed)" || return 0
   need_file_has "$OUT" "brain dm" "usage() must list the dm subcommand"
   need_file_has "$OUT" "brain inbox" "usage() must list the inbox subcommand"
-  need_file_has "$OUT" "dm take" "usage() must list the live-consumption command (seam: cmd_dm_take — UR-3's fix)"
+  need_file_has "$OUT" "dm take" "usage() must list the live-consumption command (UR-3's fix)"
 }
 
-# Q.S/2 — ONE message is ONE file: name grammar, single JSON object, no temp residue, and no
-# copy anywhere but the recipient's pending/.
+# V.S/3 — must-survive #1. ONE message is ONE file: a single JSON object, no temp residue, and
+# no copy anywhere but the recipient's pending/.
 #   REJECTS    an append-based encoder (jq -s length would be > 1), a shared-inbox regression
 #              (count in pending/ would be 0), a temp left behind by a completed send, and a
 #              self-copy that boot delivery would read back to the sender.
-#   INITIAL ATTEMPT COUNTER — RATIFIED. The map was silent when this scenario was written; the
-#   RED pass surfaced the gap and the map then closed it: "_dm_new_id … A fresh send mints
-#   attempt counter ZERO: `<id>.a0` (gap (b) closed 2026-08-04 — the map was silent; the RED
-#   suite pins `.a0` at Q.S/2 and this ruling ratifies it)". Authority-backed, not a guess. [F11]
+#   NAME       the filename grammar is deliberately NOT asserted here — it is the one part of
+#              the send contract v1.2 changes, so it is pinned by V.N/46 (RED) instead.
 sc_send_writes_one_message_file() {
   fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
   pd=$(q_dir "$fx" bravo pending)
@@ -630,9 +661,6 @@ sc_send_writes_one_message_file() {
 
   f=$(first_file "$pd")
   need_real_file "$f" "the queued message" || return 0
-  need_queue_name "$f" "queued message name"
-  need_eq "$(attempt_of "$f")" 0 \
-    "delivery-attempt counter on a FRESHLY SENT message (seam map, _dm_new_id: 'A fresh send mints attempt counter ZERO')"
 
   if ! jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
     fail "the message file is not a single JSON object: $(head -c 200 "$f")"
@@ -652,11 +680,9 @@ sc_send_writes_one_message_file() {
   need_count "$(q_dir "$fx" alpha pending)" 0 "the sender's OWN pending/ after a p2p send"
 }
 
-# Q.S/2b — three sends land as three DISTINCT files. Sends from separate processes in the same
-# clock second differ only by <pid>, which is exactly what seam decision 3 relies on; a
-# timestamp-only id would collapse them and lose messages silently.
-#   DOES NOT   exercise the `-<n>` collision bump: that fires only on same-second PID REUSE,
-#   PROVE      which cannot be forced here (measured, not assumed). The grammar gate accepts it.
+# V.S/4 — three sends land as three DISTINCT files. Sends from separate processes in the same
+# clock second differ only by <pid>, which is exactly what seam decision 3 (UNCHANGED by v1.2)
+# relies on; a timestamp-only id would collapse them and lose messages silently.
 sc_rapid_sends_stay_distinct() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   pd=$(q_dir "$fx" bravo pending)
@@ -668,22 +694,16 @@ sc_rapid_sends_stay_distinct() {
   done
 
   need_count "$pd" 3 "message files after three sends (a colliding id would show fewer)" || return 0
-  for f in "$pd"/*; do
-    [ -e "$f" ] || continue
-    need_queue_name "$f" "queued message name"
-  done
   for m in rapid-a1 rapid-b2 rapid-c3; do
     need_tree_has "$pd" "$m" "every sent body must still be in pending/ ($m)"
   done
 }
 
-# Q.S/2c — the body cap survives the redesign. Seam decision 8: "DM_MAX_BODY kept, rationale
-# rewritten" — the PIPE_BUF justification evaporates under one-file-per-message, but the constant
-# and its refusal behaviour stay (it now bounds storage and digest cost, not atomicity). An
-# over-cap send is REFUSED outright: nothing queued, nothing journalled, no temp residue.
-# BASELINE-GREEN: v1 already enforces the cap. This guards against the rewrite quietly DROPPING
-# the cap while rewriting the comment that justifies it — the seam map changes the rationale and
-# an implementer reading only "that rationale evaporates" could reasonably delete the check. [F7]
+# V.S/5 — the body cap survives. Seam decision 8: "DM_MAX_BODY kept, rationale rewritten"; the
+# v1.2 ruling does not reopen it. An over-cap send is REFUSED outright: nothing queued, nothing
+# journalled, no temp residue.
+# This guards against a rewrite quietly DROPPING the cap while rewriting the comment that
+# justifies it — an implementer reading "that rationale evaporates" could reasonably delete it.
 sc_over_cap_body_refused() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   pd=$(q_dir "$fx" bravo pending)
@@ -706,16 +726,13 @@ sc_over_cap_body_refused() {
     "journal entry lines added by a REFUSED over-cap send"
 }
 
-# Q.S/3 — UR-9. A body carrying `"`, `\`, a tab and an INTERNAL NEWLINE must round-trip byte
-# for byte. This is the finding's whole point: every v1 test body was JSON-safe ASCII, so a
+# V.S/6 — UR-9. A body carrying `"`, `\`, a tab and an INTERNAL NEWLINE must round-trip byte for
+# byte, in storage AND through delivery. Every pre-UR-9 test body was JSON-safe ASCII, so a
 # naïvely interpolated encoder passed them all while corrupting exactly these four characters.
-#   REJECTS    string-interpolated JSON (invalid object, or the newline splitting the file into
-#              two JSON values), and any lossy escape/unescape round trip.
-sc_ur9_json_special_body_round_trip() {
+sc_json_special_body_round_trip() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   base=$(dirname "$fx")
   pd=$(q_dir "$fx" bravo pending)
-  # all four hazards, plus an ASCII marker so delivery can be checked without newline games
   body=$(printf 'ur9mark q="dq" bs=\\ tab:\tX\nsecond physical line')
 
   run_brain "$fx" alpha dm @bravo "$body"
@@ -737,18 +754,16 @@ sc_ur9_json_special_body_round_trip() {
     fail "decoded .content is not byte-identical to the sent body (UR-9 round trip); got $(byte_size "$base/ur9.got") bytes, want $(byte_size "$base/ur9.want")"
   fi
 
-  # ...and it must survive DELIVERY too, not just storage.
   run_brain "$fx" bravo dm take
   rc=$?
   need_rc "$rc" 0 "brain dm take (JSON-special body)" || return 0
   need_file_has "$OUT" "ur9mark" "the JSON-special message must actually be delivered by take"
 }
 
-# Q.S/4 — carried from v1, re-pinned. The journal keeps a POINTER, never the body.
-#   The pointer's exact path form is deliberately NOT pinned: the seam map replaces the storage
-#   layout but never restates the call-log grammar, so this asserts only what v1 ratified and
-#   the redesign preserves — the line names the recipient and points into that lane's dm tree.
-#   Q.S/5 is what closes UR-10's encoded-body hole; this scenario is the literal-leak half.
+# V.S/7 — must-survive #6 (journal body exclusion). The journal keeps a POINTER, never the body.
+#   The pointer's exact path form is deliberately NOT pinned: the map never restates the call-log
+#   grammar, so this asserts only that the line names the recipient and points into that lane's
+#   dm tree. V.S/8 closes UR-10's encoded-body hole; this is the literal-leak half.
 sc_dm_journals_pointer_not_body() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   # A REPEATED short marker: every substring of the body >= 4 chars contains 'zzq7', so a
@@ -777,8 +792,8 @@ sc_dm_journals_pointer_not_body() {
   need_tree_has "$(q_dir "$fx" bravo pending)" "$body" "the body reached the queue (positive control)"
 }
 
-# Q.S/5 — UR-10. The v1 scenarios rejected only LITERAL fragments, so a call-log line carrying
-# `base64(content)` passed every assertion while committing a reversible credential.
+# V.S/8 — UR-10. Literal-fragment assertions alone let a call-log line carrying `base64(content)`
+# pass while committing a reversible credential.
 #   INSTRUMENT the journal line with every DIGIT removed. Timestamps, pids and message ids are
 #              digit-bearing, so two sends of two DIFFERENT bodies must normalise to the SAME
 #              string. Any body-derived component — base64, hex, a length, a hash, a prefix —
@@ -786,11 +801,10 @@ sc_dm_journals_pointer_not_body() {
 #   FIXTURE    the two bodies are the same LENGTH and contain no digits, so a length field or a
 #              digit-only encoding cannot smuggle a difference past the normaliser either.
 #   COVERS     the direct path AND the @all broadcast path (the finding requires both).
-#   BASELINE-GREEN: the current jq-based writer is already body-independent — UR-10 is a SUITE
-#   hole, not an engine bug — so this passes today and must keep passing. Verified DISCRIMINATING
-#   against a mutant engine that appends [b64:<body>] to the call-log line: that mutant satisfies
-#   every literal-fragment assertion (v1's whole test) and is rejected by the shape comparison.
-sc_ur10_journal_body_independent() {
+#   Verified DISCRIMINATING against a mutant engine that appends [b64:<body>] to the call-log
+#   line: that mutant satisfies every literal-fragment assertion and is rejected by the shape
+#   comparison.
+sc_journal_body_independent() {
   fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
   b1="mikeoscarpapaquebecromeosierrax"    # 31 chars, letters only
   b2="tangouniformvictorwhiskeyxrayzu"    # 31 chars, letters only, no shared 4-gram
@@ -836,8 +850,7 @@ sc_ur10_journal_body_independent() {
 
   s3=$(journal_shape "$l3"); s4=$(journal_shape "$l4")
   [ -n "$s3" ] || fail "instrument check: the normalised broadcast journal line is empty"
-  need_eq "$s3" "$s4" \
-    "BROADCAST call-log line is not body-independent (UR-10)"
+  need_eq "$s3" "$s4" "BROADCAST call-log line is not body-independent (UR-10)"
 
   # positive control: both bodies really were transported, so a clean journal means something
   need_tree_has "$fx/.brain/dm" "$b1" "body #1 reached the queue (positive control)"
@@ -846,9 +859,9 @@ sc_ur10_journal_body_independent() {
   need_tree_lacks "$fx/.brain/journal" "$b2" "body #2 anywhere under journal/"
 }
 
-# Q.S/6 — carried. A secret-shaped body leaves no trace under journal/. The secret LEADS the
-# body and repeats, so a prefix-truncating leak cannot hide it: any leaked fragment of >= 4
-# chars contains 'AWS_', and of >= 21 the whole key name.
+# V.S/9 — a secret-shaped body leaves no trace under journal/. The secret LEADS the body and
+# repeats, so a prefix-truncating leak cannot hide it: any leaked fragment of >= 4 chars contains
+# 'AWS_', and of >= 21 the whole key name.
 sc_dm_secret_body_never_journalled() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   secret_body="AWS_SECRET_ACCESS_KEY=abc123 AWS_SECRET_ACCESS_KEY=abc123 abc123"
@@ -871,13 +884,11 @@ sc_dm_secret_body_never_journalled() {
   need_tree_lacks "$fx/.brain/journal" "AWS_" "any leading fragment of the secret under journal/"
 }
 
-# Q.S/7 — carried, re-pinned to per-message files. @all lands in every registered lane's
-# pending/ and never the sender's; one invocation still writes ONE journal line.
+# V.S/10 — @all lands in every registered lane's pending/ and never the sender's; one invocation
+# still writes ONE journal line. The fan-out is NOT gated on who looks live.
 sc_dm_all_broadcasts_not_to_self() {
   fx=$(make_vault alpha bravo charlie delta) || fatal "fixture build failed"
   body="resync-before-your-gates-9c1"
-  # the fan-out is NOT gated on who looks live: charlie LOOKS dormant (two-month-old updated:),
-  # delta is explicitly done. Both are registered, so both must still receive it.
   write_presence "$fx" charlie active "" "2026-06-01T00:00:00Z" \
     || fatal "fixture: could not write the stale lane"
   write_presence "$fx" delta "done" || fatal "fixture: could not write the done lane"
@@ -896,7 +907,6 @@ sc_dm_all_broadcasts_not_to_self() {
     pd=$(q_dir "$fx" "$lane" pending)
     need_count "$pd" 1 "$why pending/ after broadcast" || continue
     f=$(first_file "$pd")
-    need_queue_name "$f" "$why broadcast message name"
     if ! jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
       fail "$lane broadcast file is not a JSON object: $(head -c 120 "$f")"
       continue
@@ -911,14 +921,12 @@ sc_dm_all_broadcasts_not_to_self() {
     "journal entry lines added by one broadcast (ONE invocation = ONE line)"
 }
 
-# Q.S/8 — carried. An unknown recipient fails cleanly: no lane tree, no journal line, and no
-# temp residue anywhere (a half-written .tmp-* would be the atomic-placement helper leaking).
-# BASELINE-GREEN; verified discriminating against a mutant that journals a rejected send.
+# V.S/11 — an unknown recipient fails cleanly: no lane tree, no journal line, and no temp residue
+# anywhere (a half-written .tmp-* would be the atomic-placement helper leaking).
+# Verified discriminating against a mutant that journals a rejected send.
 sc_dm_unknown_recipient_fails_clean() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
 
-  # prerequisite: the dm path works at all, so a non-zero exit below means "rejected",
-  # not "subcommand missing".
   run_brain "$fx" alpha dm @bravo "probe-known-recipient"
   rc=$?
   need_rc "$rc" 0 "prerequisite: dm to a known recipient" || return 0
@@ -936,8 +944,8 @@ sc_dm_unknown_recipient_fails_clean() {
     "temp residue in a bystander lane's pending/ after a rejected send"
 }
 
-# Q.S/9 — carried. A self-send is refused, writes nothing, journals nothing, leaves no temp.
-# BASELINE-GREEN; verified discriminating against a mutant that journals a rejected send.
+# V.S/12 — a self-send is refused, writes nothing, journals nothing, leaves no temp.
+# Verified discriminating against a mutant that journals a rejected send.
 sc_dm_self_send_refused() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   body="self-send-body-4b2"
@@ -963,10 +971,9 @@ sc_dm_self_send_refused() {
     "journal entry lines added by a REFUSED self-send"
 }
 
-# Q.S/10a — guard. The existing `dm/` ignore rule is PREFIX-scoped, so the new subtree is
-# already covered (Stage-2 seam finding: "no new-layout work needed here"). This guard is what
-# would catch a regression that narrowed the rule to the old inbox.jsonl path.
-# BASELINE-GREEN; verified discriminating against a mutant whose fresh init omits the dm/ rule.
+# V.S/13 — must-survive #6 (dm/ gitignore self-heal). The `dm/` ignore rule is PREFIX-scoped, so
+# every state directory is covered; this guard is what would catch a regression that narrowed the
+# rule to one path. Verified discriminating against a mutant whose fresh init omits the dm/ rule.
 sc_init_gitignores_dm_queue() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
 
@@ -975,17 +982,15 @@ sc_init_gitignores_dm_queue() {
     fail "instrument broken: git check-ignore matches .brain/presence/alpha.md"
     return 0
   fi
-  for p in .brain/dm/bravo/pending/20260101T000000Z-1.a0 \
-           .brain/dm/bravo/claimed/20260101T000000Z-1.a0.c1-1 \
-           .brain/dm/bravo/read/20260101T000000Z-1.a0 \
-           .brain/dm/bravo/failed/20260101T000000Z-1.a3; do
+  for p in .brain/dm/bravo/pending/20260101T000000Z-1 \
+           .brain/dm/bravo/read/20260101T000000Z-1 \
+           .brain/dm/bravo/failed/20260101T000000Z-1; do
     git -C "$fx" check-ignore -q "$p" 2>/dev/null \
       || fail "a fresh init does not gitignore $p (git check-ignore did not match)"
   done
 }
 
-# Q.S/10b — a real send leaves nothing in `git status`. RED today only because the precondition
-# (one file in pending/) does not hold yet; the ignore half is already true.
+# V.S/14 — a real send leaves nothing in `git status`.
 sc_queue_files_stay_out_of_git_status() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
 
@@ -1007,15 +1012,12 @@ sc_queue_files_stay_out_of_git_status() {
   need_str_lacks "$st" ".brain/dm" "git status after a send"
 }
 
-# Q.S/11 — structural witness, carried: the queue path takes NO lock, under ANY name.
-# Seam altitude decision: "No lock anywhere on the queue path — rename arbitration IS the
-# concurrency control; reusing _lock_acquire (no staleness break) would reintroduce the wedge
-# the design exists to remove."
+# V.S/15 — structural witness: the queue path takes NO lock, under ANY name. Seam altitude
+# decision: "No lock anywhere on the queue path"; v1.2 removes machinery, never adds a lock.
 #   INSTRUMENT making .brain/.locks read-only is NAME-agnostic: _lock_acquire creates
 #              $BRAIN/.locks/<k>.lock whatever <k> is, so any lock protocol fails here while a
-#              lock-free send is unaffected. A witness keyed on a literal lock name would miss
-#              a lock taken under a global key. A stale per-lane dm/<to>/.lock is pre-created
-#              too, since a bespoke lock need not live under .brain/.locks at all.
+#              lock-free send is unaffected. A stale per-lane dm/<to>/.lock is pre-created too,
+#              since a bespoke lock need not live under .brain/.locks at all.
 #   POSITIVE   the same send must SUCCEED — this is not "everything is broken" passing as
 #   CONTROL    "no lock", and the elapsed-time bound catches a lock that spins then gives up.
 sc_dm_takes_no_lock() {
@@ -1032,16 +1034,12 @@ sc_dm_takes_no_lock() {
     *) fail "fixture: could not make .brain/.locks read-only (rc=$mrc)"; return 0 ;;
   esac
 
-  # ALL THREE queue paths must be lock-free, not just the send: the seam's altitude decision is
-  # "No lock ANYWHERE on the queue path". A consume or boot that locked would wedge exactly the
-  # way the design exists to prevent. [F8]
-  t0=$(date +%s)
+  # ALL THREE queue paths must be lock-free, not just the send.
   run_brain "$fx" alpha dm @bravo "no-lock-probe-3c"
   rc=$?
-  # Sample the post-SEND queue state HERE: the take below must EMPTY pending/ (Q.T/12), so
-  # asserting pending/ after it would make this scenario unsatisfiable under GREEN. Captured
-  # into variables rather than asserted inline, because an assertion that returns early would
-  # skip the chmod restore below and leave .brain/.locks read-only for the EXIT trap. [R2-1]
+  # Sample the post-SEND queue state HERE: the take below empties pending/, so asserting it
+  # afterwards would make this unsatisfiable. Captured into variables rather than asserted
+  # inline, because an early return would skip the chmod restore below. [R2-1]
   pend_after_send=$(count_files "$(q_dir "$fx" bravo pending)")
   pend_has_body=no
   grep -rqF -- "no-lock-probe-3c" "$(q_dir "$fx" bravo pending)" 2>/dev/null && pend_has_body=yes
@@ -1049,38 +1047,66 @@ sc_dm_takes_no_lock() {
   trc=$?
   run_brain "$fx" bravo hook session-start
   hrc=$?
-  t1=$(date +%s)
-  # restore BEFORE any early return — the EXIT-trap rm -rf needs to descend here
-  chmod 755 "$locks" 2>/dev/null || true
+  chmod 755 "$locks" 2>/dev/null || true       # restore BEFORE any early return
 
   need_rc "$rc" 0 "brain dm with .brain/.locks read-only and a stale dm/bravo/.lock (the SEND path takes no lock)" || return 0
   need_rc "$trc" 0 "brain dm take under a read-only .brain/.locks (the CONSUME path takes no lock)"
   need_rc "$hrc" 0 "hook session-start under a read-only .brain/.locks (the BOOT path takes no lock)"
-  # Bound covers all three invocations: baseline is ~1.5s, and ONE _lock_acquire spin adds ~5s
-  # (50 x 0.1s), so 4s separates them without courting flake. Measured non-flaky across repeat
-  # runs at a 55s whole-suite load on this machine.
-  elapsed=$((t1 - t0))
-  [ "$elapsed" -le 4 ] || fail "send+take+boot took ${elapsed}s — something spun on a lock (want <= 4s; one lock spin costs ~5s)"
-  # positive control, sampled BETWEEN the send and the take — the send really did deliver
+  # NB a wall-clock limb ("<= 4s, since one _lock_acquire spin costs ~5s") was DELETED here on the
+  # watchdog's recommendation: it was a timing heuristic on a loaded machine, and the structural
+  # witness above already rejects every lock protocol by making the lock DIRECTORY unwritable.
+  # A lock that spins and gives up still fails the read-only .locks gate, so the timer bought
+  # nothing but flake surface. [L7]
   need_eq "$pend_after_send" 1 "message files in pending/ immediately after the lock-free send"
   need_eq "$pend_has_body" yes "the sent body reached pending/ (positive control)"
-  # ...and the lock-free CONSUME path then carried it through to the acked archive
   need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the take (the consume path completed without a lock)"
-  need_tree_has "$(q_dir "$fx" bravo read)" "no-lock-probe-3c" "the acked archive carries the delivered content"
+  need_tree_has "$(q_dir "$fx" bravo read)" "no-lock-probe-3c" "the archived transcript carries the delivered content"
 }
 
-# ══════════════════════════ Q.T — take (the live path, UR-3) ═════════════════════════════
-
-# Q.T/12 — `brain dm take` claims, prints, acks. Seam: cmd_dm_take = recover → claim all →
-# print each → ack each, and ack is `claimed/<full-name>` → `read/<id>.a<k>`.
-#   PROVES     every claimed message reaches a TERMINAL acked state (claimed/ empty afterwards),
-#              the immutable <id> substring survives both transitions (decision 6b), and a
-#              second take consumes nothing — the SEQUENTIAL half of accepted finding #11.
-#   REJECTS    a take that prints without claiming (pending/ would still hold the files), one
-#              that claims without acking (claimed/ non-empty), and one that re-consumes.
-sc_take_claims_prints_acks() {
+# V.S/16 — seam decision 2 (UNCHANGED): the send temp is a DOT-file inside pending/, so `sh` globs
+# skip it and "a torn temp is invisible to every reader with zero code". A temp must therefore
+# never be counted as a message, never be emitted, and never be consumed.
+#   NOT ASSERTED: the 300s stale-temp PURGE. It was specified inside seam decision 6, which v1.2
+#   supersedes, and its only caller was the deleted `_dm_recover_stale`. Unresolved, non-blocking
+#   — see [F14] in the header.
+sc_dot_temp_invisible_to_readers() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed); rd=$(q_dir "$fx" bravo read)
+  pd=$(q_dir "$fx" bravo pending)
+
+  run_brain "$fx" alpha dm @bravo "real-message-2p6"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: a real send" || return 0
+
+  printf '{"from":"alpha","to":"bravo","ts":"x","content":"torn-temp-must-not-deliver"}\n' \
+    > "$pd/.tmp-inflight-9x1" || { fail "fixture: could not plant the in-flight temp"; return 0; }
+
+  need_count "$pd" 1 "a reader glob must see ONE message and never the dot-temp" || return 0
+  need_eq "$(count_dotfiles "$pd")" 1 "instrument check: the planted temp really is there" || return 0
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "brain dm take alongside an in-flight temp" || return 0
+  need_file_has "$OUT" "real-message-2p6" "the real message must be delivered (positive control)"
+  need_file_lacks "$OUT" "torn-temp-must-not-deliver" \
+    "a dot-prefixed in-flight temp must NEVER be emitted as a message (seam decision 2)"
+  need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the take — only the real message is archived"
+  need_tree_lacks "$(q_dir "$fx" bravo read)" "torn-temp-must-not-deliver" \
+    "an in-flight temp must never be promoted into the archive"
+}
+
+# ══════════════════════════ V.C — consume: take + boot (all guards) ══════════════════════
+# The "keep" half of the map's Suite-consequences list: offline delivery, no replay after a
+# successful ack, arming, path robustness, absolute-engine deployment resolution. Nothing here
+# asserts anything about `claimed/` — the deleted state is V.N/46's business.
+
+# V.C/17 — `brain dm take` emits every queued message and archives it into read/.
+#   PROVES     every delivered message reaches the archive carrying its ORIGINAL id, and a second
+#              take consumes nothing (no replay after a SUCCESSFUL archive).
+#   REJECTS    a take that prints without archiving (pending/ would still hold the files), one
+#              that archives without printing, and one that re-consumes an archived message.
+sc_take_emits_and_archives() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
 
   run_brain "$fx" alpha dm @bravo "take-one-8a2"
   rc=$?
@@ -1098,11 +1124,10 @@ sc_take_claims_prints_acks() {
   need_file_has "$OUT" "take-one-8a2" "take must print the first message"
   need_file_has "$OUT" "take-two-9b3" "take must print the second message"
 
-  need_count "$pd"  0 "pending/ after take (a claim empties it)"
-  need_count "$cd_" 0 "claimed/ after take (every claim must be acked once delivery succeeded)"
-  need_count "$rd"  2 "read/ after take"
-  need_dir_has_id "$rd" "$id1" "the acked archive must preserve message id #1 (seam 6b)"
-  need_dir_has_id "$rd" "$id2" "the acked archive must preserve message id #2 (seam 6b)"
+  need_count "$pd" 0 "pending/ after take (a successfully emitted message leaves it)"
+  need_count "$rd" 2 "read/ after take"
+  need_dir_has_id "$rd" "$id1" "the archive must preserve message id #1"
+  need_dir_has_id "$rd" "$id2" "the archive must preserve message id #2"
 
   # sequential no-double-consume: a second take sees nothing and changes nothing.
   run_brain "$fx" bravo dm take
@@ -1112,12 +1137,11 @@ sc_take_claims_prints_acks() {
   need_count "$rd" 2 "read/ after the second take (nothing re-consumed, nothing duplicated)"
 }
 
-# Q.T/13 — UR-3. A live-observed message must be CLAIMED, not merely seen: after `dm take`,
-# the next SessionStart must not replay it.
+# V.C/18 — UR-3. A live-observed message must really be consumed, not merely seen: after
+# `dm take`, the next SessionStart must not replay it.
 #   NEGATIVE   a message sent AFTER the take must still be reported at that same boot —
-#   CONTROL    otherwise "boot did not replay" would be satisfied by a boot that reports
-#              nothing at all.
-sc_ur3_take_then_boot_no_replay() {
+#   CONTROL    otherwise "boot did not replay" would be satisfied by a boot that reports nothing.
+sc_take_then_boot_no_replay() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
 
   run_brain "$fx" alpha dm @bravo "live-read-a7k"
@@ -1128,7 +1152,7 @@ sc_ur3_take_then_boot_no_replay() {
   rc=$?
   need_rc "$rc" 0 "brain dm take (the live read)" || return 0
   need_file_has "$OUT" "live-read-a7k" "take must actually deliver the message (positive control)" || return 0
-  need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the live read (the message was acked)" || return 0
+  need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the live read (the message was archived)" || return 0
 
   run_brain "$fx" alpha dm @bravo "after-take-b8m"
   rc=$?
@@ -1141,8 +1165,8 @@ sc_ur3_take_then_boot_no_replay() {
   need_str_lacks "$ctx" "live-read-a7k"  "a message already consumed by 'dm take' must NOT be replayed at the next boot (UR-3)"
 }
 
-# Q.T/14 — an empty queue is a silent success. Seam: cmd_dm_take "exits 0 with no output when
-# empty". A watcher runs this on every inbox flutter, so noise or a non-zero exit is a defect.
+# V.C/19 — an empty queue is a silent success. A watcher runs this on every inbox flutter, so
+# noise or a non-zero exit is a defect.
 sc_take_empty_is_silent_zero() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
 
@@ -1153,76 +1177,16 @@ sc_take_empty_is_silent_zero() {
   need_eq "$(byte_size "$OUT")" 0 "stdout bytes from an empty take"
 }
 
-# Q.T/15 — two CONCURRENT consumers of one lane get DISJOINT messages. This is accepted finding
-# #11's structural fix: rename(2) arbitration means each of two sessions wins a distinct set,
-# with no lock (seam decision 4).
-#   ASSERTION  every marker appears in EXACTLY ONE of the two captures (disjoint AND complete),
-#              which is deterministic under a correct implementation regardless of how the race
-#              actually falls. A double-consume shows as a marker in both; a lost message shows
-#              as a marker in neither.
-#   6c LIMB    both takes must exit 0. Decision 6c says the loser of a claim race "continues
-#              silently" — a non-zero exit or a hard failure there is conflating a lost race
-#              with a real error. This only bites when the race actually fires, so treat it as
-#              opportunistic evidence, not a proof of the silent path.
-sc_two_consumers_disjoint() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending)
-
-  for m in c1 c2 c3 c4 c5 c6; do
-    run_brain "$fx" alpha dm @bravo "concurrent-$m-marker"
-    rc=$?
-    need_rc "$rc" 0 "prerequisite: send concurrent-$m" || return 0
-  done
-  need_count "$pd" 6 "prerequisite: six messages queued" || return 0
-
-  run_brain_tagged conA "$fx" bravo dm take &
-  pa=$!
-  run_brain_tagged conB "$fx" bravo dm take &
-  pb=$!
-  wait "$pa"; rca=$?
-  wait "$pb"; rcb=$?
-  oa=$(tagged_out "$fx" conA); ob=$(tagged_out "$fx" conB)
-
-  need_rc "$rca" 0 "concurrent take A (decision 6c: losing a claim race is SILENT, not an error)"
-  need_rc "$rcb" 0 "concurrent take B (decision 6c: losing a claim race is SILENT, not an error)"
-
-  for m in c1 c2 c3 c4 c5 c6; do
-    seen=0
-    grep -qF -- "concurrent-$m-marker" "$oa" 2>/dev/null && seen=$((seen + 1))
-    grep -qF -- "concurrent-$m-marker" "$ob" 2>/dev/null && seen=$((seen + 1))
-    case "$seen" in
-      1) ;;
-      0) fail "concurrent-$m was delivered to NEITHER consumer — a message was lost" ;;
-      *) fail "concurrent-$m was delivered to BOTH consumers — double-consume (accepted finding #11 is not closed)" ;;
-    esac
-  done
-
-  need_count "$pd" 0 "pending/ after two concurrent takes"
-  need_count "$(q_dir "$fx" bravo claimed)" 0 "claimed/ after two concurrent takes"
-  need_count "$(q_dir "$fx" bravo read)" 6 "read/ after two concurrent takes (all six acked exactly once)"
-}
-
-# ══════════════════════════ Q.B — boot delivery (UR-1 ordering) ══════════════════════════
-
-hook_context() { # <repo> <identity> → prints additionalContext, non-zero if it can't
-  run_brain "$1" "$2" hook session-start
-  _hc_rc=$?
-  [ "$_hc_rc" = "0" ] || return 1
-  jq -e -r '.hookSpecificOutput.additionalContext // empty' "$OUT" 2>/dev/null
-}
-
-# Q.B/16 — offline delivery under the NEW order (recover → claim → digest → emit → ack).
-# THREE queued messages from TWO senders: a dormant lane wakes to a QUEUE, so one-message
-# coverage would let a `tail -1`-shaped delivery pass while dropping everything older.
-#   PROVES     per-message claim+ack (read/ holds three separate entries carrying the original
-#              ids), sender attribution survives delivery, and — the structural half — that
-#              the BATCH ROTATION IS GONE: no `<ts>-<pid>.jsonl` archive and no inbox.jsonl.
-#   REJECTS    the v1 rotate-then-deliver shape wholesale, and any delivery that collapses N
-#              messages into one archive blob.
-sc_boot_delivers_and_acks_per_message() {
+# V.C/20 — offline delivery. THREE queued messages from TWO senders: a dormant lane wakes to a
+# QUEUE, so one-message coverage would let a `tail -1`-shaped delivery pass while dropping
+# everything older.
+#   PROVES     per-message archiving (read/ holds three separate entries carrying the original
+#              ids), sender attribution survives delivery, and — the structural half — that the
+#              BATCH ROTATION IS GONE: no `<ts>-<pid>.jsonl` archive and no inbox.jsonl.
+sc_boot_delivers_offline_backlog() {
   fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
   q1="q1a4"; q2="q2b5"; q3="q3c6"
-  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed); rd=$(q_dir "$fx" bravo read)
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
   # charlie sends while status: done — cmd_dm only requires the presence note to exist. Being
   # done keeps charlie out of cmd_status's active list, so its name cannot reach the injected
   # context that way.
@@ -1235,9 +1199,9 @@ sc_boot_delivers_and_acks_per_message() {
   run_brain "$fx" alpha   dm @bravo "queued-$q3"; rc=$?
   need_rc "$rc" 0 "prerequisite: third dm" || return 0
   need_count "$pd" 3 "prerequisite: all three messages queued" || return 0
-  id1=$(id_of_body "$pd" "queued-$q1") || { fail "no queued file carries $q1 — the send did not land as a per-message file in pending/"; return 0; }
-  id2=$(id_of_body "$pd" "queued-$q2") || { fail "no queued file carries $q2 — the send did not land as a per-message file in pending/"; return 0; }
-  id3=$(id_of_body "$pd" "queued-$q3") || { fail "no queued file carries $q3 — the send did not land as a per-message file in pending/"; return 0; }
+  id1=$(id_of_body "$pd" "queued-$q1") || { fail "no queued file carries $q1"; return 0; }
+  id2=$(id_of_body "$pd" "queued-$q2") || { fail "no queued file carries $q2"; return 0; }
+  id3=$(id_of_body "$pd" "queued-$q3") || { fail "no queued file carries $q3"; return 0; }
 
   # Close the OTHER path by which a sender's name reaches the context: cmd_status echoes recent
   # journal lines mentioning this lane, and the call-log line names the sender. Stripping
@@ -1260,41 +1224,40 @@ sc_boot_delivers_and_acks_per_message() {
   # no sender is unactionable. The NAME is the contract; any rendering carrying it satisfies it.
   need_str_has "$ctx" "charlie" "startup context must identify the SENDER of a delivered message"
 
-  need_count "$pd"  0 "pending/ after a delivered boot (emptied by successful claims)"
-  need_count "$cd_" 0 "claimed/ after a delivered boot (every claim acked AFTER emission)"
-  need_count "$rd"  3 "read/ after a delivered boot — one entry per message, not one blob"
-  need_dir_has_id "$rd" "$id1" "acked archive preserves id #1"
-  need_dir_has_id "$rd" "$id2" "acked archive preserves id #2"
-  need_dir_has_id "$rd" "$id3" "acked archive preserves id #3"
+  need_count "$pd" 0 "pending/ after a delivered boot"
+  need_count "$rd" 3 "read/ after a delivered boot — one entry per message, not one blob"
+  need_dir_has_id "$rd" "$id1" "archive preserves id #1"
+  need_dir_has_id "$rd" "$id2" "archive preserves id #2"
+  need_dir_has_id "$rd" "$id3" "archive preserves id #3"
 
   # the deleted-not-extended half: _inbox_rotate and its <ts>-<pid>.jsonl archive naming die.
   for f in "$rd"/*; do
     [ -e "$f" ] || continue
     case "${f##*/}" in
-      *.jsonl) fail "read/ holds a batch archive '${f##*/}' — _inbox_rotate's <ts>-<pid>.jsonl naming is DELETED by the redesign, not extended" ;;
+      *.jsonl) fail "read/ holds a batch archive '${f##*/}' — the batch-rotation naming is DELETED, not extended" ;;
     esac
   done
   need_file_absent "$fx/.brain/dm/bravo/inbox.jsonl" "the retired single-shared inbox file"
 }
 
-# Q.B/17 — exactly-once across boots. TWO messages across THREE boots: one message's lifecycle
-# is not enough, because "deliver only if read/ does not already exist" delivers correctly
-# exactly once per lane FOREVER and would satisfy a single-message test.
-#   ALSO       an empty-queue boot must not destroy an existing archive (the v1 unconditional
-#              rotation did exactly that; the per-message layout must not regress into it).
-sc_boot_delivers_exactly_once() {
+# V.C/21 — no replay across boots. TWO messages across THREE boots: one message's lifecycle is
+# not enough, because "deliver only if read/ does not already exist" delivers correctly exactly
+# once per lane FOREVER and would satisfy a single-message test.
+#   ALSO       an empty-queue boot must not destroy an existing archive (the v1.0 unconditional
+#              rotation did exactly that).
+sc_boot_no_replay_across_boots() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   m1="m1x7"; m2="m2y9"
   pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
 
   run_brain "$fx" alpha dm @bravo "$m1-$m1-$m1"; rc=$?
   need_rc "$rc" 0 "prerequisite: first dm to bravo" || return 0
-  id1=$(id_of_body "$pd" "$m1") || { fail "no queued file carries $m1 — the send did not land as a per-message file in pending/"; return 0; }
+  id1=$(id_of_body "$pd" "$m1") || { fail "no queued file carries $m1"; return 0; }
 
   ctx1=$(hook_context "$fx" bravo); hrc=$?
   need_rc "$hrc" 0 "boot 1" || return 0
   need_str_has "$ctx1" "$m1" "boot 1 must report the first message" || return 0
-  need_dir_has_id "$rd" "$id1" "boot 1 must ack the first message into read/" || return 0
+  need_dir_has_id "$rd" "$id1" "boot 1 must archive the first message into read/" || return 0
 
   ctx2=$(hook_context "$fx" bravo); hrc=$?
   need_rc "$hrc" 0 "boot 2" || return 0
@@ -1303,7 +1266,7 @@ sc_boot_delivers_exactly_once() {
 
   run_brain "$fx" alpha dm @bravo "$m2-$m2-$m2"; rc=$?
   need_rc "$rc" 0 "prerequisite: second dm (after a delivery already happened)" || return 0
-  id2=$(id_of_body "$pd" "$m2") || { fail "no queued file carries $m2 — the send did not land as a per-message file in pending/"; return 0; }
+  id2=$(id_of_body "$pd" "$m2") || { fail "no queued file carries $m2"; return 0; }
 
   ctx3=$(hook_context "$fx" bravo); hrc=$?
   need_rc "$hrc" 0 "boot 3" || return 0
@@ -1316,10 +1279,9 @@ sc_boot_delivers_exactly_once() {
   need_count "$rd" 2 "read/ after three boots (2 deliveries, 1 empty-queue no-op)"
 }
 
-# Q.B/18 — every boot arms the lane on the NEW mechanism, whether or not mail arrived.
-# Seam: cmd_inbox prints the pending/ dir; the protocol tells the agent to run `brain dm take`
-# on inbox activity. The retired inbox.jsonl watch target must be gone from the context, or
-# lanes keep arming a file that no longer exists.
+# V.C/22 — every boot arms the lane on the pending/ directory and names the consume command,
+# whether or not mail arrived. The retired inbox.jsonl watch target must be gone from the
+# context, or lanes keep arming a file that no longer exists.
 sc_boot_arms_pending_and_take() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
 
@@ -1329,758 +1291,13 @@ sc_boot_arms_pending_and_take() {
 
   need_str_has "$ctx" "navigation-standards" "the existing protocol nudge must survive"
   need_str_has "$ctx" "dm/bravo/pending" "startup context must carry this lane's concrete pending/ path to arm on"
-  need_str_has "$ctx" "dm take" "startup context must name the command that CLAIMS a live-observed message (UR-3)"
+  need_str_has "$ctx" "dm take" "startup context must name the command that CONSUMES a live-observed message (UR-3)"
   need_str_lacks "$ctx" "inbox.jsonl" "startup context must stop pointing lanes at the retired shared inbox file"
 }
 
-# Q.B/19 — pending/ is emptied ONLY by a successful claim, and decision 6c's LOUD limb: when
-# the claim `mv` fails while the source is STILL THERE, that is a real error (ENOSPC/EACCES),
-# not a lost race — warn loudly and stop claiming.
-#   INSTRUMENT claimed/ made read-only, with the rename-into-0500 positive control.
-#   CHANNEL    the hook redirects its stderr into .brain/.hook-errors.log (cmd_hook), which is
-#              the "warn loudly" channel decision 6c names; growth of that file is the witness.
-#   PROVES     a failed claim loses NOTHING — the message is still in pending/ and is delivered
-#              by the next boot once the fault clears.
-#   DOES NOT   pin whether the failing boot still emits a digest; the seam is silent on that.
-#   PROVE
-sc_pending_emptied_only_by_successful_claims() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed); rd=$(q_dir "$fx" bravo read)
-  hooklog="$fx/.brain/.hook-errors.log"
-
-  run_brain "$fx" alpha dm @bravo "claim-blocked-5e2"; rc=$?
-  need_rc "$rc" 0 "prerequisite: send" || return 0
-  need_count "$pd" 1 "prerequisite: message queued" || return 0
-
-  make_readonly_dir "$cd_"
-  mrc=$?
-  case "$mrc" in
-    0) ;;
-    2) fail "instrument blind: a rename into a 0500 directory still succeeds (running as root?)"; return 0 ;;
-    *) fail "fixture: could not make claimed/ read-only (rc=$mrc)"; return 0 ;;
-  esac
-  before_log=$(byte_size "$hooklog")
-
-  hook_context "$fx" bravo >/dev/null
-  hrc=$?
-  chmod 755 "$cd_" 2>/dev/null || true       # restore BEFORE any early return
-  need_rc "$hrc" 0 "the boot must still succeed (a hook never blocks a session)" || return 0
-
-  need_count "$pd" 1 "pending/ after a FAILED claim — the message must NOT be consumed"
-  need_count "$rd" 0 "read/ after a FAILED claim — nothing may reach the terminal state"
-  [ "$(byte_size "$hooklog")" -gt "$before_log" ] \
-    || fail "decision 6c: a claim that failed while the source was STILL PRESENT is a real error and must warn loudly — .brain/.hook-errors.log did not grow"
-
-  # nothing was lost: once the fault clears, the very next boot delivers it.
-  ctx=$(hook_context "$fx" bravo)
-  hrc=$?
-  need_rc "$hrc" 0 "recovery boot" || return 0
-  need_str_has "$ctx" "claim-blocked-5e2" "after the fault clears the message must still be delivered (prefer duplicate delivery over silent loss)"
-  need_count "$pd" 0 "pending/ after the recovery boot"
-  need_count "$rd" 1 "read/ after the recovery boot"
-}
-
-# ══════════════════════════ Q.R — recovery, lease, poison cap ════════════════════════════
-
-# Q.R/20 — UR-1's headline: a message CLAIMED but never ACKED (the interrupted boot) must come
-# back. Seam decision 6: recovery parses <claim-ts> from the claim name, and past
-# DM_CLAIM_MAX_AGE renames it back to pending/<id>.a<k+1>.
-#   PROVES     recovery happens (the message is redelivered), the attempt counter is BUMPED
-#              (k+1 — without which the poison cap in 6b can never trigger), and the immutable
-#              <id> survives the whole pending→claimed→pending→claimed→read round trip.
-#   REJECTS    a boot that only reads pending/ (the v1 shape — nothing ever scans a
-#              non-terminal state, which is exactly UR-1), and a recovery that resets k.
-#   PAIRS WITH Q.R/21, which is the same fixture with only the AGE changed.
-sc_ur1_stale_claim_recovered() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed); rd=$(q_dir "$fx" bravo read)
-
-  run_brain "$fx" alpha dm @bravo "stale-claim-6h1"; rc=$?
-  need_rc "$rc" 0 "prerequisite: send" || return 0
-
-  c=$(mint_stuck_claim "$fx" bravo); mrc=$?
-  [ "$mrc" = 0 ] || { mint_failed "$mrc"; return 0; }
-  need_count "$cd_" 1 "prerequisite: exactly one stuck claim" || return 0
-  id=$(msg_id_of "$c")
-  k=$(attempt_of "$c") || { fail "the claim name carries no .a<k> attempt counter: ${c##*/}"; return 0; }
-  claim_ts_of "$c" >/dev/null \
-    || { fail "the claim name carries no .c<claim-ts>-<pid> stamp (seam decision 6): ${c##*/}"; return 0; }
-
-  aged=$(age_claim "$c" $(( DM_CLAIM_MAX_AGE + 300 )))
-  [ -n "$aged" ] || { fail "could not age the claim: unrecognised <claim-ts> encoding in ${c##*/} (expected epoch seconds or _now_compact %Y%m%dT%H%M%SZ)"; return 0; }
-
-  ctx=$(hook_context "$fx" bravo)
-  hrc=$?
-  need_rc "$hrc" 0 "boot after the claim went stale" || return 0
-
-  need_str_has "$ctx" "stale-claim-6h1" \
-    "UR-1: a claim older than DM_CLAIM_MAX_AGE (${DM_CLAIM_MAX_AGE}s) must be recovered and REDELIVERED — prefer duplicate delivery over silent loss"
-  need_count "$pd"  0 "pending/ after the recovering boot"
-  need_count "$cd_" 0 "claimed/ after the recovering boot"
-  need_dir_has_id "$rd" "$id" "the recovered message must reach read/ carrying its ORIGINAL id (seam 6b: preserve the uniq string)"
-
-  got=$(first_file "$rd")
-  gk=$(attempt_of "$got") || { fail "the acked name carries no .a<k>: ${got##*/}"; return 0; }
-  need_eq "$gk" "$((k + 1))" \
-    "recovery must BUMP the delivery-attempt counter (seam 6b: recovery renames with k+1) — without the bump the poison cap can never fire"
-}
-
-# Q.R/21 — the lease's other side: a claim YOUNGER than DM_CLAIM_MAX_AGE belongs to a live
-# consumer and must NOT be stolen. Identical fixture to Q.R/20 with only the AGE changed, so
-# the pair isolates the lease decision itself rather than the recovery machinery.
-#   REJECTS    "recover everything in claimed/ on every boot", which would deliver every
-#              message twice to a lane that is simply still working through its queue.
-sc_fresh_claim_not_stolen() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed); rd=$(q_dir "$fx" bravo read)
-
-  run_brain "$fx" alpha dm @bravo "fresh-claim-7j2"; rc=$?
-  need_rc "$rc" 0 "prerequisite: send" || return 0
-
-  c=$(mint_stuck_claim "$fx" bravo); mrc=$?
-  [ "$mrc" = 0 ] || { mint_failed "$mrc"; return 0; }
-  need_count "$cd_" 1 "prerequisite: exactly one fresh claim" || return 0
-  id=$(msg_id_of "$c")
-
-  ctx=$(hook_context "$fx" bravo)     # claim-ts is NOW — well inside the lease
-  hrc=$?
-  need_rc "$hrc" 0 "boot while the claim is still fresh" || return 0
-
-  need_str_lacks "$ctx" "fresh-claim-7j2" \
-    "a claim younger than DM_CLAIM_MAX_AGE (${DM_CLAIM_MAX_AGE}s) must NOT be stolen from its claimer"
-  need_count "$pd" 0 "pending/ must stay empty — a fresh claim is not recovered"
-  need_count "$rd" 0 "read/ must stay empty — the boot never owned this message"
-  need_count "$cd_" 1 "the fresh claim must still be sitting in claimed/"
-  need_dir_has_id "$cd_" "$id" "the untouched claim must still carry its original id"
-}
-
-# Q.R/22 — the poison cap (seam 6b / ROADMAP "a poison message must not loop forever").
-# At-least-once delivery plus automatic stale-claim recovery is an INFINITE redelivery loop for
-# any message whose processing kills its consumer; SQS's answer is a dead-letter queue after N
-# receives, and the seam adopts it: recovery at k+1 > DM_MAX_ATTEMPTS routes to failed/.
-#   FIXTURE    the attempt counter is set to DM_MAX_ATTEMPTS BY THE TEST (renaming the pending
-#              file), so this scenario is independent of the unresolved initial-k question
-#              flagged at Q.S/2 — only the k+1 > 3 arithmetic is under test.
-#   PROVES     routing to failed/, id preservation, NO delivery on the routing boot, NO
-#              redelivery on any later boot, and surfacing in `brain status`.
-#   CONTROL    status is sampled BEFORE and AFTER: a hardcoded banner fails the before-sample.
-sc_poison_cap_routes_to_failed() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed)
-  rd=$(q_dir "$fx" bravo read);    fd=$(q_dir "$fx" bravo failed)
-
-  run_brain "$fx" alpha dm @bravo "poison-8k3"; rc=$?
-  need_rc "$rc" 0 "prerequisite: send" || return 0
-  p=$(first_file "$pd") || { fail "nothing queued in pending/ — the send did not land as a per-message file"; return 0; }
-  id=$(msg_id_of "$p")
-  mv "$p" "$pd/$id.a$DM_MAX_ATTEMPTS" \
-    || { fail "fixture: could not set the attempt counter to $DM_MAX_ATTEMPTS"; return 0; }
-
-  # negative control on the status banner, taken while nothing has failed yet
-  run_brain "$fx" bravo status
-  rc=$?
-  need_rc "$rc" 0 "brain status (before any failure)" || return 0
-  if status_has_failed "$OUT"; then
-    fail "control: brain status says 'failed' with an EMPTY failed/ — the surfacing is hardcoded, not derived"
-  fi
-
-  c=$(mint_stuck_claim "$fx" bravo); mrc=$?
-  [ "$mrc" = 0 ] || { mint_failed "$mrc"; return 0; }
-  need_eq "$(attempt_of "$c")" "$DM_MAX_ATTEMPTS" "prerequisite: the claim carries the capped attempt counter" || return 0
-  aged=$(age_claim "$c" $(( DM_CLAIM_MAX_AGE + 300 )))
-  [ -n "$aged" ] || { fail "could not age the claim: unrecognised <claim-ts> encoding in ${c##*/}"; return 0; }
-
-  ctx=$(hook_context "$fx" bravo)
-  hrc=$?
-  need_rc "$hrc" 0 "boot that must route the poisoned message" || return 0
-
-  need_count "$fd" 1 "failed/ after the routing boot (k+1 > $DM_MAX_ATTEMPTS)" || return 0
-  need_dir_has_id "$fd" "$id" "the poisoned message must keep its id in failed/"
-  need_count "$pd"  0 "pending/ after routing — a poisoned message is NOT re-queued"
-  need_count "$cd_" 0 "claimed/ after routing"
-  need_count "$rd"  0 "read/ after routing — failed/ is terminal, not an ack"
-  need_str_lacks "$ctx" "poison-8k3" "the routing boot must not ALSO deliver the poisoned message"
-
-  ctx2=$(hook_context "$fx" bravo)
-  hrc=$?
-  need_rc "$hrc" 0 "a later boot" || return 0
-  need_str_lacks "$ctx2" "poison-8k3" "a message in failed/ must NEVER be redelivered"
-  need_count "$fd" 1 "failed/ is terminal and never auto-deleted"
-
-  run_brain "$fx" bravo status
-  rc=$?
-  need_rc "$rc" 0 "brain status (after the failure)" || return 0
-  status_has_failed "$OUT" \
-    || fail "seam 6b: a message routed to failed/ must be SURFACED in 'brain status' (never auto-deleted, never silent). NB this ignores status's echoed journal lines, so the banner must come from status's OWN rendering"
-}
-
-# Q.R/22b — the poison cap's BOUNDARY, and the reason Q.R/22 alone is not enough. Seam 6b routes
-# to failed/ when `k+1 > DM_MAX_ATTEMPTS`, so k = DM_MAX_ATTEMPTS-1 is the LAST attempt that must
-# still be DELIVERED: recovery bumps it to .a3 and 3 > 3 is false. Q.R/22 pins the first FAILING
-# k; this pins the last DELIVERING one.
-#   REJECTS    an off-by-one that implements `>=` instead of `>` — which Q.R/22 cannot see, since
-#              a `>=` engine routes k=3 to failed/ exactly like a correct one. Without this
-#              sibling the cap could fire one delivery early on every poisoned message. [F4]
-sc_poison_cap_boundary_delivers() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
-
-  run_brain "$fx" alpha dm @bravo "boundary-3q7"
-  rc=$?
-  need_rc "$rc" 0 "prerequisite: send" || return 0
-  pf=$(first_file "$pd") || { fail "nothing queued in pending/ — the send did not land as a per-message file"; return 0; }
-  id=$(msg_id_of "$pf")
-  k=$(( DM_MAX_ATTEMPTS - 1 ))
-  mv "$pf" "$pd/$id.a$k" || { fail "fixture: could not set the attempt counter to $k"; return 0; }
-
-  c=$(mint_stuck_claim "$fx" bravo); mrc=$?
-  [ "$mrc" = 0 ] || { mint_failed "$mrc"; return 0; }
-  need_eq "$(attempt_of "$c")" "$k" "prerequisite: the claim carries the boundary attempt counter" || return 0
-  aged=$(age_claim "$c" "$(( DM_CLAIM_MAX_AGE + 300 ))")
-  [ -n "$aged" ] || { fail "could not age the claim: unrecognised <claim-ts> encoding in ${c##*/}"; return 0; }
-
-  ctx=$(hook_context "$fx" bravo)
-  hrc=$?
-  need_rc "$hrc" 0 "boot at the poison-cap boundary" || return 0
-
-  need_count "$fd" 0 \
-    "failed/ must stay EMPTY at k=$k: recovery bumps to $DM_MAX_ATTEMPTS, and $DM_MAX_ATTEMPTS > $DM_MAX_ATTEMPTS is FALSE — routing here is an off-by-one (>= instead of >)"
-  need_str_has "$ctx" "boundary-3q7" "the last permitted delivery attempt must still be DELIVERED"
-  need_count "$pd" 0 "pending/ after the boundary boot"
-  need_dir_has_id "$rd" "$id" "the boundary message must be acked into read/"
-  got=$(first_file "$rd") || { fail "read/ is empty after the boundary boot"; return 0; }
-  gk=$(attempt_of "$got") || { fail "the acked name carries no .a<k>: ${got##*/}"; return 0; }
-  need_eq "$gk" "$DM_MAX_ATTEMPTS" "recovery must bump k=$k to $DM_MAX_ATTEMPTS and DELIVER, not route to failed/"
-}
-
-# (Q.R/23 is intentionally absent: it was a standalone "status stays silent with an empty
-# failed/" scenario, folded into Q.R/22 as its before/after negative control so the pair shares
-# one vault. The id is left unused rather than renumbered, so review references stay stable.)
-
-# Q.R/24 — delivery failure must never retire a message. This is UR-1's fix text verbatim
-# ("test kill-after-claim plus digest/output failure") and ROADMAP's "a message stays replayable
-# until handoff to the session actually succeeded".
-#   LIMB (a)   ACK failure — read/ read-only, so the claimed→read rename gets EACCES. The
-#              message must not vanish, must not be in read/, and the failure must be reported.
-#   LIMB (b)   EMIT failure — stdout is CLOSED, so printing the message cannot succeed. Whatever
-#              the engine does about it, the message must NOT end up in read/: acking a message
-#              whose delivery failed is exactly the loss UR-1 describes.
-#   NOT PINNED the exit status of either limb; the seam fixes the WARN-don't-die behaviour for
-#              the ENOENT case only and says nothing about the process's exit code, so asserting
-#              one would be stricter than the authority.
-#   NOT COVERED the true ENOENT limb ("the claim was recovered out from under us — warn, never
-#              die") needs a real concurrent interleaving between recovery and ack; there is no
-#              CLI surface for acking a named claim, so it is not drivable here. Declared, not
-#              silently skipped.
-sc_delivery_failure_never_retires() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed); rd=$(q_dir "$fx" bravo read)
-
-  # ── limb (a): the ack cannot land ──
-  run_brain "$fx" alpha dm @bravo "ack-fails-9m4"; rc=$?
-  need_rc "$rc" 0 "prerequisite: send #1" || return 0
-
-  make_readonly_dir "$rd"
-  mrc=$?
-  case "$mrc" in
-    0) ;;
-    2) fail "instrument blind: a rename into a 0500 directory still succeeds (running as root?)"; return 0 ;;
-    *) fail "fixture: could not make read/ read-only (rc=$mrc)"; return 0 ;;
-  esac
-  run_brain "$fx" bravo dm take
-  chmod 755 "$rd" 2>/dev/null || true       # restore BEFORE any early return
-
-  need_count "$rd" 0 "read/ after an ack that could not land — nothing may reach the terminal state"
-  [ "$(count_files "$pd")" != 0 ] || [ "$(count_files "$cd_")" != 0 ] \
-    || fail "after a failed ack the message is in NEITHER pending/ nor claimed/ — it must stay replayable in one of them, never be dropped"
-  # the engine's own diagnostics are prefixed "brain: " (_warn/_die); a bare mv/rename error on
-  # stderr is a LEAK, not a report, and must not satisfy this. [F10b]
-  if [ -s "$ERR" ]; then
-    need_file_has "$ERR" "brain:" "a failed ack must be reported BY THE ENGINE (stderr carried output, but none of it was a 'brain: ' diagnostic — an unsuppressed mv error is a leak, not a report)"
-  else
-    fail "a failed ack must be reported (stderr was empty)"
-  fi
-
-  # ── limb (b): the emit cannot land ──
-  fx2=$(make_vault alpha bravo) || fatal "fixture build failed"
-  base2=$(dirname "$fx2")
-  pd2=$(q_dir "$fx2" bravo pending); cd2=$(q_dir "$fx2" bravo claimed); rd2=$(q_dir "$fx2" bravo read)
-
-  run_brain "$fx2" alpha dm @bravo "emit-fails-1n5"; rc=$?
-  need_rc "$rc" 0 "prerequisite: send #2" || return 0
-
-  _brain_env_run - "$base2/closed.err" "$fx2" bravo dm take
-
-  need_count "$rd2" 0 \
-    "read/ after a take whose OUTPUT could not be written — a message acked without being delivered is exactly UR-1's silent loss"
-  [ "$(count_files "$pd2")" != 0 ] || [ "$(count_files "$cd2")" != 0 ] \
-    || fail "after a failed emit the message is in NEITHER pending/ nor claimed/ — it must stay replayable in one of them"
-  # ...and it must still be deliverable once the fault clears. AGE any surviving claim first:
-  # a correct engine may legitimately leave the emit-failed message as a FRESH claim in claimed/,
-  # and Q.R/21 forbids the next boot from stealing a claim younger than DM_CLAIM_MAX_AGE. Without
-  # this step the two scenarios contradict each other and this one falsely rejects the seam's own
-  # take shape. Ageing converges BOTH permitted shapes (returned to pending/, or left claimed) on
-  # "delivered at the next boot", and still proves the message was never silently lost. [F1]
-  if c2=$(first_file "$cd2"); then
-    age_claim "$c2" "$(( DM_CLAIM_MAX_AGE + 300 ))" >/dev/null \
-      || { fail "could not age the surviving claim: unrecognised <claim-ts> encoding in ${c2##*/}"; return 0; }
-  fi
-  ctx=$(hook_context "$fx2" bravo)
-  hrc=$?
-  need_rc "$hrc" 0 "boot after the emit failure" || return 0
-  need_str_has "$ctx" "emit-fails-1n5" \
-    "a message whose emit failed must still be delivered later (prefer duplicate delivery over silent loss)"
-}
-
-# Q.R/25 — stale temps are purged, in-flight temps are not. Seam decision 6: "Stale .tmp-*
-# purged after 300s (dirq maxtemp)". A fresh .tmp-* is another process's send MID-FLIGHT;
-# deleting it would destroy a message that is about to be renamed into place.
-#   INSTRUMENT mtime, which is the CORRECT judge for a temp (it is created fresh) even though
-#              it is the wrong judge for a claim (rename preserves the send-time mtime — the
-#              bug the seam map records its research catching).
-#   PATHS      both `dm take` and a boot are driven before asserting, because the seam pins the
-#              300s rule without naming which command owns the sweep.
-#   ALSO       neither temp is ever visible to a reader glob (count_files skips dotfiles).
-sc_stale_temp_purged_fresh_kept() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending)
-  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
-
-  printf '{"from":"alpha","to":"bravo","ts":"x","content":"torn-stale"}\n' > "$pd/.tmp-stale-9x1"
-  printf '{"from":"alpha","to":"bravo","ts":"x","content":"torn-fresh"}\n' > "$pd/.tmp-fresh-9x2"
-  touch -t 202601020304.05 "$pd/.tmp-stale-9x1" \
-    || { fail "fixture: touch -t is unavailable, cannot age a temp"; return 0; }
-
-  run_brain "$fx" alpha dm @bravo "temp-sweep-2p6"; rc=$?
-  need_rc "$rc" 0 "prerequisite: a real send alongside the temps" || return 0
-  need_count "$pd" 1 "a reader glob must see ONE message and neither temp (dotfiles are invisible by design)"
-
-  run_brain "$fx" bravo dm take
-  hook_context "$fx" bravo >/dev/null
-
-  need_file_absent "$pd/.tmp-stale-9x1" \
-    "a .tmp-* older than DM_TEMP_MAX_AGE (${DM_TEMP_MAX_AGE}s) must be purged (seam decision 6, dirq maxtemp)"
-  need_file "$pd/.tmp-fresh-9x2" \
-    "a FRESH .tmp-* is another sender's in-flight message and must NOT be purged"
-  # positive control: the sweep did not eat the real message
-  need_count "$(q_dir "$fx" bravo read)" 1 "the real message must still have been delivered while the temps were swept"
-}
-
-# ══════════════════════════ Q.X — symlink refusal (UR-2) ═════════════════════════════════
-#
-# UR-2: _inbox_ensure checked only the lane dir and the inbox; the `dm` ROOT was never checked,
-# and _inbox_rotate — which ran FIRST at SessionStart — validated nothing at all. The seam's
-# _dm_dir_ok must reject a symlink or non-directory at EVERY level walked, on EVERY queue touch.
-# Every target below lives inside the disposable scratch root; nothing points at a real path.
-#
-# ⚠ SCOPE HONESTY (seam Flags): POSIX sh has no openat/O_NOFOLLOW, so these scenarios pin
-# COMPONENT REFUSAL, not race-freedom. The same-user TOCTOU residual is a documented limit and
-# no assertion here claims otherwise.
-
-# Q.X/26 — the `dm` ROOT itself. The component the v1 engine never validated at all.
-sc_send_refuses_symlinked_dm_root() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  ext=$(dirname "$fx")/outside-dmroot
-  mkdir -p "$ext" || { fail "fixture: could not create the external target"; return 0; }
-  printf 'XCANARY-dmroot\n' > "$ext/canary.txt"
-
-  # positive control: this exact send WORKS before the root becomes a symlink
-  run_brain "$fx" alpha dm @bravo "presym-probe"
-  rc=$?
-  need_rc "$rc" 0 "positive control: the send works before .brain/dm is a symlink" || return 0
-
-  mv "$fx/.brain/dm" "$fx/.brain/dm.real" || { fail "fixture: could not move the real dm root"; return 0; }
-  ln -s "$ext" "$fx/.brain/dm" || { fail "fixture: could not symlink the dm root"; return 0; }
-
-  run_brain "$fx" alpha dm @bravo "postsym-XSYM1"
-  rc=$?
-  need_rc_nonzero "$rc" "brain dm with .brain/dm a SYMLINK (UR-2: the dm root was never validated)"
-  [ -s "$ERR" ] || fail "a refused send wrote nothing to stderr"
-  need_tree_lacks "$ext" "postsym-XSYM1" "message content written THROUGH the symlinked dm root"
-  need_file_has "$ext/canary.txt" "XCANARY-dmroot" "external canary intact (positive control that the target is readable)"
-}
-
-# Q.X/27 — the lane directory. Refusal must be SPECIFIC to the poisoned lane: a send to a
-# healthy sibling in the same vault still has to work, or "refused" just means "broken".
-sc_send_refuses_symlinked_lane_dir() {
-  fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
-  ext=$(dirname "$fx")/outside-lane
-  mkdir -p "$ext" || { fail "fixture: could not create the external target"; return 0; }
-
-  mkdir -p "$fx/.brain/dm" || { fail "fixture: could not create the dm root"; return 0; }
-  ln -s "$ext" "$fx/.brain/dm/bravo" || { fail "fixture: could not symlink the lane dir"; return 0; }
-
-  run_brain "$fx" alpha dm @bravo "lanelink-XSYM2"
-  rc=$?
-  need_rc_nonzero "$rc" "brain dm to a lane whose directory is a SYMLINK"
-  [ -s "$ERR" ] || fail "a refused send wrote nothing to stderr"
-  need_tree_lacks "$ext" "lanelink-XSYM2" "message content written through the symlinked lane dir"
-
-  # specificity: a healthy lane in the same vault is unaffected
-  run_brain "$fx" alpha dm @charlie "healthy-lane-probe"
-  rc=$?
-  need_rc "$rc" 0 "positive control: a healthy sibling lane still receives mail" || return 0
-  need_count "$(q_dir "$fx" charlie pending)" 1 "the healthy lane's pending/"
-}
-
-# Q.X/28 — the pending/ STATE directory. A component the v1 layout did not even have, so
-# nothing in the old engine could have validated it.
-sc_send_refuses_symlinked_pending_dir() {
-  fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
-  ext=$(dirname "$fx")/outside-pending
-  mkdir -p "$ext" || { fail "fixture: could not create the external target"; return 0; }
-
-  mkdir -p "$fx/.brain/dm/bravo" || { fail "fixture: could not create the lane dir"; return 0; }
-  ln -s "$ext" "$fx/.brain/dm/bravo/pending" || { fail "fixture: could not symlink pending/"; return 0; }
-
-  run_brain "$fx" alpha dm @bravo "pendinglink-XSYM3"
-  rc=$?
-  need_rc_nonzero "$rc" "brain dm to a lane whose pending/ is a SYMLINK"
-  [ -s "$ERR" ] || fail "a refused send wrote nothing to stderr"
-  need_tree_lacks "$ext" "pendinglink-XSYM3" "message content written through the symlinked pending/"
-
-  run_brain "$fx" alpha dm @charlie "healthy-lane-probe"
-  rc=$?
-  need_rc "$rc" 0 "positive control: a healthy sibling lane still receives mail"
-}
-
-# Q.X/29 — the read/ ARCHIVE directory, reached on the BOOT path. This is the exact gap UR-2
-# names: _inbox_rotate ran first at SessionStart and validated neither the inbox nor read/, so
-# a symlinked archive could route message bodies into a tracked canonical directory.
-#   PROVES     the boot path validates read/ before moving anything through it, warns, and
-#              LOSES NOTHING (the message stays in pending/ or claimed/, still deliverable).
-sc_boot_refuses_symlinked_read_dir() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  ext=$(dirname "$fx")/outside-read
-  mkdir -p "$ext" || { fail "fixture: could not create the external target"; return 0; }
-  hooklog="$fx/.brain/.hook-errors.log"
-  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed)
-
-  run_brain "$fx" alpha dm @bravo "readlink-XSYM4"; rc=$?
-  need_rc "$rc" 0 "prerequisite: send with a healthy tree" || return 0
-  need_count "$pd" 1 "prerequisite: message queued" || return 0
-
-  assert_disposable "$fx"
-  [ -d "$fx/.brain/dm/bravo/read" ] && rm -rf "$fx/.brain/dm/bravo/read"
-  ln -s "$ext" "$fx/.brain/dm/bravo/read" || { fail "fixture: could not symlink read/"; return 0; }
-  before_log=$(byte_size "$hooklog")
-
-  hook_context "$fx" bravo >/dev/null
-  hrc=$?
-  need_rc "$hrc" 0 "the boot must still succeed (a hook never blocks a session)" || return 0
-
-  need_tree_lacks "$ext" "readlink-XSYM4" \
-    "UR-2: a message body was moved THROUGH a symlinked read/ — the archive destination must be validated before every move"
-  [ "$(byte_size "$hooklog")" -gt "$before_log" ] \
-    || fail "a refused symlinked read/ must be reported to .brain/.hook-errors.log"
-  [ "$(count_files "$pd")" != 0 ] || [ "$(count_files "$cd_")" != 0 ] \
-    || fail "the message was lost when read/ was refused — it must stay in pending/ or claimed/"
-}
-
-# Q.X/30 — the MESSAGE FILE. Seam _dm_dir_ok: "message files additionally -L-checked and
-# required regular (-f)", and the iteration guard is `[ -e ] || [ -L ] || continue` precisely so
-# "a broken symlink must be SEEN and refused, not silently skipped".
-#   PROVES     no dereference (external content never reaches the injected context), no
-#              promotion of the link into read/, and that BOTH a resolvable and a BROKEN
-#              symlink are reported rather than skipped.
-#   DOES NOT   pin whether refusing one entry halts the rest of the lane — the seam is silent on
-#   PROVE      that, so no assertion is made about the healthy message alongside it.
-sc_boot_refuses_symlinked_message_file() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  ext=$(dirname "$fx")/outside-msg
-  mkdir -p "$ext" || { fail "fixture: could not create the external target"; return 0; }
-  printf '{"from":"mallory","to":"bravo","ts":"x","content":"XSYMBODY-injected"}\n' > "$ext/secret.txt"
-  before_secret=$(byte_size "$ext/secret.txt")
-  hooklog="$fx/.brain/.hook-errors.log"
-
-  run_brain "$fx" alpha dm @bravo "healthy-alongside"; rc=$?
-  need_rc "$rc" 0 "prerequisite: one healthy message" || return 0
-  pd=$(q_dir "$fx" bravo pending)
-  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
-  # names chosen to satisfy the grammar, so a refusal cannot be blamed on an unparsable name
-  ln -s "$ext/secret.txt" "$pd/20260803T101500Z-424242.a0" \
-    || { fail "fixture: could not plant the symlinked message"; return 0; }
-  ln -s "$ext/no-such-target" "$pd/20260803T101501Z-424243.a0" \
-    || { fail "fixture: could not plant the broken symlink"; return 0; }
-  before_log=$(byte_size "$hooklog"); before_loglines=$(line_count "$hooklog")
-
-  ctx=$(hook_context "$fx" bravo)
-  hrc=$?
-  need_rc "$hrc" 0 "the boot must still succeed (a hook never blocks a session)" || return 0
-
-  need_str_lacks "$ctx" "XSYMBODY-injected" \
-    "UR-2: a symlinked message file was DEREFERENCED into the startup context — arbitrary external content reached the session"
-  need_dir_lacks_id "$(q_dir "$fx" bravo read)" "20260803T101500Z-424242" \
-    "a symlinked message must not be promoted into read/"
-  need_dir_lacks_id "$(q_dir "$fx" bravo read)" "20260803T101501Z-424243" \
-    "a BROKEN symlinked message must not be promoted into read/"
-  # BOTH planted entries must be reported, not just one. NAMES ARE THE PRIMARY GATE: it accepts a
-  # compliant CONSOLIDATED one-line warning that names both, and rejects a two-line warning about
-  # only one of them. A line-count floor does neither — it gets both directions wrong — so it is
-  # used ONLY as the fallback when the warnings name nothing.
-  # ⚠ DECLARED: in that unnamed fallback case, "one refusal that happens to span two lines" cannot
-  # be distinguished from "two refusals" by any observation available here. Naming the offending
-  # filename in the warning is what would close it. [F10a / R2-2]
-  added=$(( $(line_count "$hooklog") - before_loglines ))
-  [ "$(byte_size "$hooklog")" -gt "$before_log" ] \
-    || fail "the symlinked and BROKEN-symlinked entries must be SEEN and refused, not silently skipped — .brain/.hook-errors.log did not grow"
-  if grep -q '424242' "$hooklog" 2>/dev/null || grep -q '424243' "$hooklog" 2>/dev/null; then
-    need_file_has "$hooklog" "424242" "the symlinked entry must be named among the refusals"
-    need_file_has "$hooklog" "424243" "the BROKEN-symlinked entry must be named among the refusals"
-  else
-    [ "$added" -ge 2 ] \
-      || fail "the refusals name neither planted entry, so only the line count can be checked here: $added line(s) added, want >= 2 (one per refused entry). Naming the offending filename in the warning would make this exact"
-  fi
-  need_eq "$(byte_size "$ext/secret.txt")" "$before_secret" "the external target must be untouched"
-}
-
-# ══════════════════════════ Q.D — digest ═════════════════════════════════════════════════
-
-# Q.D/31 — a large backlog is BOUNDED at injection and LOSSLESS in storage. _dm_digest's
-# signature changes from one file to N files; DM_INJECT_MAX_LINES (40) still bounds it.
-#   PROVES     the injected block does not carry all 45 messages (an unbounded digest would
-#              blow the receiving lane's context window — the reason the caps exist), while
-#              every one of the 45 is still accounted for in exactly one queue state.
-#   DOES NOT   pin WHICH messages are shown, nor whether the omitted ones are claimed-and-
-#   PROVE      pointed-at or left in pending/. The seam map does not resolve that, so the
-#              lossless invariant is asserted instead of a particular policy. Flagged in the
-#              hand-off report as an open, non-blocking choice.
-#   FIXTURE    messages are written directly (not sent) so 45 of them cost no engine calls; the
-#              names follow the ratified grammar with an explicit `-<n>` discriminator.
-sc_digest_bounded_and_lossless() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending)
-  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
-
-  i=1
-  while [ "$i" -le 45 ]; do
-    m=$(printf 'dg%02d' "$i")
-    jq -cn --arg f alpha --arg t bravo --arg ts "2026-08-03T00:00:00Z" --arg c "bulk-$m-marker" \
-      '{from:$f,to:$t,ts:$ts,content:$c}' > "$pd/20260803T000000Z-999999-$i.a0" \
-      || { fail "fixture: could not write bulk message $i"; return 0; }
-    i=$((i + 1))
-  done
-  need_count "$pd" 45 "prerequisite: 45 messages queued" || return 0
-
-  ctx=$(hook_context "$fx" bravo)
-  hrc=$?
-  need_rc "$hrc" 0 "boot with a 45-message backlog" || return 0
-
-  shown=0
-  i=1
-  while [ "$i" -le 45 ]; do
-    m=$(printf 'dg%02d' "$i")
-    str_has "$ctx" "bulk-$m-marker" && shown=$((shown + 1))
-    i=$((i + 1))
-  done
-  [ "$shown" -gt 0 ] || fail "the boot injected NONE of the 45 queued messages"
-  [ "$shown" -le "$DM_INJECT_MAX_LINES" ] \
-    || fail "the injected block carried $shown of the 45 queued messages — DM_INJECT_MAX_LINES ($DM_INJECT_MAX_LINES) IS the bound, so anything above it means the cap is not applied. (A '< 45' check would have passed at 44 and let a near-unbounded digest through — that was the original hole.) [F6]"
-
-  # lossless: every message is in exactly one of the four states, none destroyed
-  total=$(( $(count_files "$pd") \
-          + $(count_files "$(q_dir "$fx" bravo claimed)") \
-          + $(count_files "$(q_dir "$fx" bravo read)") \
-          + $(count_files "$(q_dir "$fx" bravo failed)") ))
-  need_eq "$total" 45 "messages accounted for across pending/claimed/read/failed after the boot — bounding the DIGEST must never destroy a MESSAGE"
-}
-
-# Q.D/32 — seam defect 5: `cut -c1-2000` truncated mid-JSON and injected a syntactically broken
-# object into a session's startup context. The fix truncates the CONTENT FIELD, not the
-# serialized object.
-#   PROVES     the injected block is bounded (a marker at the far end of a 2.9 KB body does not
-#              survive) AND that every JSON-looking line it does carry actually parses.
-#   VACUITY    if the digest renders prose rather than serialized objects, the JSON limb is
-#   NOTE       vacuously true — that is a PERMITTED alternative (the seam does not pin the
-#              rendering), and the HEAD/TAIL bound still holds. Do not "fix" the engine to
-#              produce JSON just to make this limb bite.
-sc_digest_truncates_content_not_json() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  base=$(dirname "$fx")
-  pad=$(awk 'BEGIN{ s=""; for (i = 0; i < 2900; i++) s = s "x"; printf "%s", s }')
-  body="HEADMARK-$pad-TAILMARK"
-
-  run_brain "$fx" alpha dm @bravo "$body"
-  rc=$?
-  need_rc "$rc" 0 "brain dm with a 2.9 KB body (under DM_MAX_BODY)" || return 0
-  need_count "$(q_dir "$fx" bravo pending)" 1 "the long message was queued" || return 0
-
-  ctx=$(hook_context "$fx" bravo)
-  hrc=$?
-  need_rc "$hrc" 0 "boot with a long message queued" || return 0
-
-  need_str_has  "$ctx" "HEADMARK" "the long message must be delivered at all (positive control)"
-  need_str_lacks "$ctx" "TAILMARK" \
-    "the injected block carried the FULL 2.9 KB body — DM_INJECT_MAX_COLS (2000) is not bounding it"
-
-  printf '%s\n' "$ctx" > "$base/ctx.txt"
-  bad=0
-  while IFS= read -r ln; do
-    case "$ln" in
-      '{'*) printf '%s\n' "$ln" | jq -e . >/dev/null 2>&1 || bad=$((bad + 1)) ;;
-    esac
-  done < "$base/ctx.txt"
-  need_eq "$bad" 0 \
-    "seam defect 5: $bad line(s) of the injected block start with '{' but are not valid JSON — truncation must bound the CONTENT FIELD, never the serialized object"
-}
-
-# ══════════════════════════ 4.G — presence (carried unchanged) ═══════════════════════════
-
-# 4.G/33 — a presence note with dialog_with: shows the open dialog in brain status.
-# BASELINE-GREEN; verified discriminating against a mutant that stops rendering dialog_with
-# (4.G/34 correctly did NOT flip against that same mutant — the pair is a control).
-# charlie is done → cmd_status never lists it, so any mention of 'charlie' in the output can
-# only come from alpha's dialog_with field.
-sc_status_surfaces_open_dialog() {
-  fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
-  write_presence "$fx" charlie "done" || fatal "fixture: could not rewrite charlie"
-  write_presence "$fx" alpha active charlie || fatal "fixture: could not rewrite alpha"
-
-  run_brain "$fx" alpha status
-  rc=$?
-  need_rc "$rc" 0 "brain status" || return 0
-
-  out=$(cat "$OUT")
-  need_str_has "$out" "charlie" "status must surface the dialog partner"
-  if ! printf '%s' "$out" | grep -qi 'dialog'; then
-    fail "status output never says 'dialog' — the open dialog is not surfaced as one"
-  fi
-}
-
-# 4.G/34 — a note WITHOUT dialog_with renders unchanged (the field is genuinely optional).
-sc_status_unchanged_without_dialog() {
-  fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
-  write_presence "$fx" charlie "done" || fatal "fixture: could not rewrite charlie"
-
-  run_brain "$fx" alpha status
-  rc=$?
-  need_rc "$rc" 0 "brain status" || return 0
-
-  out=$(cat "$OUT")
-  need_str_has "$out" "alpha" "active lanes still listed"
-  need_str_has "$out" "bravo" "active lanes still listed"
-  need_str_lacks "$out" "charlie" "a done lane must stay unlisted"
-  if printf '%s' "$out" | grep -qi 'dialog'; then
-    fail "status invented dialog output for a vault with no dialog_with field"
-  fi
-}
-
-# 4.G/35 — reconcile does not flag dialog_with as stealth-structural.
-sc_reconcile_accepts_dialog_field() {
-  fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
-  write_presence "$fx" alpha active charlie || fatal "fixture: could not rewrite alpha"
-  need_file_has "$fx/.brain/presence/alpha.md" "dialog_with: charlie" "fixture carries the field" || return 0
-
-  run_brain "$fx" alpha reconcile --check
-  rc=$?
-  need_rc "$rc" 0 "brain reconcile --check with dialog_with present" || return 0
-  need_file_lacks "$ERR" "stealth" "reconcile warnings"
-  need_file_lacks "$ERR" "invalid" "reconcile warnings"
-}
-
-# ══════════════════════════ 3.G — templates ══════════════════════════════════════════════
-
-nav_matches() { grep -qiE -- "$1" "$NAV_SKILL" 2>/dev/null; }
-
-# Same, but newline-flattened so a match may span a wrapped sentence. Callers MUST bound the
-# gap (.{0,N}) — an unbounded .* over the flattened file degenerates into "both words appear
-# somewhere", which the pre-rewrite template already satisfies.
-nav_matches_near() { tr '\n' ' ' < "$NAV_SKILL" 2>/dev/null | grep -qiE -- "$1"; }
-file_matches_near() { tr '\n' ' ' < "$1" 2>/dev/null | grep -qiE -- "$2"; }
-
-# 3.G/36 — the always-read skill must teach the mechanic lanes actually operate. Seam Flags:
-# the templates "must describe the take command and drop the inbox-file watch instructions".
-#   ⚠ the negative limb targets the v1 sentence ("watch it for new JSON lines"). It is a
-#   WORDING check, not a contract: if a rewritten instruction legitimately trips it, challenge
-#   this assertion rather than contorting the template.
-sc_nav_skill_names_the_take_mechanic() {
-  need_file "$NAV_SKILL" "generic nav-standards template" || return 0
-  nav_matches 'brain dm|dm @' || fail "the always-read skill never mentions 'brain dm' — the fast tier is untaught"
-  nav_matches 'dm take' \
-    || fail "the always-read skill never mentions 'brain dm take' — lanes cannot CLAIM a live-observed message, so UR-3 reopens at the protocol layer"
-  nav_matches 'pending' \
-    || fail "the always-read skill never mentions the pending/ queue — lanes have nothing concrete to arm on"
-  if nav_matches_near 'watch.{0,60}(new JSON|JSON line|jsonl)'; then
-    fail "the always-read skill still tells lanes to watch the inbox FILE for JSON lines — that storage contract is deleted (seam: cmd_inbox now prints the pending/ dir; activity means 'run brain dm take')"
-  fi
-}
-
-# 3.G/37 — a fresh reader can state the three tiers and which one is the record.
-sc_nav_skill_states_tiers_and_record() {
-  need_file "$NAV_SKILL" "generic nav-standards template" || return 0
-  nav_matches 'brain dm|dm @|inbox' || fail "tier 1 (fast: dm → queue) is not named in the always-read skill"
-  nav_matches 'announce' || fail "tier 2 (everyone-eventually: announce → journal) is not named"
-  nav_matches 'connection' || fail "tier 3 (permanent: connections/ note) is not named"
-  # PHRASE-anchored, not proximity. A proximity check is demonstrably hollow here: the template
-  # ALSO contains "record it in the waiting-on connection note" and "a connections note recording
-  # what was contested", so 'connection' and 'record' sit within 10 characters of each other even
-  # when the load-bearing sentence has been gutted — measured against a mutant that rewrote
-  # "record is a connection note" to "home is a connection note", which every window from 80 down
-  # to 10 chars, and a same-physical-line variant, all failed to catch. [F2]
-  # Accepted phrasings (case-insensitive, wrap-tolerant): "[the] record is a|the connection[s]
-  # note" · "connection[s] note is a|the [durable] record". Widen this alternation if you reword
-  # it — do NOT loosen it back into a proximity match.
-  nav_matches_near '(the[[:space:]]+)?record[[:space:]]+is[[:space:]]+(a|the)[[:space:]]+connections?[[:space:]]+note|connections?[[:space:]]+note[[:space:]]+is[[:space:]]+(a|the)[[:space:]]+(durable[[:space:]]+)?record' \
-    || fail "nothing STATES that the connection note is the record — a reader cannot tell which tier is durable. Accepted phrasings: '[the] record is a|the connection[s] note' or 'connection[s] note is a|the [durable] record'. Merely mentioning both words near each other does NOT satisfy this (the template already does that twice while saying something else entirely)"
-}
-
-# 3.G/38 — triage rules an agent must ACT on live in the always-read part.
-sc_nav_skill_carries_triage_rules() {
-  need_file "$NAV_SKILL" "generic nav-standards template" || return 0
-  # word-boundary the short form: a bare 'ack' substring also matches "track", so an
-  # unrelated "keep track of what lands" would green this gate with the ack rule missing
-  nav_matches '\back\b|acknowledg' || fail "the 'ack everything even when deferring' rule is absent"
-  nav_matches 'defer' || fail "the write-it-down-when-you-defer rule is absent"
-}
-
-# 3.G/39 — UR-8. Both templates promise `announce` reaches every lane at its next boot;
-# _recent_journal surfaces only TODAY's last five lines naming the lane as author or explicit
-# @recipient, so a generic announcement is invisible to every other lane and nothing crossing a
-# date boundary matches at all. §7.5 bucket C: narrow the doc to what the code does — a
-# doc-lie is worse than a missing feature, because lanes act on it.
-sc_ur8_no_false_announce_promise() {
-  need_file "$NAV_SKILL" "generic nav-standards template" || return 0
-  need_file "$DM_PROTOCOL" "DM-PROTOCOL template" || return 0
-  # instrument control: the flattener is looking at real content
-  file_matches_near "$DM_PROTOCOL" 'announce' \
-    || { fail "instrument check: DM-PROTOCOL.md does not mention announce at all"; return 0; }
-
-  # NB `next[[:space:]]+boot`, not a literal single space: both templates WRAP this sentence, so
-  # after flattening the words are separated by a newline-plus-indent run. A literal 'next boot'
-  # silently missed the live false promise in the nav skill — measured, not assumed.
-  if file_matches_near "$NAV_SKILL" '(everyone|every lane|all lanes).{0,40}next[[:space:]]+boot'; then
-    fail "UR-8: the nav skill still promises announce reaches everyone at their next boot — _recent_journal filters to today + explicit mentions, so that promise is false"
-  fi
-  if file_matches_near "$DM_PROTOCOL" '(everyone|every lane|all lanes).{0,40}(its[[:space:]]+)?next[[:space:]]+boot'; then
-    fail "UR-8: DM-PROTOCOL.md still promises announce reaches every lane at its next boot — narrow it to explicit mentions, today's journal"
-  fi
-}
-
-# 3.G/40 — the always-read skill stays <= 80 lines (measure, don't estimate).
-sc_nav_skill_line_budget() {
-  need_file "$NAV_SKILL" "generic nav-standards template" || return 0
-  n=$(wc -l < "$NAV_SKILL" | tr -d ' \n')
-  [ "$n" -le 80 ] || fail "templates/navigation-standards.SKILL.md is $n lines (budget: 80)"
-}
-
-# 3.G/41 — zero project-specific referents in the generic template.
-sc_nav_skill_no_erd_referents() {
-  need_file "$NAV_SKILL" "generic nav-standards template" || return 0
-  n=$(grep -cE 'AUTONOMOUS_WORK|\.brain/research' "$NAV_SKILL" 2>/dev/null || true)
-  [ -n "$n" ] || n=0
-  need_eq "$n" 0 "project-specific referents in the generic template"
-}
-
-# ══════════════════════════ pre-PR H1–H5 review fixes ════════════════════════════════════
-
-# The implementation names this bound beside the other DM_* constants. Restating the ruled
-# value here makes the H5 boundary falsifiable without sourcing the engine under test.
-DM_CLAIM_MAX_MESSAGES=40
-DM_INJECT_MAX_COLS=2000
-
-# H1 — claimed message identifiers must survive a vault path containing whitespace. This drives
-# the complete public lifecycle: send → SessionStart claim/delivery → ack.
-sc_h1_space_path_round_trip() {
+# V.C/23 — message identifiers must survive a vault path containing whitespace. Drives the
+# complete public lifecycle: send → SessionStart delivery → archive.
+sc_space_path_round_trip() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   base=$(dirname "$fx")
   spaced="$base/repo with space"
@@ -2095,224 +1312,16 @@ sc_h1_space_path_round_trip() {
   hrc=$?
   need_rc "$hrc" 0 "SessionStart from a vault path containing a space" || return 0
   need_str_has "$ctx" "space-path-round-trip-h1" \
-    "H1: the real boot must deliver a DM when the vault path contains a space"
+    "the real boot must deliver a DM when the vault path contains a space"
   need_count "$(q_dir "$fx" bravo pending)" 0 "pending/ after the spaced-path boot"
-  need_count "$(q_dir "$fx" bravo claimed)" 0 "claimed/ after the spaced-path ack"
   need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the spaced-path delivery"
 }
 
-# H2(a) — a file is the consumer-boundary unit. Multiple JSON values in one file are malformed,
-# must emit nothing, and must remain replayable rather than being acked as several records.
-sc_h2_multi_object_file_refused() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed)
-  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
-  planted="$pd/20260804T120000Z-9201.a0"
-  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"multi-first-h2"}' > "$planted" \
-    || { fail "fixture: could not write the first planted object"; return 0; }
-  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:01Z",content:"multi-second-h2"}' >> "$planted" \
-    || { fail "fixture: could not write the second planted object"; return 0; }
-
-  run_brain "$fx" bravo dm take
-  rc=$?
-  need_rc_nonzero "$rc" "H2: taking a file that contains more than one JSON object"
-  need_eq "$(byte_size "$OUT")" 0 "multi-object file output — malformed input must emit nothing"
-  need_count "$(q_dir "$fx" bravo read)" 0 "read/ after a malformed multi-object file"
-  need_count "$cd_" 1 "claimed/ after a malformed multi-object file — it must remain replayable"
-}
-
-# H2(b) — unknown fields are not part of the wire contract and must not cross the consumer
-# boundary. The four contract fields remain intact and the message is acked normally.
-sc_h2_extra_field_stripped() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending)
-  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
-  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"extra-field-h2",extra:"must-not-cross"}' \
-    > "$pd/20260804T120000Z-9202.a0" \
-    || { fail "fixture: could not write the extra-field message"; return 0; }
-
-  run_brain "$fx" bravo dm take
-  rc=$?
-  need_rc "$rc" 0 "take of a valid message carrying an unknown field" || return 0
-  if ! jq -s -e 'length == 1 and (.[0] | keys == ["content","from","to","ts"])' "$OUT" >/dev/null 2>&1; then
-    fail "H2: digest output must reconstruct exactly from/to/ts/content and strip every unknown field"
-  fi
-  need_file_has "$OUT" "extra-field-h2" "the sanitized message content"
-  need_file_lacks "$OUT" "must-not-cross" "the planted unknown field"
-  need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the sanitized message is delivered"
-}
-
-# H2(c) — every contract value is bounded, not only content. An oversized producer-controlled
-# `from` must be shortened before output and the serialized record must remain within the
-# existing per-line injection cap.
-sc_h2_oversized_from_bounded() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending)
-  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
-  huge_from=$(awk 'BEGIN { for (i = 0; i < 6000; i++) printf "f" }')
-  jq -cn --arg f "$huge_from" \
-    '{from:$f,to:"bravo",ts:"2026-08-04T12:00:00Z",content:"oversized-from-h2"}' \
-    > "$pd/20260804T120000Z-9203.a0" \
-    || { fail "fixture: could not write the oversized-from message"; return 0; }
-
-  run_brain "$fx" bravo dm take
-  rc=$?
-  need_rc "$rc" 0 "take of a message carrying an oversized from value" || return 0
-  size=$(byte_size "$OUT")
-  [ "$size" -le "$((DM_INJECT_MAX_COLS + 1))" ] \
-    || fail "H2: one sanitized digest record is $size bytes, above the $DM_INJECT_MAX_COLS-column bound"
-  if ! jq -s -e --arg original "$huge_from" \
-    'length == 1 and (.[0] | keys == ["content","from","to","ts"]) and (.[0].from | length) < ($original | length)' \
-    "$OUT" >/dev/null 2>&1; then
-    fail "H2: the oversized from value was not bounded while reconstructing the four-field record"
-  fi
-  need_file_has "$OUT" "oversized-from-h2" "content alongside the bounded from value"
-}
-
-# H3(a) — leading-zero decimals are non-canonical and must never reach shell arithmetic. The
-# malformed claim moves visibly to failed/ while an unrelated valid message still delivers.
-sc_h3_leading_zero_claim_survives_boot() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed)
-  mkdir -p "$pd" "$cd_" "$(q_dir "$fx" bravo read)" "$(q_dir "$fx" bravo failed)" \
-    || { fail "fixture: could not create the queue tree"; return 0; }
-  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"bad-leading-zero-h3"}' \
-    > "$cd_/20260804T120000Z-9301.a0.c08-123"
-  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:01Z",content:"good-after-bad-h3"}' \
-    > "$pd/20260804T120001Z-9302.a0"
-
-  ctx=$(hook_context "$fx" bravo)
-  hrc=$?
-  need_rc "$hrc" 0 "SessionStart with a leading-zero claim epoch" || return 0
-  need_str_has "$ctx" "good-after-bad-h3" \
-    "H3: a malformed claim must not prevent other messages from being delivered"
-  need_str_lacks "$ctx" "bad-leading-zero-h3" "the malformed claim must not be delivered"
-  need_count "$(q_dir "$fx" bravo failed)" 1 "failed/ after rejecting the leading-zero claim"
-  need_count "$cd_" 0 "claimed/ after routing the malformed claim to failed/"
-  need_file_has "$fx/.brain/.hook-errors.log" "20260804T120000Z-9301.a0.c08-123" \
-    "the malformed-claim warning must name the offending file"
-}
-
-# H3(b) — an attempt outside the state-machine range is terminal input, never an operand. It
-# must land in failed/ without wrapping into a negative, permanently unclaimable pending name.
-sc_h3_overrange_attempt_routes_failed() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  cd_=$(q_dir "$fx" bravo claimed); fd=$(q_dir "$fx" bravo failed)
-  mkdir -p "$(q_dir "$fx" bravo pending)" "$cd_" "$(q_dir "$fx" bravo read)" "$fd" \
-    || { fail "fixture: could not create the queue tree"; return 0; }
-  bad_name="20260804T120000Z-9303.a9223372036854775807.c0-123"
-  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"overrange-attempt-h3"}' \
-    > "$cd_/$bad_name"
-
-  run_brain "$fx" bravo dm take
-  rc=$?
-  need_rc "$rc" 0 "take with an over-range claim attempt" || return 0
-  need_count "$fd" 1 "failed/ after rejecting the over-range attempt"
-  need_file "$fd/$bad_name" "the over-range claim's visible terminal file"
-  need_count "$(q_dir "$fx" bravo pending)" 0 \
-    "pending/ after the over-range attempt — no wrapped negative name may be created"
-  need_file_has "$ERR" "$bad_name" "the over-range warning must name the offending file"
-
-  run_brain "$fx" bravo status
-  rc=$?
-  need_rc "$rc" 0 "status after routing the over-range claim" || return 0
-  status_has_failed "$OUT" || fail "H3: the terminal failed/ state must be visible in brain status"
-}
-
-# H4 — a jq shim simulates another session recovering the claim after digest but before ack.
-# The digest is delivered, ack warns about ENOENT, and the public command still exits zero.
-sc_h4_disappeared_claim_ack_is_soft() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  base=$(dirname "$fx"); cd_=$(q_dir "$fx" bravo claimed)
-  run_brain "$fx" alpha dm @bravo "claim-disappeared-h4"
-  rc=$?
-  need_rc "$rc" 0 "prerequisite: send" || return 0
-
-  shim_dir="$base/ack-race-bin"
-  mkdir -p "$shim_dir" || { fail "fixture: could not create the ack-race shim directory"; return 0; }
-  real_jq=$(command -v jq) || { fail "fixture: jq vanished after preflight"; return 0; }
-  real_rm=$(command -v rm) || { fail "fixture: rm is unavailable"; return 0; }
-  {
-    printf '#!/usr/bin/env sh\n'
-    printf 'validation=0\n'
-    printf 'for arg do [ "$arg" = "-e" ] && validation=1; done\n'
-    printf '"%s" "$@"\n' "$real_jq"
-    printf 'rc=$?\n'
-    printf 'if [ "$rc" -eq 0 ] && [ "$validation" -eq 0 ]; then\n'
-    printf '  for file in "$DM_ACK_RACE_CLAIM_DIR"/*; do\n'
-    printf '    [ -e "$file" ] || [ -L "$file" ] || continue\n'
-    printf '    "%s" -f -- "$file"\n' "$real_rm"
-    printf '  done\n'
-    printf 'fi\n'
-    printf 'exit "$rc"\n'
-  } > "$shim_dir/jq"
-  chmod +x "$shim_dir/jq" || { fail "fixture: could not make the jq shim executable"; return 0; }
-
-  DM_ACK_RACE_CLAIM_DIR=$cd_
-  export DM_ACK_RACE_CLAIM_DIR
-  PATH="$shim_dir:$PATH" run_brain "$fx" bravo dm take
-  rc=$?
-  unset DM_ACK_RACE_CLAIM_DIR
-
-  need_rc "$rc" 0 "H4: take after another session recovered the claim before ack"
-  need_file_has "$OUT" "claim-disappeared-h4" "the digest emitted before the simulated recovery"
-  need_file_has "$ERR" "claim disappeared before ack" \
-    "the dedicated ENOENT soft-landing warning"
-  need_file_lacks "$ERR" "refusing non-regular dm message" \
-    "the generic file validator must not intercept the absent-claim soft path"
-}
-
-# H5 — claiming is bounded work. The first invocation owns exactly the fixed batch, leaves the
-# remainder pending, and the next invocation drains every leftover without loss or starvation.
-sc_h5_claim_batch_bounded_and_fair() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  base=$(dirname "$fx"); pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
-  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
-  backlog=$((DM_CLAIM_MAX_MESSAGES + 3))
-  i=1
-  while [ "$i" -le "$backlog" ]; do
-    seq=$(printf '%03d' "$i")
-    jq -cn --arg content "bounded-batch-$seq-h5" \
-      '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:$content}' \
-      > "$pd/20260804T120000Z-9401-$seq.a0" \
-      || { fail "fixture: could not plant backlog message $i"; return 0; }
-    i=$((i + 1))
-  done
-
-  run_brain "$fx" bravo dm take
-  rc=$?
-  need_rc "$rc" 0 "first bounded take" || return 0
-  first_out="$base/first-bounded-take.out"
-  cp "$OUT" "$first_out" || { fail "fixture: could not preserve first take output"; return 0; }
-  need_eq "$(line_count "$first_out")" "$DM_CLAIM_MAX_MESSAGES" \
-    "H5: messages delivered by the first claim invocation"
-  need_count "$rd" "$DM_CLAIM_MAX_MESSAGES" \
-    "read/ after the first invocation — exactly one bounded batch must have been claimed"
-  need_count "$pd" 3 "pending/ after the first invocation — the remainder stays claimable"
-  need_count "$(q_dir "$fx" bravo claimed)" 0 "claimed/ after the first batch is acked"
-
-  run_brain "$fx" bravo dm take
-  rc=$?
-  need_rc "$rc" 0 "second take of the leftover batch" || return 0
-  second_out="$OUT"
-  need_eq "$(line_count "$second_out")" 3 "messages delivered by the second claim invocation"
-  need_count "$rd" "$backlog" "read/ after successive invocations drain the full backlog"
-  need_count "$pd" 0 "pending/ after the second invocation"
-
-  i=1
-  while [ "$i" -le "$backlog" ]; do
-    seq=$(printf '%03d' "$i")
-    seen=$(grep -h -cF -- "bounded-batch-$seq-h5" "$first_out" "$second_out" 2>/dev/null \
-      | awk '{ total += $1 } END { print total + 0 }')
-    need_eq "$seen" 1 "backlog marker $seq across successive bounded takes" || return 0
-    i=$((i + 1))
-  done
-}
-
-# D.P1/50 — deployment is one main-worktree engine, even when the receiving lane is a sibling
-# whose tracked .brain/bin/brain predates `dm take`. This reproduces the live failure shape:
-# SessionStart itself resolves the shared vault correctly, then its emitted command is executed
-# from the stale sibling. Only an absolute main-engine instruction can consume the queued marker.
+# V.C/24 — must-survive #7 (absolute engine resolution). Deployment is one main-worktree engine,
+# even when the receiving lane is a sibling whose tracked .brain/bin/brain predates `dm take`.
+# This reproduces the live failure shape: SessionStart resolves the shared vault correctly, then
+# its emitted command is executed from the stale sibling. Only an absolute main-engine
+# instruction can consume the queued marker.
 sc_deploy_instruction_uses_main_worktree_engine() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   base=$(dirname "$fx"); sibling="$base/sibling-worktree"
@@ -2339,13 +1348,30 @@ sc_deploy_instruction_uses_main_worktree_engine() {
   ctx=$(hook_context "$sibling" bravo)
   hrc=$?
   need_rc "$hrc" 0 "SessionStart from the sibling carrying an old tracked engine" || return 0
-  instruction=$(printf '%s\n' "$ctx" | sed -n 's/^On activity, claim and consume it with: //p' | head -1)
-  [ -n "$instruction" ] \
-    || { fail "Part 1: SessionStart emitted no executable consume instruction"; return 0; }
-  need_str_has "$instruction" "$fx/.brain/bin/brain" \
-    "Part 1: the consume instruction must name the main worktree's deployed engine" || return 0
-  need_str_lacks "$instruction" "$sibling/.brain/bin/brain" \
+
+  # ⚠ THE PROSE IS NOT PINNED — dispatcher ruling, 2026-08-04. The v1.1 engine emits
+  # "On activity, claim and consume it with: <cmd>", and an honest v1.2 GREEN drops the word
+  # "claim" with the layer it names. GREEN may not touch this frozen suite, so a guard matching
+  # that sentence would wedge the arc. Exactly three things are pinned, all load-bearing:
+  #   (a) the instruction names the MAIN worktree's ABSOLUTE engine — never the sibling's tracked
+  #       copy and never a relative `.brain/bin/brain` (must-survive #7);
+  #   (b) the command NAME is `dm take` — ruled v1.2 contract; it survives with no-claim semantics;
+  #   (c) the line is an INSTRUCTION to act on activity, not a bare path with no directive.
+  # The command is extracted by stripping any leading prose up to the first quote or absolute
+  # path, so ANY sentence wrapping the command works. If a future wording puts a '/' inside the
+  # prose itself, the extraction breaks LOUDLY (the command below will not execute), never silently.
+  instr_line=$(printf '%s\n' "$ctx" | grep -F -- 'dm take' | grep -F -- "$fx/.brain/bin/brain" | head -1)
+  [ -n "$instr_line" ] \
+    || { fail "Part 1: SessionStart emitted no line carrying BOTH the 'dm take' command name and the main worktree's absolute engine path ($fx/.brain/bin/brain)"; return 0; }
+  need_str_lacks "$instr_line" "$sibling/.brain/bin/brain" \
     "Part 1: the consume instruction must never name the sibling's tracked engine"
+  printf '%s' "$instr_line" | grep -qiE 'consume|run|execute|invoke' \
+    || fail "Part 1: the emitted line carries a command but no directive verb — a lane watching its pending/ dir is told a path, not an action to take on activity"
+  instruction=$(printf '%s' "$instr_line" | sed -n 's|^[^"/]*\(["/].*\)$|\1|p')
+  [ -n "$instruction" ] \
+    || { fail "Part 1: could not extract an executable command from the emitted line: $instr_line"; return 0; }
+  need_str_has "$instruction" "$fx/.brain/bin/brain" \
+    "Part 1: the extracted command must name the main worktree's deployed engine" || return 0
 
   run_brain "$fx" alpha dm @bravo "main-engine-deploy-p1"
   rc=$?
@@ -2372,302 +1398,1060 @@ sc_deploy_instruction_uses_main_worktree_engine() {
     "the DM protocol must direct lanes to the emitted absolute engine"
 }
 
-# U.H2/51 — one malformed file is isolated from healthy peers in the same claimed batch. The
-# poison stays replayable (the frozen H2 single-poison contract), while both valid peers emit and
-# ack at attempt zero; they must never inherit the poison file's retry count.
-sc_poison_file_does_not_discard_healthy_batchmates() {
+# ══════════════════════ V.W — wire contract + bounds at the consumer (guards) ═════════════
+# Must-survive #6: "exactly one JSON object per file, four bounded fields, byte-based
+# (utf8bytelength) line and aggregate caps". Every fixture here gets its filename from a real
+# send (plant_message) and only its BYTES are overwritten, so nothing depends on the queue
+# filename grammar v1.2 changes.
+#
+# ⚠ RENDERING IS NOT PINNED. The v1.1 suite asserted `keys == ["content","from","to","ts"]` on
+# the emitted record. Must-survive #8 requires the message ID to be EXPOSED in the digest, and
+# the map does not say how — an `id` key is the obvious rendering, and an exact-keys equality
+# would forbid it. These guards therefore assert the four contract values and the byte caps and
+# say nothing about extra structure. See the hand-off report: authority/authority tension,
+# resolved by NARROWING an assertion the map never mandated rather than by adding apparatus.
+
+# V.W/25 — a file is the consumer-boundary unit. Multiple JSON values in one file are malformed:
+# nothing may be emitted from it, it must never reach the archive, and it must not be destroyed.
+#   (WHERE it goes is v1.2's change — V.N/49 pins quarantine. This guard pins only that the
+#   malformed file is refused, silent, and not lost, all of which hold today.)
+sc_multi_object_file_refused() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed); rd=$(q_dir "$fx" bravo read)
-  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
-  printf '%s\n' '{not-valid-json' > "$pd/20260804T130000Z-9500.a0"
-  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T13:00:01Z",content:"healthy-peer-one-h2"}' \
-    > "$pd/20260804T130001Z-9501.a0"
-  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T13:00:02Z",content:"healthy-peer-two-h2"}' \
-    > "$pd/20260804T130002Z-9502.a0"
+  rd=$(q_dir "$fx" bravo read)
+
+  planted=$(plant_message "$fx" bravo "multi-object-seed-h2") \
+    || { fail "prerequisite: could not queue the seed message"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"multi-first-h2"}' > "$planted" \
+    || { fail "fixture: could not write the first planted object"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:01Z",content:"multi-second-h2"}' >> "$planted" \
+    || { fail "fixture: could not write the second planted object"; return 0; }
 
   run_brain "$fx" bravo dm take
-  rc=$?
-  need_rc_nonzero "$rc" "mixed healthy/poison take must report the retained poison file"
-  need_file_has "$OUT" "healthy-peer-one-h2" "the first healthy batchmate"
-  need_file_has "$OUT" "healthy-peer-two-h2" "the second healthy batchmate"
-  need_count "$rd" 2 "read/ after healthy peers are emitted and acked independently"
-  need_count "$cd_" 1 "claimed/ after only the poison file remains replayable"
-  need_count "$pd" 0 "pending/ after all three files were claimed"
-  for f in "$rd"/*; do
-    [ -e "$f" ] || continue
-    need_eq "$(attempt_of "$f")" 0 \
-      "healthy peer attempt counter — poison retries must never propagate to a batchmate" || return 0
-  done
+  # ⚠ NARROWED from the v1.1 suite, deliberately. F.H2/43 asserted `exit non-zero` here. The
+  # v1.2 ruling is SILENT on the exit status of a consume that quarantined one file and
+  # delivered its peers, and V.N/49 requires exactly that outcome to be normal — so a non-zero
+  # requirement would reject a permitted implementation. The anti-silence property is what
+  # matters, and it is asserted directly instead: the engine must SAY something. Its own
+  # diagnostics are prefixed "brain: " (_warn/_die), so a bare jq/mv error on stderr is a leak,
+  # not a report, and does not satisfy this.
+  if [ -s "$ERR" ]; then
+    need_file_has "$ERR" "brain:" "a refused multi-object file must be reported BY THE ENGINE (stderr carried output, but no 'brain: ' diagnostic — an unsuppressed tool error is a leak, not a report)"
+  else
+    fail "a file refused at the consumer boundary must be reported, never silently swallowed (stderr was empty)"
+  fi
+  need_file_lacks "$OUT" "multi-first-h2" "a multi-object file must emit NOTHING (first object)"
+  need_file_lacks "$OUT" "multi-second-h2" "a multi-object file must emit NOTHING (second object)"
+  need_count "$rd" 0 "read/ after a malformed multi-object file — it must never be archived"
+  need_not_lost "$fx" bravo "multi-first-h2" "the refused multi-object file"
 }
 
-# U.H3/52 — crash → immediate restart preserves the fresh claim, then an armed lease sweep moves
-# it back to pending when wall-clock expiry arrives. The lane's existing pending-dir watcher can
-# then run `dm take`; no unrelated DM or later reboot is needed to create the wake-up event.
-sc_fresh_claim_arms_recovery_at_lease_expiry() {
+# V.W/26 — unknown fields are not part of the wire contract and must not cross the consumer
+# boundary. The contract values survive; the planted field does not.
+sc_extra_field_stripped() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  run_brain "$fx" alpha dm @bravo "lease-expiry-wakeup-h3"
-  rc=$?
-  need_rc "$rc" 0 "prerequisite: send the crash-window message" || return 0
-  claim=$(mint_stuck_claim "$fx" bravo); mrc=$?
-  [ "$mrc" = 0 ] || { mint_failed "$mrc"; return 0; }
-  claim=$(age_claim "$claim" "$((DM_CLAIM_MAX_AGE - 2))") \
-    || { fail "fixture: could not place the claim just inside its lease"; return 0; }
 
-  ctx=$(hook_context "$fx" bravo)
-  hrc=$?
-  need_rc "$hrc" 0 "immediate restart while the claim is still fresh" || return 0
-  need_str_lacks "$ctx" "lease-expiry-wakeup-h3" \
-    "the immediate restart must not steal a still-fresh claim"
-  need_count "$(q_dir "$fx" bravo claimed)" 1 "claimed/ immediately after restart"
-  need_count "$(q_dir "$fx" bravo pending)" 0 "pending/ immediately after restart"
-
-  waited=0
-  while [ "$(count_files "$(q_dir "$fx" bravo pending)")" = 0 ] && [ "$waited" -lt 7 ]; do
-    sleep 1
-    waited=$((waited + 1))
-  done
-  need_count "$(q_dir "$fx" bravo pending)" 1 \
-    "pending/ after idling past the lease — the scheduled sweep must create watcher activity" \
-    || return 0
+  planted=$(plant_message "$fx" bravo "extra-field-seed-h2") \
+    || { fail "prerequisite: could not queue the seed message"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"extra-field-h2",extra:"must-not-cross"}' \
+    > "$planted" || { fail "fixture: could not write the extra-field message"; return 0; }
 
   run_brain "$fx" bravo dm take
   rc=$?
-  need_rc "$rc" 0 "watcher-triggered take after scheduled lease recovery" || return 0
-  need_file_has "$OUT" "lease-expiry-wakeup-h3" \
-    "the crash-window message delivered after idle lease expiry"
-  need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the recovered delivery"
+  need_rc "$rc" 0 "take of a valid message carrying an unknown field" || return 0
+  need_file_has "$OUT" "extra-field-h2" "the sanitized message content"
+  need_file_has "$OUT" "alpha" "the .from contract field must survive sanitisation"
+  need_file_lacks "$OUT" "must-not-cross" "the planted unknown field must not cross the consumer boundary"
+  # STRUCTURAL half: a literal-fragment check alone would accept a record that dropped `ts`, or
+  # emitted prose, or carried the unknown field under a renamed key. This is where the rebuilt
+  # record's shape is actually pinned.
+  need_digest_records_wellformed "$OUT" "the sanitized record emitted for a message with an unknown field"
+  need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the sanitized message is delivered"
 }
 
-# U.H4/53 — every pre-existing transition destination is preserved. Recovery must not clobber a
-# regular pending message, nest into a directory, or follow a symlink out of the queue; failed/
-# collisions get distinct forensic names instead of overwriting, nesting, or refusing forever.
-sc_queue_destination_collisions_preserve_every_message() {
+# V.W/27 — every contract value is bounded, not only content. An oversized producer-controlled
+# `from` must be shortened before output, and the emitted line must stay within the per-line
+# BYTE cap.
+sc_oversized_from_bounded() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  base=$(dirname "$fx"); pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed)
-  fd=$(q_dir "$fx" bravo failed); ejected="$base/ejected"; ejected_failed="$base/ejected-failed"
-  mkdir -p "$pd" "$cd_" "$fd" "$ejected" "$ejected_failed" \
-    || { fail "fixture: could not create collision queue directories"; return 0; }
+  huge_from=$(awk 'BEGIN { for (i = 0; i < 6000; i++) printf "f" }')
 
-  jq -cn '{from:"prior",to:"bravo",ts:"2026-08-04T13:10:00Z",content:"occupied-regular-h4"}' \
-    > "$pd/20260804T131000Z-9601.a1"
-  mkdir "$pd/20260804T131001Z-9602.a1" \
-    || { fail "fixture: could not plant the occupied directory"; return 0; }
-  printf 'occupied-directory-sentinel-h4\n' > "$pd/20260804T131001Z-9602.a1/sentinel"
-  ln -s "$ejected" "$pd/20260804T131002Z-9603.a1" \
-    || { fail "fixture: could not plant the occupied symlink"; return 0; }
-
-  i=1
-  for id in 20260804T131000Z-9601 20260804T131001Z-9602 20260804T131002Z-9603; do
-    jq -cn --arg content "stale-source-$i-h4" \
-      '{from:"alpha",to:"bravo",ts:"2026-08-04T13:00:00Z",content:$content}' \
-      > "$cd_/$id.a0.c0-1"
-    i=$((i + 1))
-  done
-
-  printf 'old-failed-regular-h4\n' > "$fd/bad-regular"
-  printf '%s\n' '{bad-new-regular-h4' > "$pd/bad-regular"
-  mkdir "$fd/bad-directory" || { fail "fixture: could not plant failed/ directory collision"; return 0; }
-  printf 'old-failed-directory-h4\n' > "$fd/bad-directory/sentinel"
-  printf '%s\n' '{bad-new-directory-h4' > "$pd/bad-directory"
-  ln -s "$ejected_failed" "$fd/bad-symlink" \
-    || { fail "fixture: could not plant failed/ symlink collision"; return 0; }
-  printf '%s\n' '{bad-new-symlink-h4' > "$pd/bad-symlink"
+  planted=$(plant_message "$fx" bravo "oversized-from-seed-h2") \
+    || { fail "prerequisite: could not queue the seed message"; return 0; }
+  jq -cn --arg f "$huge_from" \
+    '{from:$f,to:"bravo",ts:"2026-08-04T12:00:00Z",content:"oversized-from-h2"}' \
+    > "$planted" || { fail "fixture: could not write the oversized-from message"; return 0; }
 
   run_brain "$fx" bravo dm take
   rc=$?
-  need_file_has "$OUT" "occupied-regular-h4" \
-    "the pre-existing regular pending message must survive and deliver"
-  need_tree_has "$fd" "stale-source-1-h4" "the stale source blocked by a regular destination"
-  need_tree_has "$fd" "stale-source-2-h4" "the stale source blocked by a directory destination"
-  need_tree_has "$fd" "stale-source-3-h4" "the stale source blocked by a symlink destination"
-  need_file_has "$pd/20260804T131001Z-9602.a1/sentinel" "occupied-directory-sentinel-h4" \
-    "the occupied pending directory sentinel"
-  need_eq "$(count_files "$ejected")" 0 \
-    "symlink recovery target — no message may be ejected outside the queue"
-
-  need_file_has "$fd/bad-regular" "old-failed-regular-h4" \
-    "the pre-existing failed/ regular forensic record"
-  need_tree_has "$fd" "bad-new-regular-h4" \
-    "the newly rejected message beside a regular failed/ collision"
-  need_file_has "$fd/bad-directory/sentinel" "old-failed-directory-h4" \
-    "the pre-existing failed/ directory sentinel"
-  need_tree_has "$fd" "bad-new-directory-h4" \
-    "the newly rejected message beside a directory failed/ collision"
-  need_tree_has "$fd" "bad-new-symlink-h4" \
-    "the newly rejected message beside a symlink failed/ collision"
-  need_eq "$(count_files "$ejected_failed")" 0 \
-    "failed/ symlink target — no forensic message may be ejected"
-  need_count "$pd" 2 \
-    "pending/ after collisions — only the deliberately occupied directory and symlink remain"
-  [ "$rc" = 0 ] || [ "$rc" = 1 ] \
-    || fail "collision handling returned unexpected exit $rc"
+  need_rc "$rc" 0 "take of a message carrying an oversized from value" || return 0
+  need_file_has "$OUT" "oversized-from-h2" "content alongside the bounded from value"
+  need_file_lacks "$OUT" "$huge_from" "the full 6,000-byte from value must never be emitted"
+  need_digest_records_wellformed "$OUT" "the record emitted for a message with an oversized from value"
+  widest=$(max_line_bytes "$OUT")
+  [ "$widest" -le "$DM_INJECT_MAX_COLS" ] \
+    || fail "the widest emitted line is $widest bytes, above the $DM_INJECT_MAX_COLS-byte per-line cap"
 }
 
-# U.H5/54 — a 252-byte producer-alphabet ID fits pending/<id>.a0 but cannot fit the maximum
-# claim suffix. It must be quarantined, allowing the later healthy entry to deliver in the same
-# invocation; an early overlong name can never permanently head-of-line block the queue.
-sc_overlong_id_routes_failed_without_blocking_later_message() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending); fd=$(q_dir "$fx" bravo failed)
-  mkdir -p "$pd" "$fd" || { fail "fixture: could not create overlong-id queue"; return 0; }
-  long_id=$(awk 'BEGIN { printf "20260804T132000Z-1"; for (i = 0; i < 234; i++) printf "0" }')
-  need_eq "$(printf '%s' "$long_id" | wc -c | tr -d ' \n')" 252 \
-    "fixture: overlong ID byte length" || return 0
-  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T13:20:00Z",content:"overlong-id-h5"}' \
-    > "$pd/$long_id.a0" \
-    || { fail "fixture: filesystem did not accept the intended NAME_MAX boundary file"; return 0; }
-  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T13:20:01Z",content:"healthy-after-overlong-h5"}' \
-    > "$pd/99999999T999999Z-9999.a0"
-
-  run_brain "$fx" bravo dm take
-  rc=$?
-  need_rc "$rc" 0 "take with an early-sorting overlong ID" || return 0
-  need_file_has "$OUT" "healthy-after-overlong-h5" \
-    "the healthy message after the overlong ID"
-  need_count "$fd" 1 "failed/ after quarantining the overlong ID"
-  need_tree_has "$fd" "overlong-id-h5" "the quarantined overlong-ID message"
-  need_count "$pd" 0 "pending/ after the overlong ID is removed and the healthy peer delivers"
-}
-
-# U.H6/55 — one 40-transition budget spans stale recovery, invalid-name routing, and claiming.
-# Twenty stale recoveries plus twenty early invalid pending routes exhaust invocation one; the
-# twenty recovered messages and one healthy tail remain and all progress on invocation two.
-sc_one_transition_budget_spans_recovery_routing_and_claiming() {
-  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed)
-  fd=$(q_dir "$fx" bravo failed); rd=$(q_dir "$fx" bravo read)
-  mkdir -p "$pd" "$cd_" "$fd" "$rd" \
-    || { fail "fixture: could not create transition-budget queue"; return 0; }
-
-  i=1
-  while [ "$i" -le 20 ]; do
-    seq=$(printf '%03d' "$i")
-    jq -cn --arg content "recovered-budget-$seq-h6" \
-      '{from:"alpha",to:"bravo",ts:"2026-08-04T13:30:00Z",content:$content}' \
-      > "$cd_/10000000T000000Z-9701-$seq.a0.c0-1"
-    printf '%s\n' '{invalid-budget-h6' > "$pd/000-invalid-$seq"
-    i=$((i + 1))
-  done
-  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T13:30:01Z",content:"healthy-tail-budget-h6"}' \
-    > "$pd/99999999T999999Z-9702.a0"
-
-  run_brain "$fx" bravo dm take
-  rc=$?
-  need_rc "$rc" 0 "first transition-bounded take" || return 0
-  need_eq "$(byte_size "$OUT")" 0 \
-    "first take output — recovery plus routing must consume the whole shared budget"
-  need_count "$fd" 20 "failed/ after the first take routes exactly twenty invalid names"
-  need_count "$pd" 21 \
-    "pending/ after the first take leaves twenty recovered messages plus the healthy tail"
-  need_count "$cd_" 0 "claimed/ after exactly twenty stale recoveries"
-  need_count "$rd" 0 "read/ after no claim budget remained"
-
-  run_brain "$fx" bravo dm take
-  rc=$?
-  need_rc "$rc" 0 "second take resumes after the exhausted transition budget" || return 0
-  need_eq "$(line_count "$OUT")" 21 "messages delivered by the resumed invocation"
-  need_file_has "$OUT" "healthy-tail-budget-h6" \
-    "fair resumption must eventually reach the healthy tail"
-  need_count "$pd" 0 "pending/ after the resumed invocation"
-  need_count "$rd" 21 "read/ after every valid message progresses"
-}
-
-# U.M1/56 — jq `length` counts code points. Four multibyte fields can therefore serialize above
-# the 2,000-byte line cap even after the conservative per-field slice. The wire caps are bytes:
-# the emitted line stays valid JSON and is at most DM_INJECT_MAX_COLS bytes plus its newline.
+# V.W/28 — jq's `length` counts CODE POINTS. Four multibyte fields can therefore serialize above
+# the 2,000-BYTE line cap even after a conservative per-field slice. The map's caps are byte caps
+# (`utf8bytelength`), and `max_line_bytes` measures under LC_ALL=C so it really counts bytes.
 sc_multibyte_digest_respects_byte_caps() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
-  pd=$(q_dir "$fx" bravo pending)
-  mkdir -p "$pd" || { fail "fixture: could not create multibyte queue"; return 0; }
   multi=$(awk 'BEGIN { for (i = 0; i < 300; i++) printf "🙂" }')
+
+  planted=$(plant_message "$fx" bravo "multibyte-seed-m1") \
+    || { fail "prerequisite: could not queue the seed message"; return 0; }
   jq -cn --arg v "$multi" '{from:"alpha",to:$v,ts:$v,content:$v}' \
-    > "$pd/20260804T134000Z-9801.a0" \
-    || { fail "fixture: could not write the multibyte message"; return 0; }
+    > "$planted" || { fail "fixture: could not write the multibyte message"; return 0; }
 
   run_brain "$fx" bravo dm take
   rc=$?
   need_rc "$rc" 0 "take of a multibyte boundary message" || return 0
-  jq -e -s 'length == 1 and (.[0] | type) == "object"' "$OUT" >/dev/null 2>&1 \
-    || fail "multibyte digest output is not one valid JSON object"
-  size=$(byte_size "$OUT")
-  [ "$size" -le "$((DM_INJECT_MAX_COLS + 1))" ] \
-    || fail "multibyte digest record is $size bytes, above the $DM_INJECT_MAX_COLS-byte line cap"
+  [ "$(byte_size "$OUT")" -gt 0 ] || fail "the multibyte message was not emitted at all"
+  # The byte cap must be met by SHRINKING the fields, never by emitting a truncated/invalid record.
+  need_digest_records_wellformed "$OUT" "the record emitted for a multibyte boundary message"
+  widest=$(max_line_bytes "$OUT")
+  [ "$widest" -le "$DM_INJECT_MAX_COLS" ] \
+    || fail "the widest emitted line is $widest BYTES, above the $DM_INJECT_MAX_COLS-byte line cap — a code-point slice is not a byte cap"
   need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the bounded multibyte delivery"
 }
 
+# V.W/29 — seam defect 5: `cut -c1-2000` truncated mid-JSON and injected a syntactically broken
+# object into a session's startup context. The fix truncates the CONTENT FIELD, not the
+# serialized object.
+#   VACUITY    if the digest renders prose rather than serialized objects, the JSON limb is
+#   NOTE       vacuously true — a PERMITTED alternative (the map does not pin the rendering) —
+#              and the HEAD/TAIL bound still holds. Do not "fix" the engine to produce JSON just
+#              to make this limb bite.
+sc_digest_truncates_content_not_json() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pad=$(awk 'BEGIN{ s=""; for (i = 0; i < 2900; i++) s = s "x"; printf "%s", s }')
+  body="HEADMARK-$pad-TAILMARK"
+
+  run_brain "$fx" alpha dm @bravo "$body"
+  rc=$?
+  need_rc "$rc" 0 "brain dm with a 2.9 KB body (under DM_MAX_BODY)" || return 0
+  need_count "$(q_dir "$fx" bravo pending)" 1 "the long message was queued" || return 0
+
+  ctx=$(hook_context "$fx" bravo)
+  hrc=$?
+  need_rc "$hrc" 0 "boot with a long message queued" || return 0
+
+  need_str_has  "$ctx" "HEADMARK" "the long message must be delivered at all (positive control)"
+  need_str_lacks "$ctx" "TAILMARK" \
+    "the injected block carried the FULL 2.9 KB body — the $DM_INJECT_MAX_COLS-byte line cap is not bounding it"
+
+  printf '%s\n' "$ctx" > "$base/ctx.txt"
+  bad=0
+  while IFS= read -r ln; do
+    case "$ln" in
+      '{'*) printf '%s\n' "$ln" | jq -e . >/dev/null 2>&1 || bad=$((bad + 1)) ;;
+    esac
+  done < "$base/ctx.txt"
+  need_eq "$bad" 0 \
+    "seam defect 5: $bad line(s) of the injected block start with '{' but are not valid JSON — truncation must bound the CONTENT FIELD, never the serialized object"
+}
+
+# V.W/30 — must-survive #3 (per-message isolation): a malformed file must never suppress a valid
+# peer. The corrupted entry is whichever one the consumer reaches FIRST, so this also covers
+# head-of-line blocking.
+#   REJECTS    a consumer that abandons the batch on the first bad file (both peers would be
+#              missing), and one that discards healthy peers alongside the poison.
+#   NOT PINNED where the poison goes, nor the exit status — v1.2 moves it to failed/ (V.N/49),
+#              v1.1 leaves it parked; both satisfy "not lost, not archived".
+sc_malformed_peer_does_not_suppress_valid() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
+
+  for m in peer-a-h2 peer-b-h2 peer-c-h2; do
+    run_brain "$fx" alpha dm @bravo "$m"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: send $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three peers queued" || return 0
+
+  # corrupt whichever entry the consumer's glob reaches first — the head-of-line position
+  victim=$(first_file "$pd") || { fail "pending/ is empty after three sends"; return 0; }
+  lost=""
+  for m in peer-a-h2 peer-b-h2 peer-c-h2; do
+    grep -qF -- "$m" "$victim" 2>/dev/null && lost=$m
+  done
+  [ -n "$lost" ] || { fail "fixture: could not identify which peer sits at the head of the queue"; return 0; }
+  printf '%s\n' '{not-valid-json-h2' > "$victim" \
+    || { fail "fixture: could not corrupt the head entry"; return 0; }
+
+  run_brain "$fx" bravo dm take
+
+  shown=0
+  for m in peer-a-h2 peer-b-h2 peer-c-h2; do
+    [ "$m" = "$lost" ] && continue
+    if grep -qF -- "$m" "$OUT" 2>/dev/null; then
+      shown=$((shown + 1))
+    else
+      fail "healthy peer '$m' was suppressed by a malformed entry at the head of the queue (must-survive #3)"
+    fi
+  done
+  need_eq "$shown" 2 "healthy peers delivered alongside a malformed head entry"
+  need_count "$rd" 2 "read/ — exactly the two healthy peers are archived"
+  need_tree_lacks "$rd" "not-valid-json-h2" "a malformed file must never reach the archive"
+  need_not_lost "$fx" bravo "not-valid-json-h2" "the malformed entry"
+}
+
+# V.W/31 — a quarantined message is SURFACED, never silent. `failed/` is planted directly (its
+# contents are forensic records, not queue entries, so no filename grammar applies).
+#   CONTROL    status is sampled BEFORE and AFTER: a hardcoded banner fails the before-sample.
+#   ⚠ AUTHORITY NOTE: the "surfaced in brain status, never auto-deleted" wording came from seam
+#   decision 6b (the poison cap), which the v1.2 ruling supersedes. v1.2 keeps a quarantine but
+#   does not restate the surfacing requirement. Retained here as a regression guard on live
+#   behaviour, flagged NON-BLOCKING in the hand-off report — drop it if the dispatcher rules that
+#   quarantine visibility is not part of the v1.2 contract.
+sc_status_surfaces_quarantined_dms() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  fd=$(q_dir "$fx" bravo failed)
+
+  run_brain "$fx" bravo inbox
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: brain inbox ensures the queue tree" || return 0
+
+  run_brain "$fx" bravo status
+  rc=$?
+  need_rc "$rc" 0 "brain status (before any quarantine)" || return 0
+  if status_has_failed "$OUT"; then
+    fail "control: brain status reports a failure with an EMPTY failed/ — the surfacing is hardcoded, not derived"
+    return 0
+  fi
+
+  mkdir -p "$fd" || { fail "fixture: could not create failed/"; return 0; }
+  printf '%s\n' '{quarantined-forensic-record' > "$fd/quarantined-probe" \
+    || { fail "fixture: could not plant the quarantined record"; return 0; }
+
+  run_brain "$fx" bravo status
+  rc=$?
+  need_rc "$rc" 0 "brain status (after quarantine)" || return 0
+  status_has_failed "$OUT" \
+    || fail "a quarantined DM must be SURFACED in 'brain status' (never auto-deleted, never silent). NB this ignores status's echoed journal lines, so the banner must come from status's OWN rendering"
+  need_file "$fd/quarantined-probe" "the quarantined record must never be auto-deleted"
+}
+
+# ══════════════════════════ V.X — symlink / path-component refusal (guards) ══════════════
+#
+# Must-survive #6: "path/symlink component checks". UR-2: the `dm` ROOT was never validated, and
+# the boot-time rotate that ran FIRST validated nothing at all. `_dm_dir_ok` must reject a
+# symlink or non-directory at EVERY level walked, on EVERY queue touch. Every target below lives
+# inside the disposable scratch root; nothing points at a real path.
+#
+# ⚠ SCOPE HONESTY (seam Flags): POSIX sh has no openat/O_NOFOLLOW, so these scenarios pin
+# COMPONENT REFUSAL, not race-freedom. The same-user TOCTOU residual is a documented limit and
+# no assertion here claims otherwise.
+
+# V.X/32 — the `dm` ROOT itself: the component the v1.0 engine never validated at all.
+sc_send_refuses_symlinked_dm_root() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  ext=$(dirname "$fx")/outside-dmroot
+  mkdir -p "$ext" || { fail "fixture: could not create the external target"; return 0; }
+  printf 'XCANARY-dmroot\n' > "$ext/canary.txt"
+
+  # positive control: this exact send WORKS before the root becomes a symlink
+  run_brain "$fx" alpha dm @bravo "presym-probe"
+  rc=$?
+  need_rc "$rc" 0 "positive control: the send works before .brain/dm is a symlink" || return 0
+
+  mv "$fx/.brain/dm" "$fx/.brain/dm.real" || { fail "fixture: could not move the real dm root"; return 0; }
+  ln -s "$ext" "$fx/.brain/dm" || { fail "fixture: could not symlink the dm root"; return 0; }
+
+  run_brain "$fx" alpha dm @bravo "postsym-XSYM1"
+  rc=$?
+  need_rc_nonzero "$rc" "brain dm with .brain/dm a SYMLINK (UR-2: the dm root was never validated)"
+  [ -s "$ERR" ] || fail "a refused send wrote nothing to stderr"
+  need_tree_lacks "$ext" "postsym-XSYM1" "message content written THROUGH the symlinked dm root"
+  need_file_has "$ext/canary.txt" "XCANARY-dmroot" "external canary intact (positive control that the target is readable)"
+}
+
+# V.X/33 — the lane directory. Refusal must be SPECIFIC to the poisoned lane: a send to a
+# healthy sibling in the same vault still has to work, or "refused" just means "broken".
+sc_send_refuses_symlinked_lane_dir() {
+  fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
+  ext=$(dirname "$fx")/outside-lane
+  mkdir -p "$ext" || { fail "fixture: could not create the external target"; return 0; }
+
+  mkdir -p "$fx/.brain/dm" || { fail "fixture: could not create the dm root"; return 0; }
+  ln -s "$ext" "$fx/.brain/dm/bravo" || { fail "fixture: could not symlink the lane dir"; return 0; }
+
+  run_brain "$fx" alpha dm @bravo "lanelink-XSYM2"
+  rc=$?
+  need_rc_nonzero "$rc" "brain dm to a lane whose directory is a SYMLINK"
+  [ -s "$ERR" ] || fail "a refused send wrote nothing to stderr"
+  need_tree_lacks "$ext" "lanelink-XSYM2" "message content written through the symlinked lane dir"
+
+  # specificity: a healthy lane in the same vault is unaffected
+  run_brain "$fx" alpha dm @charlie "healthy-lane-probe"
+  rc=$?
+  need_rc "$rc" 0 "positive control: a healthy sibling lane still receives mail" || return 0
+  need_count "$(q_dir "$fx" charlie pending)" 1 "the healthy lane's pending/"
+}
+
+# V.X/34 — the pending/ STATE directory.
+sc_send_refuses_symlinked_pending_dir() {
+  fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
+  ext=$(dirname "$fx")/outside-pending
+  mkdir -p "$ext" || { fail "fixture: could not create the external target"; return 0; }
+
+  mkdir -p "$fx/.brain/dm/bravo" || { fail "fixture: could not create the lane dir"; return 0; }
+  ln -s "$ext" "$fx/.brain/dm/bravo/pending" || { fail "fixture: could not symlink pending/"; return 0; }
+
+  run_brain "$fx" alpha dm @bravo "pendinglink-XSYM3"
+  rc=$?
+  need_rc_nonzero "$rc" "brain dm to a lane whose pending/ is a SYMLINK"
+  [ -s "$ERR" ] || fail "a refused send wrote nothing to stderr"
+  need_tree_lacks "$ext" "pendinglink-XSYM3" "message content written through the symlinked pending/"
+
+  run_brain "$fx" alpha dm @charlie "healthy-lane-probe"
+  rc=$?
+  need_rc "$rc" 0 "positive control: a healthy sibling lane still receives mail"
+}
+
+# V.X/35 — the read/ ARCHIVE directory, reached on the BOOT path. This is the exact gap UR-2
+# names: the boot-time move ran first and validated neither source nor destination, so a
+# symlinked archive could route message bodies into a tracked canonical directory.
+#   PROVES     the boot path validates read/ before moving anything through it, warns, and
+#              LOSES NOTHING.
+sc_boot_refuses_symlinked_read_dir() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  ext=$(dirname "$fx")/outside-read
+  mkdir -p "$ext" || { fail "fixture: could not create the external target"; return 0; }
+  hooklog="$fx/.brain/.hook-errors.log"
+  pd=$(q_dir "$fx" bravo pending)
+
+  run_brain "$fx" alpha dm @bravo "readlink-XSYM4"; rc=$?
+  need_rc "$rc" 0 "prerequisite: send with a healthy tree" || return 0
+  need_count "$pd" 1 "prerequisite: message queued" || return 0
+
+  assert_disposable "$fx"
+  [ -d "$fx/.brain/dm/bravo/read" ] && rm -rf "$fx/.brain/dm/bravo/read"
+  ln -s "$ext" "$fx/.brain/dm/bravo/read" || { fail "fixture: could not symlink read/"; return 0; }
+  before_log=$(byte_size "$hooklog")
+
+  hook_context "$fx" bravo >/dev/null
+  hrc=$?
+  need_rc "$hrc" 0 "the boot must still succeed (a hook never blocks a session)" || return 0
+
+  need_tree_lacks "$ext" "readlink-XSYM4" \
+    "UR-2: a message body was moved THROUGH a symlinked read/ — the archive destination must be validated before every move"
+  [ "$(byte_size "$hooklog")" -gt "$before_log" ] \
+    || fail "a refused symlinked read/ must be reported to .brain/.hook-errors.log"
+  need_not_lost "$fx" bravo "readlink-XSYM4" "the message whose archive destination was refused"
+}
+
+# V.X/36 — the MESSAGE FILE. Seam `_dm_dir_ok`: "message files additionally -L-checked and
+# required regular (-f)", and the iteration guard is `[ -e ] || [ -L ] || continue` precisely so
+# "a broken symlink must be SEEN and refused, not silently skipped".
+#   PROVES     no dereference (external content never reaches the injected context), no promotion
+#              of the link into read/, and that BOTH a resolvable and a BROKEN symlink are
+#              reported rather than skipped.
+#   FIXTURE    these two entries are the ONLY hand-named queue files in the suite. Both names are
+#              given in the v1.2 grammar (no `.a<k>`), which makes the provenance of a GREEN
+#              result DIFFERENT before and after the rewrite — state it rather than paper over it:
+#                · Against the v1.1 engine this scenario passes for a WEAKER reason than it
+#                  claims. An earlier draft of this comment asserted that `_dm_dir_ok` refuses a
+#                  non-regular entry before any name parsing, so the spelling could not matter.
+#                  That is measurably FALSE here (watchdog m3): under v1.1 these names have no
+#                  `.a<k>`, so the NAME-GRAMMAR check rejects them and SHADOWS the symlink gate.
+#                  The entries are refused — just not by the limb this scenario is about.
+#                · At GREEN the names become valid, the grammar check stops firing, and the
+#                  symlink/non-regular gate is the only thing left that can refuse them. The
+#                  assertions below are load-bearing from that point on.
+#              Naming a v1.1-valid spelling instead would invert the problem (load-bearing now,
+#              shadowed after GREEN), and the suite is frozen for GREEN — so the v1.2 spelling is
+#              the right choice and this note is the honest accounting of what it costs today.
+sc_boot_refuses_symlinked_message_file() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  ext=$(dirname "$fx")/outside-msg
+  mkdir -p "$ext" || { fail "fixture: could not create the external target"; return 0; }
+  printf '{"from":"mallory","to":"bravo","ts":"x","content":"XSYMBODY-injected"}\n' > "$ext/secret.txt"
+  before_secret=$(byte_size "$ext/secret.txt")
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  run_brain "$fx" alpha dm @bravo "healthy-alongside"; rc=$?
+  need_rc "$rc" 0 "prerequisite: one healthy message" || return 0
+  pd=$(q_dir "$fx" bravo pending)
+  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
+  ln -s "$ext/secret.txt" "$pd/20260803T101500Z-424242" \
+    || { fail "fixture: could not plant the symlinked message"; return 0; }
+  ln -s "$ext/no-such-target" "$pd/20260803T101501Z-424243" \
+    || { fail "fixture: could not plant the broken symlink"; return 0; }
+  before_log=$(byte_size "$hooklog"); before_loglines=$(line_count "$hooklog")
+
+  ctx=$(hook_context "$fx" bravo)
+  hrc=$?
+  need_rc "$hrc" 0 "the boot must still succeed (a hook never blocks a session)" || return 0
+
+  need_str_lacks "$ctx" "XSYMBODY-injected" \
+    "UR-2: a symlinked message file was DEREFERENCED into the startup context — arbitrary external content reached the session"
+  need_dir_lacks_id "$(q_dir "$fx" bravo read)" "20260803T101500Z-424242" \
+    "a symlinked message must not be promoted into read/"
+  need_dir_lacks_id "$(q_dir "$fx" bravo read)" "20260803T101501Z-424243" \
+    "a BROKEN symlinked message must not be promoted into read/"
+  # BOTH planted entries must be reported, not just one. NAMES ARE THE PRIMARY GATE: it accepts a
+  # compliant CONSOLIDATED one-line warning that names both, and rejects a two-line warning about
+  # only one of them. A line-count floor does neither, so it is used ONLY as the fallback when
+  # the warnings name nothing.
+  # ⚠ DECLARED: in that unnamed fallback case, "one refusal that happens to span two lines" cannot
+  # be distinguished from "two refusals" by any observation available here. Naming the offending
+  # filename in the warning is what would close it. [F10a / R2-2]
+  added=$(( $(line_count "$hooklog") - before_loglines ))
+  [ "$(byte_size "$hooklog")" -gt "$before_log" ] \
+    || fail "the symlinked and BROKEN-symlinked entries must be SEEN and refused, not silently skipped — .brain/.hook-errors.log did not grow"
+  if grep -q '424242' "$hooklog" 2>/dev/null || grep -q '424243' "$hooklog" 2>/dev/null; then
+    need_file_has "$hooklog" "424242" "the symlinked entry must be named among the refusals"
+    need_file_has "$hooklog" "424243" "the BROKEN-symlinked entry must be named among the refusals"
+  else
+    [ "$added" -ge 2 ] \
+      || fail "the refusals name neither planted entry, so only the line count can be checked here: $added line(s) added, want >= 2 (one per refused entry). Naming the offending filename in the warning would make this exact"
+  fi
+  need_eq "$(byte_size "$ext/secret.txt")" "$before_secret" "the external target must be untouched"
+}
+
+# ══════════════════════════ V.T — presence + templates (guards, carried) ═════════════════
+
+# V.T/37 — a presence note with dialog_with: shows the open dialog in brain status.
+# Verified discriminating against a mutant that stops rendering dialog_with (V.T/38 correctly did
+# NOT flip against that same mutant — the pair is a control).
+# charlie is done → cmd_status never lists it, so any mention of 'charlie' in the output can
+# only come from alpha's dialog_with field.
+sc_status_surfaces_open_dialog() {
+  fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
+  write_presence "$fx" charlie "done" || fatal "fixture: could not rewrite charlie"
+  write_presence "$fx" alpha active charlie || fatal "fixture: could not rewrite alpha"
+
+  run_brain "$fx" alpha status
+  rc=$?
+  need_rc "$rc" 0 "brain status" || return 0
+
+  out=$(cat "$OUT")
+  need_str_has "$out" "charlie" "status must surface the dialog partner"
+  if ! printf '%s' "$out" | grep -qi 'dialog'; then
+    fail "status output never says 'dialog' — the open dialog is not surfaced as one"
+  fi
+}
+
+# V.T/38 — a note WITHOUT dialog_with renders unchanged (the field is genuinely optional).
+sc_status_unchanged_without_dialog() {
+  fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
+  write_presence "$fx" charlie "done" || fatal "fixture: could not rewrite charlie"
+
+  run_brain "$fx" alpha status
+  rc=$?
+  need_rc "$rc" 0 "brain status" || return 0
+
+  out=$(cat "$OUT")
+  need_str_has "$out" "alpha" "active lanes still listed"
+  need_str_has "$out" "bravo" "active lanes still listed"
+  need_str_lacks "$out" "charlie" "a done lane must stay unlisted"
+  if printf '%s' "$out" | grep -qi 'dialog'; then
+    fail "status invented dialog output for a vault with no dialog_with field"
+  fi
+}
+
+# V.T/39 — reconcile does not flag dialog_with as stealth-structural.
+sc_reconcile_accepts_dialog_field() {
+  fx=$(make_vault alpha bravo charlie) || fatal "fixture build failed"
+  write_presence "$fx" alpha active charlie || fatal "fixture: could not rewrite alpha"
+  need_file_has "$fx/.brain/presence/alpha.md" "dialog_with: charlie" "fixture carries the field" || return 0
+
+  run_brain "$fx" alpha reconcile --check
+  rc=$?
+  need_rc "$rc" 0 "brain reconcile --check with dialog_with present" || return 0
+  need_file_lacks "$ERR" "stealth" "reconcile warnings"
+  need_file_lacks "$ERR" "invalid" "reconcile warnings"
+}
+
+nav_matches() { grep -qiE -- "$1" "$NAV_SKILL" 2>/dev/null; }
+
+# Same, but newline-flattened so a match may span a wrapped sentence. Callers MUST bound the
+# gap (.{0,N}) — an unbounded .* over the flattened file degenerates into "both words appear
+# somewhere", which the pre-rewrite template already satisfies.
+nav_matches_near() { tr '\n' ' ' < "$NAV_SKILL" 2>/dev/null | grep -qiE -- "$1"; }
+file_matches_near() { tr '\n' ' ' < "$1" 2>/dev/null | grep -qiE -- "$2"; }
+
+# V.T/40 — the always-read skill must teach the mechanic lanes actually operate.
+#   ⚠ the negative limb targets the v1.0 sentence ("watch it for new JSON lines"). It is a
+#   WORDING check, not a contract: if a rewritten instruction legitimately trips it, challenge
+#   this assertion rather than contorting the template.
+sc_nav_skill_names_the_take_mechanic() {
+  need_file "$NAV_SKILL" "generic nav-standards template" || return 0
+  nav_matches 'brain dm|dm @' || fail "the always-read skill never mentions 'brain dm' — the fast tier is untaught"
+  nav_matches 'dm take' \
+    || fail "the always-read skill never mentions 'brain dm take' — lanes cannot consume a live-observed message, so UR-3 reopens at the protocol layer"
+  nav_matches 'pending' \
+    || fail "the always-read skill never mentions the pending/ queue — lanes have nothing concrete to arm on"
+  if nav_matches_near 'watch.{0,60}(new JSON|JSON line|jsonl)'; then
+    fail "the always-read skill still tells lanes to watch the inbox FILE for JSON lines — that storage contract is deleted (cmd_inbox prints the pending/ dir; activity means 'run brain dm take')"
+  fi
+}
+
+# V.T/41 — a fresh reader can state the three tiers and which one is the record.
+sc_nav_skill_states_tiers_and_record() {
+  need_file "$NAV_SKILL" "generic nav-standards template" || return 0
+  nav_matches 'brain dm|dm @|inbox' || fail "tier 1 (fast: dm → queue) is not named in the always-read skill"
+  nav_matches 'announce' || fail "tier 2 (everyone-eventually: announce → journal) is not named"
+  nav_matches 'connection' || fail "tier 3 (permanent: connections/ note) is not named"
+  # PHRASE-anchored, not proximity. A proximity check is demonstrably hollow here: the template
+  # ALSO contains "record it in the waiting-on connection note" and "a connections note recording
+  # what was contested", so 'connection' and 'record' sit within 10 characters of each other even
+  # when the load-bearing sentence has been gutted — measured against a mutant that rewrote
+  # "record is a connection note" to "home is a connection note", which every window from 80 down
+  # to 10 chars, and a same-physical-line variant, all failed to catch. [F2]
+  # Accepted phrasings (case-insensitive, wrap-tolerant): "[the] record is a|the connection[s]
+  # note" · "connection[s] note is a|the [durable] record". Widen this alternation if you reword
+  # it — do NOT loosen it back into a proximity match.
+  nav_matches_near '(the[[:space:]]+)?record[[:space:]]+is[[:space:]]+(a|the)[[:space:]]+connections?[[:space:]]+note|connections?[[:space:]]+note[[:space:]]+is[[:space:]]+(a|the)[[:space:]]+(durable[[:space:]]+)?record' \
+    || fail "nothing STATES that the connection note is the record — a reader cannot tell which tier is durable. Accepted phrasings: '[the] record is a|the connection[s] note' or 'connection[s] note is a|the [durable] record'. Merely mentioning both words near each other does NOT satisfy this (the template already does that twice while saying something else entirely)"
+}
+
+# V.T/42 — triage rules an agent must ACT on live in the always-read part.
+sc_nav_skill_carries_triage_rules() {
+  need_file "$NAV_SKILL" "generic nav-standards template" || return 0
+  # word-boundary the short form: a bare 'ack' substring also matches "track", so an
+  # unrelated "keep track of what lands" would green this gate with the ack rule missing
+  nav_matches '\back\b|acknowledg' || fail "the 'ack everything even when deferring' rule is absent"
+  nav_matches 'defer' || fail "the write-it-down-when-you-defer rule is absent"
+}
+
+# V.T/43 — UR-8. Both templates promised `announce` reaches every lane at its next boot;
+# _recent_journal surfaces only TODAY's last five lines naming the lane as author or explicit
+# @recipient, so a generic announcement is invisible to every other lane and nothing crossing a
+# date boundary matches at all. A doc-lie is worse than a missing feature, because lanes act on it.
+sc_no_false_announce_promise() {
+  need_file "$NAV_SKILL" "generic nav-standards template" || return 0
+  need_file "$DM_PROTOCOL" "DM-PROTOCOL template" || return 0
+  # instrument control: the flattener is looking at real content
+  file_matches_near "$DM_PROTOCOL" 'announce' \
+    || { fail "instrument check: DM-PROTOCOL.md does not mention announce at all"; return 0; }
+
+  # NB `next[[:space:]]+boot`, not a literal single space: both templates WRAP this sentence, so
+  # after flattening the words are separated by a newline-plus-indent run. A literal 'next boot'
+  # silently missed the live false promise in the nav skill — measured, not assumed.
+  if file_matches_near "$NAV_SKILL" '(everyone|every lane|all lanes).{0,40}next[[:space:]]+boot'; then
+    fail "UR-8: the nav skill still promises announce reaches everyone at their next boot — _recent_journal filters to today + explicit mentions, so that promise is false"
+  fi
+  if file_matches_near "$DM_PROTOCOL" '(everyone|every lane|all lanes).{0,40}(its[[:space:]]+)?next[[:space:]]+boot'; then
+    fail "UR-8: DM-PROTOCOL.md still promises announce reaches every lane at its next boot — narrow it to explicit mentions, today's journal"
+  fi
+}
+
+# V.T/44 — the always-read skill stays <= 80 lines (measure, don't estimate).
+sc_nav_skill_line_budget() {
+  need_file "$NAV_SKILL" "generic nav-standards template" || return 0
+  n=$(wc -l < "$NAV_SKILL" | tr -d ' \n')
+  [ "$n" -le 80 ] || fail "templates/navigation-standards.SKILL.md is $n lines (budget: 80)"
+}
+
+# V.T/45 — zero project-specific referents in the generic template.
+sc_nav_skill_no_erd_referents() {
+  need_file "$NAV_SKILL" "generic nav-standards template" || return 0
+  n=$(grep -cE 'AUTONOMOUS_WORK|\.brain/research' "$NAV_SKILL" 2>/dev/null || true)
+  [ -n "$n" ] || n=0
+  need_eq "$n" 0 "project-specific referents in the generic template"
+}
+
+# ══════════════════════════ V.N — NEW v1.2 behaviour (RED) ═══════════════════════════════
+#
+# Every scenario below pins something the v1.2 ruling introduces or changes. Authority is the
+# map's `# v1.2` section: the Delete list, the 8-item Must-survive checklist, "Poison, without a
+# counter", and the Suite-consequences Add list.
+#
+# All but ONE are RED against the v1.1 engine. The exception is V.N/51 (occupied archive
+# destination), which is labelled `guard` and says why in its own comment: must-survive #5 is a
+# PRESERVATION requirement the current engine already satisfies, so once it is narrowed to what
+# the map actually claims there is nothing left for v1.1 to fail. It stays in this section
+# because it is a v1.2 must-survive, not because it is red.
+
+# V.N/46 — the claim layer is GONE. Consume is `pending/ → validate → emit → read/`, with no
+# intermediate state and no name-embedded bookkeeping.
+#   PROVES     (a) a freshly sent file's name is a bare `<ts>-<pid>[-<n>]` — the `.a<k>` counter
+#              is deleted; (b) the archived name is the same id, still bare; (c) `claimed/` does
+#              not exist ANYWHERE in the lane after a full send→consume cycle.
+#   REJECTS    the whole v1.1 chain in one assertion set: an engine that keeps `claimed/` "just
+#              for safety", one that keeps the attempt counter as a cheap poison defence, and one
+#              that carries a claim stamp into the archive name.
+#   NOTE       (c) is checked against the LANE, not just after the take: `_dm_ensure_tree`
+#              creates every state directory up front, so a v1.1 engine fails here even if it
+#              never claims anything.
+sc_consume_has_no_claim_layer() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
+
+  run_brain "$fx" alpha dm @bravo "no-claim-layer-v12"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: send" || return 0
+  need_count "$pd" 1 "prerequisite: message queued" || return 0
+
+  queued=$(first_file "$pd")
+  need_v12_queue_name "$queued" "the name a fresh send mints in pending/"
+  id=$(msg_id_of "$queued")
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "brain dm take" || return 0
+  need_file_has "$OUT" "no-claim-layer-v12" "the message must be delivered (positive control)" || return 0
+
+  need_count "$pd" 0 "pending/ after a successful consume"
+  need_count "$rd" 1 "read/ after a successful consume" || return 0
+  archived=$(first_file "$rd")
+  need_v12_queue_name "$archived" "the name the consume path writes into read/"
+  need_eq "$(msg_id_of "$archived")" "$id" "the archived entry must carry the SAME id the send minted"
+
+  need_file_absent "$fx/.brain/dm/bravo/claimed" \
+    "the claimed/ state is DELETED by v1.2 — no lane directory may contain it (the ruling's head-of-chain: claim → hidden crash state → lease → invisible expiry → background sweeper → transition budget)"
+}
+
+# V.N/47 — must-survive #2, first limb: CRASH BEFORE EMIT. Stdout is closed, so emitting the
+# message cannot succeed. The message must still be in pending/ — not archived, not quarantined,
+# not parked in a hidden state — and the next boot must deliver it.
+#   REJECTS    any consume that moves a file out of pending/ before it has been emitted (v1.0's
+#              loss bug, and v1.1's claim-first ordering), and any that terminalises a message
+#              because its OUTPUT failed.
+sc_crash_before_emit_leaves_pending() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+
+  run_brain "$fx" alpha dm @bravo "crash-before-emit-v12"; rc=$?
+  need_rc "$rc" 0 "prerequisite: send" || return 0
+  need_count "$pd" 1 "prerequisite: message queued" || return 0
+
+  _brain_env_run - "$base/closed.err" "$fx" bravo dm take
+
+  need_count "$pd" 1 \
+    "pending/ after a take whose OUTPUT could not be written — must-survive #2: nothing leaves pending/ until it has been emitted"
+  need_tree_has "$pd" "crash-before-emit-v12" "the un-emitted message must still be the one sitting in pending/"
+  need_count "$rd" 0 "read/ after a failed emit — a message archived without being delivered is exactly UR-1's silent loss"
+  need_count "$fd" 0 "failed/ after a failed emit — an emit failure is not evidence that the message is structurally invalid"
+  need_file_absent "$fx/.brain/dm/bravo/claimed" "no hidden intermediate state may hold the un-emitted message"
+
+  # ...and it is delivered on the next boot, with no ageing, no sweeper and no lease to wait for.
+  ctx=$(hook_context "$fx" bravo)
+  hrc=$?
+  need_rc "$hrc" 0 "boot after the emit failure" || return 0
+  need_str_has "$ctx" "crash-before-emit-v12" \
+    "a message whose emit failed must be delivered by the very next boot (v1.2 has no lease to expire first)"
+  need_count "$pd" 0 "pending/ after the recovery boot"
+  need_count "$rd" 1 "read/ after the recovery boot"
+}
+
+# V.N/48 — must-survive #2, second limb: CRASH AFTER EMIT, BEFORE THE MOVE. read/ is made
+# read-only, so the archive rename gets EACCES after the digest has already been printed.
+#   PROVES     the emit really happened FIRST (the marker is on stdout), the message is NOT lost,
+#              it stays in pending/, and it therefore REPLAYS on the next consume.
+#   THE POINT  at-least-once is now a public contract: "duplicates acceptable". This scenario is
+#              where the suite says so — a second delivery of the same message is CORRECT here,
+#              not a double-consume defect. The v1.1 suite's Q.T/15 asserted the opposite and is
+#              retired.
+sc_crash_after_emit_before_move_replays() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
+
+  run_brain "$fx" alpha dm @bravo "crash-after-emit-v12"; rc=$?
+  need_rc "$rc" 0 "prerequisite: send" || return 0
+
+  make_readonly_dir "$rd"
+  mrc=$?
+  case "$mrc" in
+    0) ;;
+    2) fail "instrument blind: a rename into a 0500 directory still succeeds (running as root?)"; return 0 ;;
+    *) fail "fixture: could not make read/ read-only (rc=$mrc)"; return 0 ;;
+  esac
+  run_brain "$fx" bravo dm take
+  chmod 755 "$rd" 2>/dev/null || true       # restore BEFORE any early return
+
+  need_file_has "$OUT" "crash-after-emit-v12" \
+    "must-survive #2 is EMIT-before-move: the digest must reach stdout before the archive rename is attempted"
+  need_count "$rd" 0 "read/ after an archive rename that could not land"
+  need_count "$pd" 1 \
+    "pending/ after a failed archive rename — must-survive #2: 'rename failure leaves the source pending'"
+  need_tree_has "$pd" "crash-after-emit-v12" "the retained message must be the one whose move failed"
+  need_file_absent "$fx/.brain/dm/bravo/claimed" "no hidden intermediate state may hold the message"
+  # the engine's own diagnostics are prefixed "brain: " (_warn/_die); a bare mv error on stderr
+  # is a LEAK, not a report, and must not satisfy this. [F10b]
+  if [ -s "$ERR" ]; then
+    need_file_has "$ERR" "brain:" "a failed archive rename must be reported BY THE ENGINE (stderr carried output, but none of it was a 'brain: ' diagnostic — an unsuppressed mv error is a leak, not a report)"
+  else
+    fail "a failed archive rename must be reported (stderr was empty)"
+  fi
+
+  # AT-LEAST-ONCE: the same message is delivered AGAIN once the fault clears. That duplicate is
+  # the contract, not a defect.
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "second take after the fault cleared" || return 0
+  need_file_has "$OUT" "crash-after-emit-v12" \
+    "at-least-once: a message emitted but not archived must REPLAY on the next consume (duplicates are explicitly acceptable)"
+  need_count "$rd" 1 "read/ after the replay"
+  need_count "$pd" 0 "pending/ after the replay"
+}
+
+# V.N/49 — "Poison, without a counter". A file PROVEN structurally invalid against the wire
+# contract is quarantined; the valid peer beside it delivers in the SAME invocation.
+#   FIXTURE    the corrupted entry is whichever the consumer reaches FIRST (head of line).
+#   PROVES     quarantine happens (failed/ gains exactly the poison), it carries the poison's
+#              bytes, pending/ is drained, the healthy peer is archived, and NO attempt counter
+#              or retry bookkeeping appears in the quarantined name.
+#   DISPATCHER the quarantine directory is `failed/` — v1.1's name, kept as a minimal grammar
+#   DECISION   change. Ruled by the dispatcher for this pass.
+#   REJECTS    a consumer that leaves a structurally-invalid file cycling in pending/ forever
+#              (the redelivery loop the deleted poison cap existed to bound), one that discards
+#              it silently, and one that drops the healthy peer with it.
+sc_invalid_file_quarantined_valid_peer_delivers() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+
+  run_brain "$fx" alpha dm @bravo "quarantine-peer-a-v12"; rc=$?
+  need_rc "$rc" 0 "prerequisite: send #1" || return 0
+  run_brain "$fx" alpha dm @bravo "quarantine-peer-b-v12"; rc=$?
+  need_rc "$rc" 0 "prerequisite: send #2" || return 0
+  need_count "$pd" 2 "prerequisite: two peers queued" || return 0
+
+  victim=$(first_file "$pd") || { fail "pending/ is empty after two sends"; return 0; }
+  survivor="quarantine-peer-b-v12"
+  grep -qF -- "quarantine-peer-b-v12" "$victim" 2>/dev/null && survivor="quarantine-peer-a-v12"
+  printf '%s\n' '{structurally-invalid-v12' > "$victim" \
+    || { fail "fixture: could not corrupt the head entry"; return 0; }
+
+  run_brain "$fx" bravo dm take
+
+  need_file_has "$OUT" "$survivor" \
+    "the valid peer must deliver in the same invocation as the quarantined one (must-survive #3)"
+  need_count "$fd" 1 \
+    "failed/ after the consume — a file PROVEN structurally invalid against the wire contract must be quarantined, not left to redeliver forever"
+  need_tree_has "$fd" "structurally-invalid-v12" "the quarantined file must carry the offending bytes"
+  need_count "$rd" 1 "read/ — exactly the one valid peer is archived"
+  need_count "$pd" 0 "pending/ after the consume — neither entry may be left cycling"
+  q=$(first_file "$fd") || { fail "failed/ is empty"; return 0; }
+  case "${q##*/}" in
+    *.a[0-9]*) fail "the quarantined name '${q##*/}' carries a .a<k> attempt counter — v1.2 quarantines on proof, never on a retry count" ;;
+  esac
+}
+
+# V.N/50 — must-survive #4: "one 'process at most K entries' cap plus aggregate output caps. If
+# entries remain, the emitted context must explicitly instruct continuation — do not rely on a
+# new directory event firing."
+#   BOUND      45 entries are queued and at most DM_INJECT_MAX_LINES (40) may be delivered in one
+#              boot. K itself is NOT pinned — the map does not name it — only that a bound exists
+#              and does not exceed the surviving injection cap.
+#   LOSSLESS   every entry is accounted for across pending/ + read/ + failed/ afterwards.
+#   RESUMES    successive takes drain the remainder, so a bound is not starvation.
+#   CONTINUATION is checked with a NEGATIVE CONTROL: a second vault whose 3-entry backlog fits in
+#              one batch must NOT carry the phrase. Without that control the alternation could be
+#              satisfied by boilerplate every boot prints.
+sc_bounded_backlog_instructs_continuation() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+
+  seed=$(plant_message "$fx" bravo "backlog-seed-v12") \
+    || { fail "prerequisite: could not queue the seed message"; return 0; }
+  clone_queued "$seed" 44 "backlog-" || { fail "fixture: could not mint the backlog"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"backlog-00-marker"}' > "$seed" \
+    || { fail "fixture: could not rewrite the seed body"; return 0; }
+  need_count "$pd" 45 "prerequisite: 45 entries queued" || return 0
+
+  ctx=$(hook_context "$fx" bravo); hrc=$?
+  need_rc "$hrc" 0 "boot with a 45-entry backlog" || return 0
+
+  shown=0; i=0
+  while [ "$i" -le 44 ]; do
+    m=$(printf 'backlog-%02d-marker' "$i")
+    str_has "$ctx" "$m" && shown=$((shown + 1))
+    i=$((i + 1))
+  done
+  [ "$shown" -gt 0 ] || { fail "the boot injected NONE of the 45 queued entries"; return 0; }
+  [ "$shown" -le "$DM_INJECT_MAX_LINES" ] \
+    || fail "the boot delivered $shown of 45 entries — DM_INJECT_MAX_LINES ($DM_INJECT_MAX_LINES) is the surviving aggregate bound, so anything above it means no batch cap is applied"
+  [ "$(count_files "$pd")" -gt 0 ] \
+    || fail "instrument check: nothing remained pending after the bounded boot, so the continuation limb below would be vacuous — raise the fixture backlog above the engine's batch cap"
+
+  total=$(( $(count_files "$pd") + $(count_files "$rd") + $(count_files "$fd") ))
+  need_eq "$total" 45 "entries accounted for across pending/ + read/ + failed/ — bounding the BATCH must never destroy a MESSAGE"
+
+  continuation_signal "$ctx" \
+    || fail "must-survive #4: $(count_files "$pd") entr(y|ies) are still queued, and the emitted context does not instruct the lane to continue — the design explicitly forbids relying on a new directory event firing"
+
+  # NEGATIVE CONTROL: a backlog that fits in one batch must NOT carry the continuation phrase.
+  fx2=$(make_vault alpha bravo) || fatal "control fixture build failed"
+  seed2=$(plant_message "$fx2" bravo "control-seed-v12") \
+    || { fail "control: could not queue the seed message"; return 0; }
+  clone_queued "$seed2" 2 "control-" || { fail "control: could not mint the small backlog"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"control-00-marker"}' > "$seed2" \
+    || { fail "control: could not rewrite the seed body"; return 0; }
+  ctx2=$(hook_context "$fx2" bravo); hrc=$?
+  need_rc "$hrc" 0 "control boot with a 3-entry backlog" || return 0
+  need_str_has "$ctx2" "control-00-marker" "control: the small backlog really was delivered"
+  need_count "$(q_dir "$fx2" bravo pending)" 0 "control: a 3-entry backlog must drain in one boot" || return 0
+  if continuation_signal "$ctx2"; then
+    fail "instrument check: the continuation phrase is present when NOTHING remains queued — it is matching boot boilerplate, so the positive limb above proves nothing. Tighten continuation_signal()"
+  fi
+
+  # RESUMES: a bound must not starve the tail. The invocation budget is 50, not "45 / expected K":
+  # K is not pinned by the map, and the loop exits as soon as pending/ empties, so a generous
+  # budget costs nothing on a correct engine while refusing to false-reject a small batch cap.
+  used=$(drain_takes "$fx" bravo 50)
+  need_count "$pd" 0 "pending/ after $used follow-up take(s) — a bounded batch must resume, not starve"
+  need_count "$rd" 45 "read/ after the backlog drains — every entry delivered and archived"
+  need_count "$fd" 0 "failed/ after the backlog drains — no valid entry may be quarantined"
+}
+
+# V.N/51 — must-survive #5: "never a blind `mv -f` into read/; an occupied archive destination
+# must not overwrite an earlier transcript."
+#
+#   ⚠ THIS IS A GUARD, NOT A RED — and that is the honest disposition, not a concession.
+#   Must-survive #5 is a PRESERVATION requirement: the map lists it under "do not lose these in
+#   the simplification", and `_dm_ack` already refuses an occupied destination today. Once the
+#   claim is narrowed to what #5 actually says (below), there is nothing left for the v1.1 engine
+#   to fail. Its at-GREEN provenance: the archive NAME changes with the grammar, so this is what
+#   catches a rewrite that reaches for a blind `command mv -f` while re-plumbing the move.
+#
+#   NARROWED per dispatcher ruling. The first draft also asserted `read/ == 1` and `pending/ == 1`,
+#   which pinned ONE of two legal outcomes: the map permits a bumped-name archive (the house
+#   `_dm_failed_dest` idiom) just as much as retain-in-pending, and a count assertion silently
+#   outlawed the former. Only #5's two real claims are asserted now.
+#
+#   FIXTURE    no hand-built sentinel and no assumption about how an id maps to an archive name:
+#              a real send is really consumed, so the ENGINE mints the archive entry, and the
+#              second message is then queued under that exact basename. That is a genuine
+#              destination collision under v1.1's `<id>.a<k>` and v1.2's bare `<id>` alike.
+#   PROVES     the earlier transcript survives BYTE-INTACT, and the colliding arrival is not lost.
+#   REJECTS    `command mv -f` into read/ (the earlier transcript's bytes would be gone).
+sc_occupied_read_destination_preserved() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
+
+  # 1. a real send, really consumed — the archive entry is a genuine earlier transcript whose
+  #    name the ENGINE chose, so nothing here encodes a filename grammar.
+  run_brain "$fx" alpha dm @bravo "earlier-transcript-v12"; rc=$?
+  need_rc "$rc" 0 "prerequisite: first send" || return 0
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: first consume" || return 0
+  need_count "$rd" 1 "prerequisite: the first transcript is archived" || return 0
+  archived=$(first_file "$rd") || { fail "read/ is empty after the first consume"; return 0; }
+  before_bytes=$(byte_size "$archived")
+
+  # 2. queue a SECOND message under the name the archive already holds.
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"colliding-arrival-v12"}' \
+    > "$pd/${archived##*/}" \
+    || { fail "fixture: could not queue the colliding arrival"; return 0; }
+  need_count "$pd" 1 "prerequisite: the colliding arrival is queued" || return 0
+
+  run_brain "$fx" bravo dm take
+
+  need_file_has "$archived" "earlier-transcript-v12" \
+    "must-survive #5: the earlier transcript at the occupied archive destination was OVERWRITTEN — never a blind mv -f into read/"
+  need_eq "$(byte_size "$archived")" "$before_bytes" \
+    "the earlier transcript must be BYTE-INTACT, not merely still present"
+  need_not_lost "$fx" bravo "colliding-arrival-v12" \
+    "the arrival whose archive destination was occupied (retained pending or archived under a bumped name are BOTH legal)"
+}
+
+# V.N/52 — must-survive #8: "Expose the message id in the digest — if duplicates are a public
+# contract, the receiving agent needs to recognise a replay. Currently only from/to/ts/content
+# are rendered."
+#   ASSERTION  the id appears in the emitted output. The RENDERING is deliberately not pinned —
+#              a fifth JSON key, a prefix, a trailing comment all satisfy it (which is why the
+#              V.W guards no longer assert an exact key set).
+#   NOT A      the id (`<ts>-<pid>`) shares no substring with the ISO-8601 `ts` field, so this
+#   COINCIDENCE cannot pass by accident on today's four-field record.
+#   ALSO       the id the receiver sees must be the id the sender minted AND the one the archive
+#              keeps — otherwise "recognise a replay" is unusable across the duplicate.
+sc_message_id_exposed_in_digest() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
+
+  run_brain "$fx" alpha dm @bravo "id-in-digest-v12"; rc=$?
+  need_rc "$rc" 0 "prerequisite: send" || return 0
+  queued=$(first_file "$pd") || { fail "pending/ is empty after the send"; return 0; }
+  id=$(msg_id_of "$queued")
+  [ -n "$id" ] || { fail "could not read the minted message id from ${queued##*/}"; return 0; }
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "brain dm take" || return 0
+  need_file_has "$OUT" "id-in-digest-v12" "the message must be delivered (positive control)" || return 0
+
+  need_file_has "$OUT" "$id" \
+    "must-survive #8: the emitted digest does not carry the message id '$id' — with at-least-once delivery a public contract, the receiving agent has no way to recognise a replay"
+  need_dir_has_id "$rd" "$id" "the archived entry must keep the same id the digest exposed"
+}
+
+# V.N/53 — "Poison, without a counter", the global-failure limb: "preflight global dependencies
+# once — a global failure leaves everything pending; quarantine only a file proven structurally
+# invalid; leave valid messages retryable indefinitely."
+#   INSTRUMENT a PATH shim that makes `jq` fail for every invocation. jq is the engine's wire
+#              validator, so without a preflight EVERY healthy message looks structurally invalid
+#              and gets terminalised wholesale — the exact fault the ruling names ("a GLOBAL
+#              failure (e.g. an incompatible jq) would terminalise healthy messages wholesale").
+#   PATH is saved and restored around the run, and restored BEFORE any early return: a leaked
+#   broken-jq PATH would silently break every later scenario in this file.
+#   PROVES     nothing is quarantined, nothing is archived, everything stays in pending/, and the
+#              messages are still deliverable once the dependency is healthy again (retryable
+#              indefinitely).
+sc_global_dependency_failure_leaves_everything_pending() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+
+  run_brain "$fx" alpha dm @bravo "global-dep-a-v12"; rc=$?
+  need_rc "$rc" 0 "prerequisite: send #1" || return 0
+  run_brain "$fx" alpha dm @bravo "global-dep-b-v12"; rc=$?
+  need_rc "$rc" 0 "prerequisite: send #2" || return 0
+  need_count "$pd" 2 "prerequisite: two healthy messages queued" || return 0
+
+  shim_dir="$base/broken-jq-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the shim directory"; return 0; }
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'printf "jq: simulated global dependency failure\\n" >&2\n'
+    printf 'exit 3\n'
+  } > "$shim_dir/jq"
+  chmod +x "$shim_dir/jq" || { fail "fixture: could not make the broken jq shim executable"; return 0; }
+
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  run_brain "$fx" bravo dm take
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  # Instrument controls, both directions:
+  #   · the shim ENGAGED — proven by `read/ == 0` below: with a working jq the engine would have
+  #     digested and archived both messages, so a blind shim would fail that assertion, not pass it.
+  #   · the shim is GONE — checked here, because a leaked broken-jq PATH would silently poison
+  #     every scenario that runs after this one.
+  jq -e -n '1' >/dev/null 2>&1 \
+    || { fail "instrument leak: the broken-jq shim is STILL on PATH after the restore — every later scenario in this file would be poisoned by it"; return 0; }
+
+  need_count "$fd" 0 \
+    "failed/ after a GLOBAL dependency failure — a broken jq is not proof that any individual message is structurally invalid, and quarantining on it terminalises healthy mail wholesale"
+  need_count "$rd" 0 "read/ after a global dependency failure — nothing was validly emitted, so nothing may be archived"
+  need_count "$pd" 2 \
+    "pending/ after a global dependency failure — the ruling requires a global failure to leave EVERYTHING pending"
+  need_tree_has "$pd" "global-dep-a-v12" "message #1 must still be queued"
+  need_tree_has "$pd" "global-dep-b-v12" "message #2 must still be queued"
+  need_file_absent "$fx/.brain/dm/bravo/claimed" "no hidden intermediate state may hold the messages"
+
+  # retryable indefinitely: once the dependency is healthy, the same take delivers both.
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "take after the dependency is healthy again" || return 0
+  need_file_has "$OUT" "global-dep-a-v12" "message #1 must deliver once jq works again (valid messages are retryable indefinitely)"
+  need_file_has "$OUT" "global-dep-b-v12" "message #2 must deliver once jq works again"
+  need_count "$rd" 2 "read/ after the retry"
+  need_count "$pd" 0 "pending/ after the retry"
+}
+
+# V.N/54 — the quarantine destination gets the same collision protection as the archive. Two
+# structurally-invalid arrivals can map to the same `failed/` name (v1.1's `_dm_route_failed`
+# already reserves a bumped `.collision-<ts>-<pid>` spelling for exactly this), and an earlier
+# forensic record is the ONLY evidence of a message that was already thrown away once.
+#   FIXTURE    the quarantine destination is pre-occupied under the name the ENGINE minted for the
+#              pending entry, so the collision is real under either filename grammar.
+#   PROVES     the earlier forensic record survives BYTE-INTACT, and the new arrival still reaches
+#              failed/ — i.e. the collision is resolved by BUMPING, not by clobbering and not by
+#              refusing forever (a structurally-invalid file left cycling in pending/ is the
+#              redelivery loop the deleted poison cap existed to bound).
+#   RED        against v1.1 for one reason: v1.1 never quarantines a structurally-invalid file at
+#              all, so nothing arrives to collide. The earlier-record limb passes trivially today
+#              and becomes load-bearing the moment V.N/49's quarantine lands.
+#   DECLARED GAP: only the REGULAR-FILE collision kind is covered. The v1.1 suite also drove
+#              directory- and symlink-occupied destinations (retired U.H4/53); those need a
+#              non-regular entry planted inside a queue state directory, which the consumer-
+#              boundary scenarios (V.X/36) already prove is refused wholesale. Not claimed here.
+sc_failed_dest_collision_preserves_record() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); fd=$(q_dir "$fx" bravo failed)
+
+  planted=$(plant_message "$fx" bravo "quarantine-collision-seed-v12") \
+    || { fail "prerequisite: could not queue the seed message"; return 0; }
+  name=${planted##*/}
+  printf '%s\n' '{invalid-colliding-quarantine-v12' > "$planted" \
+    || { fail "fixture: could not corrupt the queued entry"; return 0; }
+
+  mkdir -p "$fd" || { fail "fixture: could not create failed/"; return 0; }
+  printf 'EARLIER-FORENSIC-RECORD-v12\n' > "$fd/$name" \
+    || { fail "fixture: could not pre-occupy the quarantine destination"; return 0; }
+  before_bytes=$(byte_size "$fd/$name")
+
+  run_brain "$fx" bravo dm take
+
+  need_file_has "$fd/$name" "EARLIER-FORENSIC-RECORD-v12" \
+    "an occupied quarantine destination was OVERWRITTEN — the earlier forensic record is the only evidence of a message already discarded once"
+  need_eq "$(byte_size "$fd/$name")" "$before_bytes" \
+    "the earlier forensic record must be BYTE-INTACT, not merely still present"
+  need_tree_has "$fd" "invalid-colliding-quarantine-v12" \
+    "the newly quarantined arrival must still reach failed/ under a bumped name — a collision must not leave a structurally-invalid file cycling in pending/ forever"
+  need_not_lost "$fx" bravo "invalid-colliding-quarantine-v12" "the colliding quarantine arrival"
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
-printf 'brain lane-DM v1.1 queue RED suite\n'
+printf 'brain lane-DM v1.2 RED suite (claim layer deleted)\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
 printf '  scratch: %s\n\n' "$SUITE_TMP"
 
-scenario red   "Q.S/1   inbox-prints-pending-dir"           sc_inbox_prints_pending_dir
-scenario red   "Q.S/1b  usage-lists-dm-inbox-and-take"      sc_usage_lists_dm_inbox_and_take
-scenario red   "Q.S/2   send-writes-one-message-file"       sc_send_writes_one_message_file
-scenario red   "Q.S/2b  rapid-sends-stay-distinct"          sc_rapid_sends_stay_distinct
-scenario guard "Q.S/2c  over-cap-body-refused"               sc_over_cap_body_refused
-scenario red   "Q.S/3   UR9-json-special-round-trip"        sc_ur9_json_special_body_round_trip
-scenario red   "Q.S/4   dm-journals-pointer-not-body"       sc_dm_journals_pointer_not_body
-scenario guard "Q.S/5   UR10-journal-body-independent"      sc_ur10_journal_body_independent
-scenario red   "Q.S/6   dm-secret-body-never-journalled"    sc_dm_secret_body_never_journalled
-scenario red   "Q.S/7   dm-all-broadcasts-not-to-self"      sc_dm_all_broadcasts_not_to_self
-scenario guard "Q.S/8   dm-unknown-recipient-fails-clean"   sc_dm_unknown_recipient_fails_clean
-scenario guard "Q.S/9   dm-self-send-refused"               sc_dm_self_send_refused
-scenario guard "Q.S/10a init-gitignores-dm-queue"           sc_init_gitignores_dm_queue
-scenario red   "Q.S/10b queue-files-stay-out-of-git-status" sc_queue_files_stay_out_of_git_status
-scenario red   "Q.S/11  dm-takes-no-lock"                   sc_dm_takes_no_lock
+scenario guard "V.S/1   inbox-prints-pending-dir"            sc_inbox_prints_pending_dir
+scenario guard "V.S/2   usage-lists-dm-and-take"             sc_usage_lists_dm_and_take
+scenario guard "V.S/3   send-writes-one-message-file"        sc_send_writes_one_message_file
+scenario guard "V.S/4   rapid-sends-stay-distinct"           sc_rapid_sends_stay_distinct
+scenario guard "V.S/5   over-cap-body-refused"               sc_over_cap_body_refused
+scenario guard "V.S/6   json-special-body-round-trip"        sc_json_special_body_round_trip
+scenario guard "V.S/7   dm-journals-pointer-not-body"        sc_dm_journals_pointer_not_body
+scenario guard "V.S/8   journal-body-independent"            sc_journal_body_independent
+scenario guard "V.S/9   secret-body-never-journalled"        sc_dm_secret_body_never_journalled
+scenario guard "V.S/10  dm-all-broadcasts-not-to-self"       sc_dm_all_broadcasts_not_to_self
+scenario guard "V.S/11  unknown-recipient-fails-clean"       sc_dm_unknown_recipient_fails_clean
+scenario guard "V.S/12  self-send-refused"                   sc_dm_self_send_refused
+scenario guard "V.S/13  init-gitignores-dm-queue"            sc_init_gitignores_dm_queue
+scenario guard "V.S/14  queue-files-stay-out-of-git-status"  sc_queue_files_stay_out_of_git_status
+scenario guard "V.S/15  dm-takes-no-lock"                    sc_dm_takes_no_lock
+scenario guard "V.S/16  dot-temp-invisible-to-readers"       sc_dot_temp_invisible_to_readers
 
-scenario red   "Q.T/12  take-claims-prints-acks"            sc_take_claims_prints_acks
-scenario red   "Q.T/13  UR3-take-then-boot-no-replay"       sc_ur3_take_then_boot_no_replay
-scenario red   "Q.T/14  take-empty-is-silent-zero"          sc_take_empty_is_silent_zero
-scenario red   "Q.T/15  two-consumers-disjoint"             sc_two_consumers_disjoint
+scenario guard "V.C/17  take-emits-and-archives"             sc_take_emits_and_archives
+scenario guard "V.C/18  take-then-boot-no-replay"            sc_take_then_boot_no_replay
+scenario guard "V.C/19  take-empty-is-silent-zero"           sc_take_empty_is_silent_zero
+scenario guard "V.C/20  boot-delivers-offline-backlog"       sc_boot_delivers_offline_backlog
+scenario guard "V.C/21  boot-no-replay-across-boots"         sc_boot_no_replay_across_boots
+scenario guard "V.C/22  boot-arms-pending-and-take"          sc_boot_arms_pending_and_take
+scenario guard "V.C/23  space-path-round-trip"               sc_space_path_round_trip
+scenario guard "V.C/24  main-worktree-engine-from-sibling"   sc_deploy_instruction_uses_main_worktree_engine
 
-scenario red   "Q.B/16  boot-delivers-and-acks-per-message" sc_boot_delivers_and_acks_per_message
-scenario red   "Q.B/17  boot-delivers-exactly-once"         sc_boot_delivers_exactly_once
-scenario red   "Q.B/18  boot-arms-pending-and-take"         sc_boot_arms_pending_and_take
-scenario red   "Q.B/19  pending-emptied-only-by-claims"     sc_pending_emptied_only_by_successful_claims
+scenario guard "V.W/25  multi-object-file-refused"           sc_multi_object_file_refused
+scenario guard "V.W/26  extra-field-stripped"                sc_extra_field_stripped
+scenario guard "V.W/27  oversized-from-bounded"              sc_oversized_from_bounded
+scenario guard "V.W/28  multibyte-digest-byte-caps"          sc_multibyte_digest_respects_byte_caps
+scenario guard "V.W/29  digest-truncates-content-not-json"   sc_digest_truncates_content_not_json
+scenario guard "V.W/30  malformed-peer-does-not-suppress"    sc_malformed_peer_does_not_suppress_valid
+scenario guard "V.W/31  status-surfaces-quarantined-dms"     sc_status_surfaces_quarantined_dms
 
-scenario red   "Q.R/20  UR1-stale-claim-recovered"          sc_ur1_stale_claim_recovered
-scenario red   "Q.R/21  fresh-claim-not-stolen"             sc_fresh_claim_not_stolen
-scenario red   "Q.R/22  poison-cap-routes-to-failed"        sc_poison_cap_routes_to_failed
-scenario red   "Q.R/22b poison-cap-boundary-delivers"       sc_poison_cap_boundary_delivers
-scenario red   "Q.R/24  delivery-failure-never-retires"     sc_delivery_failure_never_retires
-scenario red   "Q.R/25  stale-temp-purged-fresh-kept"       sc_stale_temp_purged_fresh_kept
+scenario guard "V.X/32  send-refuses-symlinked-dm-root"      sc_send_refuses_symlinked_dm_root
+scenario guard "V.X/33  send-refuses-symlinked-lane-dir"     sc_send_refuses_symlinked_lane_dir
+scenario guard "V.X/34  send-refuses-symlinked-pending"      sc_send_refuses_symlinked_pending_dir
+scenario guard "V.X/35  boot-refuses-symlinked-read-dir"     sc_boot_refuses_symlinked_read_dir
+scenario guard "V.X/36  boot-refuses-symlinked-message"      sc_boot_refuses_symlinked_message_file
 
-scenario red   "Q.X/26  send-refuses-symlinked-dm-root"     sc_send_refuses_symlinked_dm_root
-scenario red   "Q.X/27  send-refuses-symlinked-lane-dir"    sc_send_refuses_symlinked_lane_dir
-scenario red   "Q.X/28  send-refuses-symlinked-pending"     sc_send_refuses_symlinked_pending_dir
-scenario red   "Q.X/29  boot-refuses-symlinked-read-dir"    sc_boot_refuses_symlinked_read_dir
-scenario red   "Q.X/30  boot-refuses-symlinked-message"     sc_boot_refuses_symlinked_message_file
+scenario guard "V.T/37  status-surfaces-open-dialog"         sc_status_surfaces_open_dialog
+scenario guard "V.T/38  status-unchanged-without-dialog"     sc_status_unchanged_without_dialog
+scenario guard "V.T/39  reconcile-accepts-dialog-field"      sc_reconcile_accepts_dialog_field
+scenario guard "V.T/40  nav-skill-names-the-take-mechanic"   sc_nav_skill_names_the_take_mechanic
+scenario guard "V.T/41  nav-skill-states-tiers-and-record"   sc_nav_skill_states_tiers_and_record
+scenario guard "V.T/42  nav-skill-carries-triage-rules"      sc_nav_skill_carries_triage_rules
+scenario guard "V.T/43  no-false-announce-promise"           sc_no_false_announce_promise
+scenario guard "V.T/44  nav-skill-line-budget"               sc_nav_skill_line_budget
+scenario guard "V.T/45  nav-skill-no-erd-referents"          sc_nav_skill_no_erd_referents
 
-scenario red   "Q.D/31  digest-bounded-and-lossless"        sc_digest_bounded_and_lossless
-scenario red   "Q.D/32  digest-truncates-content-not-json"  sc_digest_truncates_content_not_json
-
-scenario guard "4.G/33  status-surfaces-open-dialog"        sc_status_surfaces_open_dialog
-scenario guard "4.G/34  status-unchanged-without-dialog"    sc_status_unchanged_without_dialog
-scenario guard "4.G/35  reconcile-accepts-dialog-field"     sc_reconcile_accepts_dialog_field
-
-scenario red   "3.G/36  nav-skill-names-the-take-mechanic"  sc_nav_skill_names_the_take_mechanic
-scenario guard "3.G/37  nav-skill-states-tiers-and-record"  sc_nav_skill_states_tiers_and_record
-scenario guard "3.G/38  nav-skill-carries-triage-rules"     sc_nav_skill_carries_triage_rules
-scenario red   "3.G/39  UR8-no-false-announce-promise"      sc_ur8_no_false_announce_promise
-scenario guard "3.G/40  nav-skill-line-budget"              sc_nav_skill_line_budget
-scenario guard "3.G/41  nav-skill-no-erd-referents"         sc_nav_skill_no_erd_referents
-
-scenario red   "F.H1/42 space-path-round-trip"              sc_h1_space_path_round_trip
-scenario red   "F.H2/43 multi-object-file-refused"          sc_h2_multi_object_file_refused
-scenario red   "F.H2/44 extra-field-stripped"               sc_h2_extra_field_stripped
-scenario red   "F.H2/45 oversized-from-bounded"             sc_h2_oversized_from_bounded
-scenario red   "F.H3/46 leading-zero-claim-survives-boot"   sc_h3_leading_zero_claim_survives_boot
-scenario red   "F.H3/47 overrange-attempt-routes-failed"    sc_h3_overrange_attempt_routes_failed
-scenario red   "F.H4/48 disappeared-claim-ack-is-soft"      sc_h4_disappeared_claim_ack_is_soft
-scenario red   "F.H5/49 claim-batch-bounded-and-fair"       sc_h5_claim_batch_bounded_and_fair
-scenario red   "D.P1/50 main-worktree-engine-from-sibling"  sc_deploy_instruction_uses_main_worktree_engine
-scenario red   "U.H2/51 poison-isolated-from-healthy-peers"  sc_poison_file_does_not_discard_healthy_batchmates
-scenario red   "U.H3/52 lease-expiry-arms-recovery"          sc_fresh_claim_arms_recovery_at_lease_expiry
-scenario red   "U.H4/53 queue-destination-collisions"       sc_queue_destination_collisions_preserve_every_message
-scenario red   "U.H5/54 overlong-id-does-not-head-block"    sc_overlong_id_routes_failed_without_blocking_later_message
-scenario red   "U.H6/55 one-total-transition-budget"        sc_one_transition_budget_spans_recovery_routing_and_claiming
-scenario red   "U.M1/56 multibyte-digest-byte-caps"         sc_multibyte_digest_respects_byte_caps
+scenario red   "V.N/46  consume-has-no-claim-layer"          sc_consume_has_no_claim_layer
+scenario red   "V.N/47  crash-before-emit-leaves-pending"    sc_crash_before_emit_leaves_pending
+scenario red   "V.N/48  crash-after-emit-before-move"        sc_crash_after_emit_before_move_replays
+scenario red   "V.N/49  invalid-file-quarantined"            sc_invalid_file_quarantined_valid_peer_delivers
+scenario red   "V.N/50  bounded-backlog-continuation"        sc_bounded_backlog_instructs_continuation
+scenario guard "V.N/51  occupied-read-dest-preserved"        sc_occupied_read_destination_preserved
+scenario red   "V.N/52  message-id-exposed-in-digest"        sc_message_id_exposed_in_digest
+scenario red   "V.N/53  global-dep-failure-leaves-pending"   sc_global_dependency_failure_leaves_everything_pending
+scenario red   "V.N/54  failed-dest-collision-preserves"     sc_failed_dest_collision_preserves_record
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'
