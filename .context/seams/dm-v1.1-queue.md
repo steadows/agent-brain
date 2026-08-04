@@ -268,10 +268,24 @@ archive-name recipe and its comment block · `_inbox_ensure`'s append-creation s
      `chore(brain): sync coordination vault`. **Measured by the audit: four independent candidate
      fixes — including the ultrareview's own temp-index sketch and the RED author's prototype —
      all did exactly this and still scored 12/12** before the path-scoping assertion existed.
-  The shape that satisfies all three: seed a temp index from **HEAD**, stage only `.brain` paths
+  4. **The real index must agree with the new HEAD for `.brain` afterward** (added 2026-08-04,
+     round 2 — this constraint was discovered *because* the fix for (3) broke it). The temp-index
+     shape leaves the real index holding the PRE-sync `.brain` state while HEAD moves forward, so
+     the just-synced files read as **staged deletions** against the new HEAD — and the developer's
+     next ordinary `git commit -a` silently reverts the vault sync it just made. Measured: today's
+     engine leaves `git status` clean and the marker survives; the temp-index prototype leaves
+     `D .brain/research/marker.md` staged and the next `git commit -a` empties it. Today's engine
+     avoids this only as a side effect of the pathspec form updating those index entries.
+     **A commit the next git command undoes is not durability**, which is `cmd_commit`'s whole
+     contract. Pin: after a successful commit, `git diff --cached --quiet HEAD -- .brain`.
+  The shape that satisfies (1)-(3): seed a temp index from **HEAD**, stage only `.brain` paths
   into it (DM entries excluded), then `write-tree` → `commit-tree` → `update-ref`, leaving the
   real index untouched. This is NOT the same as seeding the temp index from the CURRENT index —
-  that is precisely what swept the unrelated work.
+  that is precisely what swept the unrelated work. **But it does not satisfy (4) on its own**: the
+  implementation must additionally reconcile the real index's `.brain` entries with the new HEAD
+  (e.g. `git read-tree` the committed `.brain` paths back into the real index) WITHOUT disturbing
+  any other staged path. Verify against both limbs — unrelated staged work absent from the commit,
+  AND `git status` clean for `.brain` after it.
 - **UR-4b:** replace the `grep -qxF 'dm/'` ignore check with `git check-ignore --no-index`.
   **Audit note:** a fixed-string grep that special-cases the fixture (`grep 'dm/' && ! grep '!dm/'`)
   scores 12/12 — the negation spelling is the only discriminating axis, and `!dm/`, `!/dm/` and
