@@ -79,6 +79,18 @@ not optional polish):
   `git rm --cached` stages a deletion that the guard's own final check reads as failure — and no
   retry can clear it. Build and scan a sanitized temporary index; commit that, without pathspec
   semantics. Test legacy-tracked inbox and repeated `brain commit`.
+- **A poison message must not loop forever** (added 2026-08-03 from the prior-art research —
+  at-least-once + automatic stale-claim recovery is an infinite redelivery loop for any message
+  whose processing kills its consumer). Delivery-attempt counter in the filename grammar; after
+  3 failed deliveries the message routes to a terminal `failed/` directory, surfaced in
+  `brain status`, never auto-deleted. Adopted now because it changes the name grammar the
+  reopened suite pins.
+- **Durability claims stay honest**: the queue is robust against process death (the realistic
+  failure mode), NOT against power loss — `sh` cannot `fsync`. Docs say "process-crash-safe."
+
+**Design authority:** the full seam map — layout, name grammar, lifecycle contracts, prior-art
+citations (maildir/dirq/SQS), and the discarded alternatives — is at
+`.context/seams/dm-v1.1-queue.md` (local, per-worktree). RED tests pin THAT contract.
 
 ## Decisions recorded (won't-do / deferred-by-design)
 
