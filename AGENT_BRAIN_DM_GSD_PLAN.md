@@ -464,6 +464,27 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
       `test -f <main>/.brain/templates/DM-PROTOCOL.md`.
 - `[!]` 5.4 **Never run `brain init --force`** — it unconditionally overwrites `.gitignore` and
       `INDEX.md`, and the deployed `.gitignore` is a hand-commented variant that would be clobbered
+- `[ ]` 5.5 **Restart-and-ack gate — DM is NOT live until every active lane has restarted**
+      (ultrareview UR-6). The atomic swap replaces the engine, but inbox creation and the
+      watch instruction happen only at **SessionStart** — a session already running under the old
+      engine is never re-armed, so a DM to it queues silently until its next boot. That defeats the
+      seconds-latency promise during the one window everyone is most likely to use it (the cutover).
+      **Do this, in order:** (a) after 5.3, announce the cutover in the journal; (b) require every
+      active lane to restart its session; (c) collect an explicit ack per lane — the natural probe is
+      each lane running `brain inbox` and reporting the `pending/` path, which only the new engine
+      prints; (d) only then declare DM live and tell lanes to start using it. A lane that cannot
+      restart is NOT reachable by DM — say so rather than assuming.
+- `[ ]` 5.6 **Rollback runbook — drain before downgrading** (ultrareview UR-5). The new engine is
+      the only consumer of `dm/<lane>/pending|claimed`; rolling `bin/brain` back to a pre-DM build
+      strands every queued message permanently (the old engine has no queue reader, and a broadcast
+      call-log line names only `@all`, which matches no recipient's journal filter). **Before any
+      engine rollback:** (a) confirm every lane's `pending/` and `claimed/` are empty
+      (`brain dm take` on each, or inspect the dirs) — a non-empty queue means STOP or accept
+      documented loss; (b) keep `dm/` in `.brain/.gitignore` **permanently** — it is a
+      forward-compatible invariant, and restoring an older `.gitignore` alongside an older engine
+      re-opens the path where DM bodies get staged and the line-anchored secret scan cannot see
+      them; (c) note that `read/` and `failed/` archives are inert under the old engine — they are
+      safe to leave in place.
 
 ## Phase 6 — End-to-end verification `[ ]` (two real lanes — the method used throughout E0–E15)
 
@@ -487,6 +508,13 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
 - `[ ]` 6.5 Convergence writes a `connections/` note recording the contested point
 - `[ ]` 6.6 `git status` in the **real main worktree** (`<main>/`, not the scratch fixtures 6.1 uses)
       shows no `.brain/dm/` churn, and `git log -p` on the journal shows no DM body
+- `[ ]` 6.7 **Queue-lifecycle e2e (v1.1) — the crash window, live.** The unit suite proves it with
+      hand-minted claims; prove it once with real sessions. (a) DM a lane, let it boot, **kill the
+      session between claim and emit**, boot again → the message IS delivered (lease recovery,
+      UR-1); (b) after a normal delivery, boot again → it is NOT replayed (ack worked, UR-3);
+      (c) two live sessions of ONE lane both take → each gets a disjoint set, nothing double-acted
+      (finding #11); (d) confirm `failed/` is empty across the run — a message landing there during
+      a healthy e2e means the attempt counter is bumping when it should not.
 
 ## Phase 7 — Review gates & ship `[ ]` (requires P6)
 
@@ -540,6 +568,11 @@ per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. 
       deploy with a crash-loses-messages window. Full disposition of all 10 findings in 7.5.
 - `[~]` 7.5 **Disposition of the 10 ultrareview findings — every one has an owner, nothing dropped.**
       Steve's ruling 2026-08-03: v1.1 rewrite lands before any deploy. Three buckets:
+
+      **STATUS 2026-08-04: 6 of 10 CLOSED** by the v1.1 GREEN commit (UR-1, UR-2, UR-3, UR-8,
+      UR-9, UR-10 — verified in the committed diff, 45/45 suite green on `sh` and `dash`).
+      Remaining: UR-4a / UR-4b / UR-7 (code — RED in flight at `test/commit-install.sh`) and
+      UR-5 / UR-6 (procedure — now landed as plan tasks 5.5 and 5.6).
 
       **A. Absorbed by the v1.1 per-message-queue rewrite** (the redesign already in `ROADMAP.md`;
       these are its acceptance criteria, not separate work):
