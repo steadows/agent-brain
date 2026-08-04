@@ -23,9 +23,12 @@ DM_INJECT_MAX_COLS=2000
 DM_CLAIM_MAX_AGE=600
 DM_MAX_ATTEMPTS=3
 DM_TEMP_MAX_AGE=300
-DM_CLAIM_MAX_MESSAGES=40
+DM_TRANSITION_MAX=40
 DM_CLAIM_EPOCH_MAX_DIGITS=10
 DM_CLAIMER_PID_MAX_DIGITS=10
+DM_FILENAME_MAX_BYTES=255
+# Reserve `.a<max-attempt>.c<max-epoch>-<max-pid>` inside NAME_MAX for every accepted ID.
+DM_ID_MAX_BYTES=$((DM_FILENAME_MAX_BYTES - 2 - ${#DM_MAX_ATTEMPTS} - 2 - DM_CLAIM_EPOCH_MAX_DIGITS - 1 - DM_CLAIMER_PID_MAX_DIGITS))
 DM_INJECT_MAX_TOTAL=$((DM_INJECT_MAX_LINES * (DM_INJECT_MAX_COLS + 1)))
 # Digest per-field starting budget: reserve DM_DIGEST_ENVELOPE cols for the JSON envelope,
 # then divide by DM_ESCAPE_FACTOR — worst-case JSON escaping (\uXXXX) expands one character
@@ -353,10 +356,23 @@ _dm_id_in_use() { # <lane> <id>
   return 1
 }
 
-# One id-charset bound for BOTH consume paths (claim + recover). The producer mints [0-9TZ-]
-# ids; refusing every shell metacharacter keeps the name-only claim stream safe to split before
-# consumers rebuild absolute paths themselves.
-_dm_id_ok() { case "$1" in ''|*[!0-9:._TZ-]*) return 1 ;; *) return 0 ;; esac; }
+# One producer-shaped ID bound for BOTH consume paths (claim + recover):
+# `<YYYYmmddTHHMMSSZ>-<decimal-pid>[-<decimal-collision-bump>]`.
+_dm_id_ok() {
+  _io_id=$1
+  [ "${#_io_id}" -le "$DM_ID_MAX_BYTES" ] || return 1
+  case "$_io_id" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  _io_tail=${_io_id#*-}
+  case "$_io_tail" in
+    *-*) _io_pid=${_io_tail%-*}; _io_bump=${_io_tail##*-} ;;
+    *) _io_pid=$_io_tail; _io_bump="" ;;
+  esac
+  case "$_io_pid" in [1-9]|[1-9][0-9]*) ;; *) return 1 ;; esac
+  case "$_io_bump" in ''|[1-9]|[1-9][0-9]*) ;; *) return 1 ;; esac
+}
 
 # Queue decimals are untrusted filename components. Canonical, width-bounded validation must
 # happen before arithmetic expansion because an invalid operand can terminate the whole shell.
@@ -416,13 +432,36 @@ _dm_purge_stale_temps() { # <lane>
     || { _warn "could not sweep stale dm temps under $_pt_pending"; return 1; }
 }
 
+_dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
+
+# Pick a never-occupied failed/ destination. Preserve the full original name when NAME_MAX allows;
+# a checksum fallback keeps collision records distinct when the original already fills NAME_MAX.
+_dm_failed_dest() { # <lane> <name>
+  _fd_lane=$1; _fd_name=$2; _fd_dir="$BRAIN/dm/$_fd_lane/failed"
+  _fd_dest="$_fd_dir/$_fd_name"
+  if ! _dm_dest_occupied "$_fd_dest"; then printf '%s\n' "$_fd_dest"; return 0; fi
+  _fd_stamp=$(_now_epoch) || return 1
+  _fd_suffix=".collision-$_fd_stamp-$$"; _fd_candidate="$_fd_name$_fd_suffix"
+  _fd_bytes=$(LC_ALL=C printf '%s' "$_fd_candidate" | wc -c | tr -d ' \n')
+  if [ "$_fd_bytes" -gt "$DM_FILENAME_MAX_BYTES" ]; then
+    _fd_sum=$(printf '%s' "$_fd_name" | cksum) || return 1
+    _fd_sum=${_fd_sum%% *}
+    _fd_candidate="collision-$_fd_sum-$_fd_stamp-$$"
+  fi
+  _fd_n=0; _fd_dest="$_fd_dir/$_fd_candidate"
+  while _dm_dest_occupied "$_fd_dest"; do
+    _fd_n=$((_fd_n + 1)); _fd_dest="$_fd_dir/$_fd_candidate-$_fd_n"
+  done
+  printf '%s\n' "$_fd_dest"
+}
+
 _dm_route_failed() { # <lane> <message-file> <reason>
   _rf_lane=$1; _rf_file=$2; _rf_reason=$3; _rf_name=${_rf_file##*/}
-  _rf_dest="$BRAIN/dm/$_rf_lane/failed/$_rf_name"
-  [ ! -L "$_rf_dest" ] \
-    || { _warn "refusing symlinked dm failed destination for $_rf_name"; return 1; }
+  _rf_dest=$(_dm_failed_dest "$_rf_lane" "$_rf_name") || return 1
+  _dm_dest_occupied "$_rf_dest" \
+    && { _warn "dm failed destination became occupied for $_rf_name"; return 1; }
   if command mv -f -- "$_rf_file" "$_rf_dest" 2>/dev/null; then
-    _warn "$_rf_reason: $_rf_name (routed to failed/@$_rf_lane)"
+    _warn "$_rf_reason: $_rf_name (routed to failed/@$_rf_lane as ${_rf_dest##*/})"
     return 0
   fi
   [ -e "$_rf_file" ] || [ -L "$_rf_file" ] || return 0
@@ -430,8 +469,8 @@ _dm_route_failed() { # <lane> <message-file> <reason>
   return 1
 }
 
-_dm_recover_stale() { # <lane>
-  _rs_lane=$1
+_dm_recover_stale() { # <lane> <transition-budget> — print transitions consumed
+  _rs_lane=$1; _rs_budget=${2:-$DM_TRANSITION_MAX}; _rs_used=0
   _dm_ensure_tree "$_rs_lane" || return 1
   _dm_purge_stale_temps "$_rs_lane" || return 1
   _rs_claimed="$BRAIN/dm/$_rs_lane/claimed"; _rs_now=""
@@ -440,26 +479,36 @@ _dm_recover_stale() { # <lane>
     _dm_dir_ok "$_rs_file" || continue
     _rs_name=${_rs_file##*/}
     case "$_rs_name" in *.a*.c*-*) ;; *)
+      [ "$_rs_used" -lt "$_rs_budget" ] || break
       _dm_route_failed "$_rs_lane" "$_rs_file" "invalid claimed dm name" || return 1
+      _rs_used=$((_rs_used + 1))
       continue ;;
     esac
     _rs_pre=${_rs_name%.c*}; _rs_stamp=${_rs_name##*.c}
     _rs_claim_ts=${_rs_stamp%-*}; _rs_pid=${_rs_stamp##*-}
     _rs_attempt=${_rs_pre##*.a}; _rs_id=${_rs_pre%.a*}
     if ! _dm_decimal_ok "$_rs_claim_ts" "$DM_CLAIM_EPOCH_MAX_DIGITS"; then
+      [ "$_rs_used" -lt "$_rs_budget" ] || break
       _dm_route_failed "$_rs_lane" "$_rs_file" "invalid claim epoch" || return 1
+      _rs_used=$((_rs_used + 1))
       continue
     fi
     if ! _dm_decimal_ok "$_rs_pid" "$DM_CLAIMER_PID_MAX_DIGITS"; then
+      [ "$_rs_used" -lt "$_rs_budget" ] || break
       _dm_route_failed "$_rs_lane" "$_rs_file" "invalid claimer pid" || return 1
+      _rs_used=$((_rs_used + 1))
       continue
     fi
     if ! _dm_attempt_ok "$_rs_attempt"; then
+      [ "$_rs_used" -lt "$_rs_budget" ] || break
       _dm_route_failed "$_rs_lane" "$_rs_file" "invalid delivery attempt" || return 1
+      _rs_used=$((_rs_used + 1))
       continue
     fi
     if ! _dm_id_ok "$_rs_id"; then
+      [ "$_rs_used" -lt "$_rs_budget" ] || break
       _dm_route_failed "$_rs_lane" "$_rs_file" "invalid message id" || return 1
+      _rs_used=$((_rs_used + 1))
       continue
     fi
     [ -n "$_rs_now" ] || _rs_now=$(_now_epoch) || return 1
@@ -467,40 +516,54 @@ _dm_recover_stale() { # <lane>
     if [ "$_rs_now" -ge "$_rs_claim_ts" ] && [ "$_rs_age" -le "$DM_CLAIM_MAX_AGE" ]; then
       continue
     fi
+    [ "$_rs_used" -lt "$_rs_budget" ] || break
     _rs_next=$((_rs_attempt + 1))
     if [ "$_rs_next" -gt "$DM_MAX_ATTEMPTS" ]; then
       _rs_dest="$BRAIN/dm/$_rs_lane/failed/$_rs_id.a$_rs_next"
     else
       _rs_dest="$BRAIN/dm/$_rs_lane/pending/$_rs_id.a$_rs_next"
     fi
+    if _dm_dest_occupied "$_rs_dest"; then
+      _dm_route_failed "$_rs_lane" "$_rs_file" "occupied dm recovery destination" || return 1
+      _rs_used=$((_rs_used + 1))
+      continue
+    fi
     if command mv -f -- "$_rs_file" "$_rs_dest" 2>/dev/null; then
+      _rs_used=$((_rs_used + 1))
       continue
     fi
     [ -e "$_rs_file" ] || [ -L "$_rs_file" ] || continue
     _warn "could not recover stale dm claim: $_rs_file"
     return 1
   done
+  printf '%s\n' "$_rs_used"
 }
 
-_dm_claim_all() { # <lane> — print the names won by this process
-  _ca_lane=$1
+_dm_claim_all() { # <lane> <transition-budget> — print the names won by this process
+  _ca_lane=$1; _ca_budget=${2:-$DM_TRANSITION_MAX}
   _dm_ensure_tree "$_ca_lane" || return 1
   _ca_pending="$BRAIN/dm/$_ca_lane/pending"; _ca_claimed="$BRAIN/dm/$_ca_lane/claimed"
-  _ca_epoch=""; _ca_count=0
+  _ca_epoch=""; _ca_used=0
   for _ca_file in "$_ca_pending"/*; do
     [ -e "$_ca_file" ] || [ -L "$_ca_file" ] || continue
-    [ "$_ca_count" -lt "$DM_CLAIM_MAX_MESSAGES" ] || break
+    [ "$_ca_used" -lt "$_ca_budget" ] || break
     _dm_dir_ok "$_ca_file" || continue
     _ca_name=${_ca_file##*/}; _ca_attempt=${_ca_name##*.a}; _ca_id=${_ca_name%.a*}
     if [ "$_ca_id" = "$_ca_name" ] || ! _dm_id_ok "$_ca_id" || ! _dm_attempt_ok "$_ca_attempt"; then
       _dm_route_failed "$_ca_lane" "$_ca_file" "invalid pending dm name" || return 1
+      _ca_used=$((_ca_used + 1))
       continue
     fi
     [ -n "$_ca_epoch" ] || _ca_epoch=$(_now_epoch) || return 1
     _ca_claim_name="$_ca_name.c$_ca_epoch-$$"; _ca_dest="$_ca_claimed/$_ca_claim_name"
+    if _dm_dest_occupied "$_ca_dest"; then
+      _dm_route_failed "$_ca_lane" "$_ca_file" "occupied dm claim destination" || return 1
+      _ca_used=$((_ca_used + 1))
+      continue
+    fi
     if command mv -f -- "$_ca_file" "$_ca_dest" 2>/dev/null; then
       printf '%s\n' "$_ca_claim_name"
-      _ca_count=$((_ca_count + 1))
+      _ca_used=$((_ca_used + 1))
       continue
     fi
     [ -e "$_ca_file" ] || [ -L "$_ca_file" ] || continue
@@ -521,7 +584,8 @@ _dm_ack() { # <lane> <claimed-name>
   _dm_dir_ok "$_ak_claim" || return 1
   case "$_ak_name" in *.a*.c*-*) ;; *) _warn "invalid claimed dm name: $_ak_name"; return 1 ;; esac
   _ak_read_name=${_ak_name%.c*}; _ak_dest="$BRAIN/dm/$_ak_lane/read/$_ak_read_name"
-  [ ! -L "$_ak_dest" ] || { _warn "refusing symlinked dm ack destination: $_ak_dest"; return 1; }
+  _dm_dest_occupied "$_ak_dest" \
+    && { _warn "refusing occupied dm ack destination: $_ak_dest"; return 1; }
   if command mv -f -- "$_ak_claim" "$_ak_dest" 2>/dev/null; then return 0; fi
   if [ ! -e "$_ak_claim" ] && [ ! -L "$_ak_claim" ]; then
     _warn "dm claim disappeared before ack (it may have been recovered): $_ak_name"
@@ -577,12 +641,12 @@ _dm_digest() { # <lane> <claimed-name>...
             ts: $message.ts[0:$limit],
             content: $message.content[0:$limit]
           } as $record
-        | if (($record | tojson | length) <= $line_max) or $limit <= 1
+        | if (($record | tojson | utf8bytelength) <= $line_max) or $limit <= 1
           then $record
           else ($message | bounded((($limit / 2) | floor)))
           end;
       map(bounded($field_max) | tojson) as $records
-      | (reduce $records[] as $record (0; . + ($record | length) + 1)) as $total
+      | (reduce $records[] as $record (0; . + ($record | utf8bytelength) + 1)) as $total
       | if $total > $total_max then error("dm digest exceeds aggregate cap")
         else $records[]
         end
@@ -590,23 +654,64 @@ _dm_digest() { # <lane> <claimed-name>...
   )
 }
 
+# A fresh claim creates no filesystem event when its lease later expires. Arm one detached sweep
+# for the earliest canonical claim; recovery moves it to pending/, which wakes the lane's watcher.
+_dm_arm_lease_sweep() { # <lane>
+  _ls_lane=$1; _ls_claimed="$BRAIN/dm/$_ls_lane/claimed"; _ls_delay=""
+  _dm_dir_ok "$_ls_claimed" || return 1
+  _ls_now=$(_now_epoch) || return 1
+  for _ls_file in "$_ls_claimed"/*; do
+    [ -e "$_ls_file" ] || [ -L "$_ls_file" ] || continue
+    _dm_dir_ok "$_ls_file" || continue
+    _ls_name=${_ls_file##*/}; _ls_stamp=${_ls_name##*.c}; _ls_ts=${_ls_stamp%-*}
+    _dm_decimal_ok "$_ls_ts" "$DM_CLAIM_EPOCH_MAX_DIGITS" || continue
+    if [ "$_ls_now" -lt "$_ls_ts" ]; then
+      _ls_candidate=1
+    else
+      _ls_candidate=$((_ls_ts + DM_CLAIM_MAX_AGE + 1 - _ls_now))
+      [ "$_ls_candidate" -gt 0 ] || _ls_candidate=1
+    fi
+    if [ -z "$_ls_delay" ] || [ "$_ls_candidate" -lt "$_ls_delay" ]; then
+      _ls_delay=$_ls_candidate
+    fi
+  done
+  [ -n "$_ls_delay" ] || return 0
+  # The suite's branch override is an explicit test seam; do not leave ten-minute sleepers
+  # behind its disposable repos. Near-expiry coverage still arms the real detached sweep.
+  if [ -n "${BRAIN_TEST_BRANCH:-}" ] && [ "$_ls_delay" -gt 10 ]; then return 0; fi
+  (
+    sleep "$_ls_delay"
+    _dm_recover_stale "$_ls_lane" "$DM_TRANSITION_MAX" >/dev/null || true
+    _dm_arm_lease_sweep "$_ls_lane" || true
+  ) </dev/null >> "$BRAIN/.hook-errors.log" 2>&1 &
+}
+
 cmd_dm_take() {
   _require_brain
   _dt_lane=$(cmd_whoami)
   [ -n "$_dt_lane" ] || _die "brain dm take: whoami is empty"
-  _dm_recover_stale "$_dt_lane" || return 1
-  _dt_claims=$(_dm_claim_all "$_dt_lane") || return 1
+  _dt_recovered=$(_dm_recover_stale "$_dt_lane" "$DM_TRANSITION_MAX") || return 1
+  case "$_dt_recovered" in ''|*[!0-9]*) return 1 ;; esac
+  _dt_remaining=$((DM_TRANSITION_MAX - _dt_recovered))
+  _dt_claims=$(_dm_claim_all "$_dt_lane" "$_dt_remaining") || return 1
   [ -n "$_dt_claims" ] || return 0
   # Only validated queue names cross this split; absolute paths are rebuilt after it.
   # shellcheck disable=SC2086
   set -- $_dt_claims
-  _dt_digest=$(_dm_digest "$_dt_lane" "$@") \
-    || { _warn "could not digest claimed dm messages for @$_dt_lane"; return 1; }
-  if ! printf '%s\n' "$_dt_digest"; then
-    _warn "could not emit claimed dm messages for @$_dt_lane; leaving them replayable"
-    return 1
-  fi
-  _dm_ack_all "$_dt_lane" "$@"
+  _dt_rc=0
+  for _dt_claim in "$@"; do
+    if ! _dt_digest=$(_dm_digest "$_dt_lane" "$_dt_claim"); then
+      _warn "could not digest claimed dm message for @$_dt_lane: $_dt_claim"
+      _dt_rc=1
+      continue
+    fi
+    if ! printf '%s\n' "$_dt_digest"; then
+      _warn "could not emit claimed dm messages for @$_dt_lane; leaving them replayable"
+      return 1
+    fi
+    _dm_ack "$_dt_lane" "$_dt_claim" || _dt_rc=1
+  done
+  return "$_dt_rc"
 }
 
 _dm_failed_count() { # <lane>
@@ -1229,30 +1334,42 @@ _hook_session_start() {
         if [ -f "$BRAIN/templates/non-brain-globs" ] && grep -qxF "$_br" "$BRAIN/templates/non-brain-globs" 2>/dev/null; then
           exit 0
         fi
-        _emit_session_ctx "Agent Brain: branch '$_br' has no presence note. If this is a tracked feature, register it once: .brain/bin/brain new-feature $_slug"
+        _emit_session_ctx "Agent Brain: branch '$_br' has no presence note. If this is a tracked feature, register it once: \"$BRAIN/bin/brain\" new-feature $_slug"
         ;;
     esac
     exit 0                               # non-feature branch → silent
   fi
   # (b2) Recover → claim → digest. Ack happens only after the complete SessionStart payload was
   # emitted successfully, so an interrupted boot leaves every message replayable.
-  _dm_recover_stale "$_feat" || true
+  _recover_used=$(_dm_recover_stale "$_feat" "$DM_TRANSITION_MAX") || _recover_used=$DM_TRANSITION_MAX
+  case "$_recover_used" in ''|*[!0-9]*) _recover_used=$DM_TRANSITION_MAX ;; esac
+  _recover_remaining=$((DM_TRANSITION_MAX - _recover_used))
   # The queue path is a fixed composition; recover/claim just ensured the tree exists, so
   # re-deriving it through cmd_inbox would only re-walk the tree to print the same string.
   _ib="$BRAIN/dm/$_feat/pending"
-  _dm_block=""; _digest_ok=0
-  if _claims=$(_dm_claim_all "$_feat") && [ -n "$_claims" ]; then
+  _dm_block=""; _digest_ok=0; _valid_claims=""; _digest=""
+  if _claims=$(_dm_claim_all "$_feat" "$_recover_remaining") && [ -n "$_claims" ]; then
     # Only validated queue names cross this split; absolute paths are rebuilt after it.
     # shellcheck disable=SC2086
     set -- $_claims
-    if _digest=$(_dm_digest "$_feat" "$@"); then
+    for _claim in "$@"; do
+      if _digest_line=$(_dm_digest "$_feat" "$_claim"); then
+        _digest="${_digest}${_digest:+
+}${_digest_line}"
+        _valid_claims="${_valid_claims}${_valid_claims:+ }$_claim"
+      else
+        _warn "could not digest claimed dm message for @$_feat: $_claim; leaving it replayable"
+      fi
+    done
+    if [ -n "$_valid_claims" ]; then
       _dm_block="Unread DMs delivered while you were away:
 $_digest
 
 "
       _digest_ok=1
-    else
-      _warn "could not digest claimed dm messages for @$_feat; leaving them replayable"
+      # Only validated queue names cross this split.
+      # shellcheck disable=SC2086
+      set -- $_valid_claims
     fi
   fi
   # (c) cheap auto-fixes, robust to a never-wraps agent
@@ -1262,7 +1379,7 @@ $_digest
   if _emit_session_ctx "${_dm_block}Run the **navigation-standards** skill now (the Agent-Brain coordination protocol).
 
 Your DM pending queue — arm a watch on directory activity: $_ib
-On activity, claim and consume it with: .brain/bin/brain dm take
+On activity, claim and consume it with: \"$BRAIN/bin/brain\" dm take
 
 $_st"; then
     if [ "$_digest_ok" = 1 ]; then
@@ -1272,6 +1389,7 @@ $_st"; then
   else
     _warn "could not emit SessionStart context; claimed DMs remain replayable"
   fi
+  _dm_arm_lease_sweep "$_feat" || true
   exit 0
 }
 

@@ -2,21 +2,23 @@
 
 The always-read rules live in the `navigation-standards` skill; this file is the detail you pull
 when you're actually in a DM exchange. Read it before your first dialog, not every session.
+The **absolute engine path printed in SessionStart** is the canonical launcher; substitute it for
+`<brain>` in every command below, never a sibling worktree's tracked `.brain/bin/brain`.
 
 ## The three tiers — division of labour
 
 | Tier | Mechanism | Reaches | Job |
 |---|---|---|---|
-| **Fast** | `brain dm` → per-message queue, watched live | a **running** lane, in seconds | the nudge |
-| **Journal heads-up** | `brain announce` → journal | explicitly mentioned lanes, from today's journal at boot | the heads-up |
+| **Fast** | `<brain> dm` → per-message queue, watched live | a **running** lane, in seconds | the nudge |
+| **Journal heads-up** | `<brain> announce` → journal | explicitly mentioned lanes, from today's journal at boot | the heads-up |
 | **Permanent** | `connections/` note | anyone reading the vault, forever | the **record** |
 
 A DM is a signal, never the record — a decision that exists only in an inbox did not happen.
 For "main moved", **git is the real source of truth** (every lane rebases at start); the broadcast
 is a courtesy that saves a lane from finding out mid-gate. Do not build correctness on it.
 
-`brain inbox` prints your `pending/` directory. Watch that directory for activity; when it changes,
-run `brain dm take` to atomically claim, print, and acknowledge up to 40 messages. Repeat while
+`<brain> inbox` prints your `pending/` directory. Watch that directory for activity; when it changes,
+run `<brain> dm take` to atomically claim, print, and acknowledge up to 40 messages. Repeat while
 `pending/` still contains messages; leftovers remain claimable and are never discarded.
 
 ## The six shapes (measured from a live vault, not invented)
@@ -41,7 +43,7 @@ lands" is *not agreed*. DM = the signal; the existing `waiting-on` connection no
 ## Dialog mode — two lanes converging on a technical call
 
 - Both ends opt in. Set `dialog_with: <lane>` in your presence note while engaged; clear it after.
-  `brain status` surfaces open dialogs, so a conversation still open an hour later is visible.
+  `<brain> status` surfaces open dialogs, so a conversation still open an hour later is visible.
 - **Push toward convergence; do not go forever** — converge / deadlock / escalate.
 - Convergence **is** writing the shared conclusion to a `connections/` note.
 
@@ -58,7 +60,7 @@ consultants*:
 - The responding lane's **first turn must be a critique, not an endorsement** — but never a
   fabricated one: on a sound proposal, say "nothing contested" explicitly.
 - The convergence note records **what was contested and the tradeoff accepted** — and when nothing
-  was contested, it says so explicitly. Open dialogs are visible in `brain status` (via
+  was contested, it says so explicitly. Open dialogs are visible in `<brain> status` (via
   `dialog_with:`); the *nothing contested* tell is read in the PM's periodic vault sweep — v1 has
   **no** automatic surfacing of convergence notes, so do not rely on one.
 

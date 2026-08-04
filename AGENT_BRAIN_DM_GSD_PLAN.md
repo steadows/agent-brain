@@ -431,10 +431,13 @@ dialog in `brain status` · a note **without** it renders unchanged (the field i
 
 ## Phase 5 — Deploy `[ ]` (requires P1–P4 **and 7.4 ultrareview returned + CRITICAL/HIGH addressed** — re-sequenced by Steve 2026-08-03)
 
-⚠ **Deploy is machine-wide and instant.** Both hooks resolve the engine through
-`git rev-parse --git-common-dir`, so **every lane in every worktree executes the single deployed
-`<main>/.brain/bin/brain`**, whatever branch that lane is on. There is no staged rollout and no
-per-lane opt-in: the moment 5.2 lands, all 13 lanes are running the new engine. Sequence accordingly.
+⚠ **Deploy is machine-wide and instant.** The global hook dispatchers resolve the engine through
+`git rev-parse --git-common-dir`; SessionStart then prints that same absolute
+`<main>/.brain/bin/brain` path, and both protocol templates define it as the canonical launcher.
+Thus every instructed invocation reaches the one main-worktree deployment even though each sibling
+still has its own stale tracked copy. **Deploying only `<main>/.brain/bin/brain` is sufficient and
+does not require lanes to rebase.** There is no staged rollout or per-lane opt-in: the moment 5.2
+lands, all 13 lanes are directed to the new engine. Sequence accordingly.
 
 - `[ ]` 5.1 **FIRST — hand-add `dm/` to the DEPLOYED `<main-worktree>/.brain/.gitignore`.**
       **This must land BEFORE the engine, not after.** Task 1.3 edits only `cmd_init`'s `printf`,

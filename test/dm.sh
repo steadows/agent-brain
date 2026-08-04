@@ -2309,6 +2309,292 @@ sc_h5_claim_batch_bounded_and_fair() {
   done
 }
 
+# D.P1/50 — deployment is one main-worktree engine, even when the receiving lane is a sibling
+# whose tracked .brain/bin/brain predates `dm take`. This reproduces the live failure shape:
+# SessionStart itself resolves the shared vault correctly, then its emitted command is executed
+# from the stale sibling. Only an absolute main-engine instruction can consume the queued marker.
+sc_deploy_instruction_uses_main_worktree_engine() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx"); sibling="$base/sibling-worktree"
+
+  cp "$BRAIN_BIN" "$fx/.brain/bin/brain" \
+    || { fail "fixture: could not deploy the new engine into the main worktree"; return 0; }
+  chmod +x "$fx/.brain/bin/brain" \
+    || { fail "fixture: could not make the deployed main engine executable"; return 0; }
+  git -C "$fx" add -f -- .brain/bin/brain >/dev/null 2>&1 \
+    || { fail "fixture: could not stage the tracked engine"; return 0; }
+  git -C "$fx" commit -q -m "fixture tracked engine" >/dev/null 2>&1 \
+    || { fail "fixture: could not commit the tracked engine"; return 0; }
+  git -C "$fx" worktree add -q -b stale-engine-lane "$sibling" HEAD >/dev/null 2>&1 \
+    || { fail "fixture: could not create the sibling worktree"; return 0; }
+
+  {
+    printf '#!/bin/sh\n'
+    printf 'printf "OLD SIBLING ENGINE: dm take unavailable\\n" >&2\n'
+    printf 'exit 64\n'
+  } > "$sibling/.brain/bin/brain"
+  chmod +x "$sibling/.brain/bin/brain" \
+    || { fail "fixture: could not install the old sibling engine stub"; return 0; }
+
+  ctx=$(hook_context "$sibling" bravo)
+  hrc=$?
+  need_rc "$hrc" 0 "SessionStart from the sibling carrying an old tracked engine" || return 0
+  instruction=$(printf '%s\n' "$ctx" | sed -n 's/^On activity, claim and consume it with: //p' | head -1)
+  [ -n "$instruction" ] \
+    || { fail "Part 1: SessionStart emitted no executable consume instruction"; return 0; }
+  need_str_has "$instruction" "$fx/.brain/bin/brain" \
+    "Part 1: the consume instruction must name the main worktree's deployed engine" || return 0
+  need_str_lacks "$instruction" "$sibling/.brain/bin/brain" \
+    "Part 1: the consume instruction must never name the sibling's tracked engine"
+
+  run_brain "$fx" alpha dm @bravo "main-engine-deploy-p1"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: queue a message after the sibling was armed" || return 0
+
+  OUT="$base/instructed-take.out"; ERR="$base/instructed-take.err"
+  (
+    cd "$sibling" || exit 127
+    exec env HOME="$base/home" BRAIN_FEATURE=bravo BRAIN_TEST_BRANCH="$FIXTURE_BRANCH" \
+      BRAIN_MAIN_REF="$FIXTURE_MAIN_REF" BRAIN_SKILLS_DIR="$base/home/.claude/skills" \
+      BRAIN_GLOBAL_SETTINGS="$base/home/.claude/settings.json" BRAIN_PRETOOL_MODE=allow \
+      sh -c "$instruction"
+  ) > "$OUT" 2> "$ERR"
+  rc=$?
+  need_rc "$rc" 0 "the SessionStart consume instruction executed from the stale sibling" || return 0
+  need_file_has "$OUT" "main-engine-deploy-p1" \
+    "the emitted instruction must execute the new main engine and deliver the queued message"
+  need_file_lacks "$ERR" "OLD SIBLING ENGINE" \
+    "the stale sibling engine must never execute"
+
+  need_file_has "$NAV_SKILL" "absolute engine path printed in SessionStart" \
+    "the always-read navigation template must direct lanes to the emitted absolute engine"
+  need_file_has "$DM_PROTOCOL" "absolute engine path printed in SessionStart" \
+    "the DM protocol must direct lanes to the emitted absolute engine"
+}
+
+# U.H2/51 — one malformed file is isolated from healthy peers in the same claimed batch. The
+# poison stays replayable (the frozen H2 single-poison contract), while both valid peers emit and
+# ack at attempt zero; they must never inherit the poison file's retry count.
+sc_poison_file_does_not_discard_healthy_batchmates() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed); rd=$(q_dir "$fx" bravo read)
+  mkdir -p "$pd" || { fail "fixture: could not create pending/"; return 0; }
+  printf '%s\n' '{not-valid-json' > "$pd/20260804T130000Z-9500.a0"
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T13:00:01Z",content:"healthy-peer-one-h2"}' \
+    > "$pd/20260804T130001Z-9501.a0"
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T13:00:02Z",content:"healthy-peer-two-h2"}' \
+    > "$pd/20260804T130002Z-9502.a0"
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc_nonzero "$rc" "mixed healthy/poison take must report the retained poison file"
+  need_file_has "$OUT" "healthy-peer-one-h2" "the first healthy batchmate"
+  need_file_has "$OUT" "healthy-peer-two-h2" "the second healthy batchmate"
+  need_count "$rd" 2 "read/ after healthy peers are emitted and acked independently"
+  need_count "$cd_" 1 "claimed/ after only the poison file remains replayable"
+  need_count "$pd" 0 "pending/ after all three files were claimed"
+  for f in "$rd"/*; do
+    [ -e "$f" ] || continue
+    need_eq "$(attempt_of "$f")" 0 \
+      "healthy peer attempt counter — poison retries must never propagate to a batchmate" || return 0
+  done
+}
+
+# U.H3/52 — crash → immediate restart preserves the fresh claim, then an armed lease sweep moves
+# it back to pending when wall-clock expiry arrives. The lane's existing pending-dir watcher can
+# then run `dm take`; no unrelated DM or later reboot is needed to create the wake-up event.
+sc_fresh_claim_arms_recovery_at_lease_expiry() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  run_brain "$fx" alpha dm @bravo "lease-expiry-wakeup-h3"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: send the crash-window message" || return 0
+  claim=$(mint_stuck_claim "$fx" bravo); mrc=$?
+  [ "$mrc" = 0 ] || { mint_failed "$mrc"; return 0; }
+  claim=$(age_claim "$claim" "$((DM_CLAIM_MAX_AGE - 2))") \
+    || { fail "fixture: could not place the claim just inside its lease"; return 0; }
+
+  ctx=$(hook_context "$fx" bravo)
+  hrc=$?
+  need_rc "$hrc" 0 "immediate restart while the claim is still fresh" || return 0
+  need_str_lacks "$ctx" "lease-expiry-wakeup-h3" \
+    "the immediate restart must not steal a still-fresh claim"
+  need_count "$(q_dir "$fx" bravo claimed)" 1 "claimed/ immediately after restart"
+  need_count "$(q_dir "$fx" bravo pending)" 0 "pending/ immediately after restart"
+
+  waited=0
+  while [ "$(count_files "$(q_dir "$fx" bravo pending)")" = 0 ] && [ "$waited" -lt 7 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  need_count "$(q_dir "$fx" bravo pending)" 1 \
+    "pending/ after idling past the lease — the scheduled sweep must create watcher activity" \
+    || return 0
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "watcher-triggered take after scheduled lease recovery" || return 0
+  need_file_has "$OUT" "lease-expiry-wakeup-h3" \
+    "the crash-window message delivered after idle lease expiry"
+  need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the recovered delivery"
+}
+
+# U.H4/53 — every pre-existing transition destination is preserved. Recovery must not clobber a
+# regular pending message, nest into a directory, or follow a symlink out of the queue; failed/
+# collisions get distinct forensic names instead of overwriting, nesting, or refusing forever.
+sc_queue_destination_collisions_preserve_every_message() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx"); pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed)
+  fd=$(q_dir "$fx" bravo failed); ejected="$base/ejected"; ejected_failed="$base/ejected-failed"
+  mkdir -p "$pd" "$cd_" "$fd" "$ejected" "$ejected_failed" \
+    || { fail "fixture: could not create collision queue directories"; return 0; }
+
+  jq -cn '{from:"prior",to:"bravo",ts:"2026-08-04T13:10:00Z",content:"occupied-regular-h4"}' \
+    > "$pd/20260804T131000Z-9601.a1"
+  mkdir "$pd/20260804T131001Z-9602.a1" \
+    || { fail "fixture: could not plant the occupied directory"; return 0; }
+  printf 'occupied-directory-sentinel-h4\n' > "$pd/20260804T131001Z-9602.a1/sentinel"
+  ln -s "$ejected" "$pd/20260804T131002Z-9603.a1" \
+    || { fail "fixture: could not plant the occupied symlink"; return 0; }
+
+  i=1
+  for id in 20260804T131000Z-9601 20260804T131001Z-9602 20260804T131002Z-9603; do
+    jq -cn --arg content "stale-source-$i-h4" \
+      '{from:"alpha",to:"bravo",ts:"2026-08-04T13:00:00Z",content:$content}' \
+      > "$cd_/$id.a0.c0-1"
+    i=$((i + 1))
+  done
+
+  printf 'old-failed-regular-h4\n' > "$fd/bad-regular"
+  printf '%s\n' '{bad-new-regular-h4' > "$pd/bad-regular"
+  mkdir "$fd/bad-directory" || { fail "fixture: could not plant failed/ directory collision"; return 0; }
+  printf 'old-failed-directory-h4\n' > "$fd/bad-directory/sentinel"
+  printf '%s\n' '{bad-new-directory-h4' > "$pd/bad-directory"
+  ln -s "$ejected_failed" "$fd/bad-symlink" \
+    || { fail "fixture: could not plant failed/ symlink collision"; return 0; }
+  printf '%s\n' '{bad-new-symlink-h4' > "$pd/bad-symlink"
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_file_has "$OUT" "occupied-regular-h4" \
+    "the pre-existing regular pending message must survive and deliver"
+  need_tree_has "$fd" "stale-source-1-h4" "the stale source blocked by a regular destination"
+  need_tree_has "$fd" "stale-source-2-h4" "the stale source blocked by a directory destination"
+  need_tree_has "$fd" "stale-source-3-h4" "the stale source blocked by a symlink destination"
+  need_file_has "$pd/20260804T131001Z-9602.a1/sentinel" "occupied-directory-sentinel-h4" \
+    "the occupied pending directory sentinel"
+  need_eq "$(count_files "$ejected")" 0 \
+    "symlink recovery target — no message may be ejected outside the queue"
+
+  need_file_has "$fd/bad-regular" "old-failed-regular-h4" \
+    "the pre-existing failed/ regular forensic record"
+  need_tree_has "$fd" "bad-new-regular-h4" \
+    "the newly rejected message beside a regular failed/ collision"
+  need_file_has "$fd/bad-directory/sentinel" "old-failed-directory-h4" \
+    "the pre-existing failed/ directory sentinel"
+  need_tree_has "$fd" "bad-new-directory-h4" \
+    "the newly rejected message beside a directory failed/ collision"
+  need_tree_has "$fd" "bad-new-symlink-h4" \
+    "the newly rejected message beside a symlink failed/ collision"
+  need_eq "$(count_files "$ejected_failed")" 0 \
+    "failed/ symlink target — no forensic message may be ejected"
+  need_count "$pd" 2 \
+    "pending/ after collisions — only the deliberately occupied directory and symlink remain"
+  [ "$rc" = 0 ] || [ "$rc" = 1 ] \
+    || fail "collision handling returned unexpected exit $rc"
+}
+
+# U.H5/54 — a 252-byte producer-alphabet ID fits pending/<id>.a0 but cannot fit the maximum
+# claim suffix. It must be quarantined, allowing the later healthy entry to deliver in the same
+# invocation; an early overlong name can never permanently head-of-line block the queue.
+sc_overlong_id_routes_failed_without_blocking_later_message() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); fd=$(q_dir "$fx" bravo failed)
+  mkdir -p "$pd" "$fd" || { fail "fixture: could not create overlong-id queue"; return 0; }
+  long_id=$(awk 'BEGIN { printf "20260804T132000Z-1"; for (i = 0; i < 234; i++) printf "0" }')
+  need_eq "$(printf '%s' "$long_id" | wc -c | tr -d ' \n')" 252 \
+    "fixture: overlong ID byte length" || return 0
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T13:20:00Z",content:"overlong-id-h5"}' \
+    > "$pd/$long_id.a0" \
+    || { fail "fixture: filesystem did not accept the intended NAME_MAX boundary file"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T13:20:01Z",content:"healthy-after-overlong-h5"}' \
+    > "$pd/99999999T999999Z-9999.a0"
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "take with an early-sorting overlong ID" || return 0
+  need_file_has "$OUT" "healthy-after-overlong-h5" \
+    "the healthy message after the overlong ID"
+  need_count "$fd" 1 "failed/ after quarantining the overlong ID"
+  need_tree_has "$fd" "overlong-id-h5" "the quarantined overlong-ID message"
+  need_count "$pd" 0 "pending/ after the overlong ID is removed and the healthy peer delivers"
+}
+
+# U.H6/55 — one 40-transition budget spans stale recovery, invalid-name routing, and claiming.
+# Twenty stale recoveries plus twenty early invalid pending routes exhaust invocation one; the
+# twenty recovered messages and one healthy tail remain and all progress on invocation two.
+sc_one_transition_budget_spans_recovery_routing_and_claiming() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); cd_=$(q_dir "$fx" bravo claimed)
+  fd=$(q_dir "$fx" bravo failed); rd=$(q_dir "$fx" bravo read)
+  mkdir -p "$pd" "$cd_" "$fd" "$rd" \
+    || { fail "fixture: could not create transition-budget queue"; return 0; }
+
+  i=1
+  while [ "$i" -le 20 ]; do
+    seq=$(printf '%03d' "$i")
+    jq -cn --arg content "recovered-budget-$seq-h6" \
+      '{from:"alpha",to:"bravo",ts:"2026-08-04T13:30:00Z",content:$content}' \
+      > "$cd_/10000000T000000Z-9701-$seq.a0.c0-1"
+    printf '%s\n' '{invalid-budget-h6' > "$pd/000-invalid-$seq"
+    i=$((i + 1))
+  done
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T13:30:01Z",content:"healthy-tail-budget-h6"}' \
+    > "$pd/99999999T999999Z-9702.a0"
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "first transition-bounded take" || return 0
+  need_eq "$(byte_size "$OUT")" 0 \
+    "first take output — recovery plus routing must consume the whole shared budget"
+  need_count "$fd" 20 "failed/ after the first take routes exactly twenty invalid names"
+  need_count "$pd" 21 \
+    "pending/ after the first take leaves twenty recovered messages plus the healthy tail"
+  need_count "$cd_" 0 "claimed/ after exactly twenty stale recoveries"
+  need_count "$rd" 0 "read/ after no claim budget remained"
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "second take resumes after the exhausted transition budget" || return 0
+  need_eq "$(line_count "$OUT")" 21 "messages delivered by the resumed invocation"
+  need_file_has "$OUT" "healthy-tail-budget-h6" \
+    "fair resumption must eventually reach the healthy tail"
+  need_count "$pd" 0 "pending/ after the resumed invocation"
+  need_count "$rd" 21 "read/ after every valid message progresses"
+}
+
+# U.M1/56 — jq `length` counts code points. Four multibyte fields can therefore serialize above
+# the 2,000-byte line cap even after the conservative per-field slice. The wire caps are bytes:
+# the emitted line stays valid JSON and is at most DM_INJECT_MAX_COLS bytes plus its newline.
+sc_multibyte_digest_respects_byte_caps() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending)
+  mkdir -p "$pd" || { fail "fixture: could not create multibyte queue"; return 0; }
+  multi=$(awk 'BEGIN { for (i = 0; i < 300; i++) printf "🙂" }')
+  jq -cn --arg v "$multi" '{from:"alpha",to:$v,ts:$v,content:$v}' \
+    > "$pd/20260804T134000Z-9801.a0" \
+    || { fail "fixture: could not write the multibyte message"; return 0; }
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "take of a multibyte boundary message" || return 0
+  jq -e -s 'length == 1 and (.[0] | type) == "object"' "$OUT" >/dev/null 2>&1 \
+    || fail "multibyte digest output is not one valid JSON object"
+  size=$(byte_size "$OUT")
+  [ "$size" -le "$((DM_INJECT_MAX_COLS + 1))" ] \
+    || fail "multibyte digest record is $size bytes, above the $DM_INJECT_MAX_COLS-byte line cap"
+  need_count "$(q_dir "$fx" bravo read)" 1 "read/ after the bounded multibyte delivery"
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
 printf 'brain lane-DM v1.1 queue RED suite\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
@@ -2375,6 +2661,13 @@ scenario red   "F.H3/46 leading-zero-claim-survives-boot"   sc_h3_leading_zero_c
 scenario red   "F.H3/47 overrange-attempt-routes-failed"    sc_h3_overrange_attempt_routes_failed
 scenario red   "F.H4/48 disappeared-claim-ack-is-soft"      sc_h4_disappeared_claim_ack_is_soft
 scenario red   "F.H5/49 claim-batch-bounded-and-fair"       sc_h5_claim_batch_bounded_and_fair
+scenario red   "D.P1/50 main-worktree-engine-from-sibling"  sc_deploy_instruction_uses_main_worktree_engine
+scenario red   "U.H2/51 poison-isolated-from-healthy-peers"  sc_poison_file_does_not_discard_healthy_batchmates
+scenario red   "U.H3/52 lease-expiry-arms-recovery"          sc_fresh_claim_arms_recovery_at_lease_expiry
+scenario red   "U.H4/53 queue-destination-collisions"       sc_queue_destination_collisions_preserve_every_message
+scenario red   "U.H5/54 overlong-id-does-not-head-block"    sc_overlong_id_routes_failed_without_blocking_later_message
+scenario red   "U.H6/55 one-total-transition-budget"        sc_one_transition_budget_spans_recovery_routing_and_claiming
+scenario red   "U.M1/56 multibyte-digest-byte-caps"         sc_multibyte_digest_respects_byte_caps
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'
