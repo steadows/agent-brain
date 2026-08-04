@@ -807,9 +807,47 @@ _days_ago() {
 }
 
 # ── commit (durability; path-scoped, locked, secret-scanned, ff-only) ────────────────────────
+_commit_cleanup() {
+  _cc_rc=0
+  if [ -n "${_commit_index:-}" ]; then
+    rm -f -- "$_commit_index" "$_commit_index.lock" 2>/dev/null || _cc_rc=1
+    _commit_index=""
+  fi
+  if [ "${_commit_lock_held:-0}" = 1 ]; then
+    _lock_release commit
+    _commit_lock_held=0
+  fi
+  return "$_cc_rc"
+}
+
+_commit_clear_traps() { trap - 0 HUP INT TERM; }
+
+_commit_abort() {
+  _ca_message=$*
+  _ca_index=${_commit_index:-}
+  _commit_cleanup || _warn "could not clean temporary commit index: $_ca_index"
+  _commit_clear_traps
+  _die "$_ca_message"
+}
+
+_commit_finish() {
+  _cf_index=${_commit_index:-}
+  if ! _commit_cleanup; then
+    _commit_clear_traps
+    _die "could not clean temporary commit index: $_cf_index"
+  fi
+  _commit_clear_traps
+}
+
 cmd_commit() {
   _require_brain
   _lock_acquire commit || _die "another brain commit is in progress"
+  _commit_lock_held=1
+  _commit_index=""
+  trap '_commit_cleanup' 0
+  trap '_commit_cleanup; exit 129' HUP
+  trap '_commit_cleanup; exit 130' INT
+  trap '_commit_cleanup; exit 143' TERM
   # Self-healing invariant: dm/ MUST be ignored. cmd_init writes .gitignore only on a fresh
   # scaffold (and --force is forbidden on a live vault), so a vault initialized before the DM
   # feature would otherwise commit inbox bodies — which the line-anchored secret scan below
@@ -817,18 +855,18 @@ cmd_commit() {
   # DM inboxes must never reach a commit, and this guard FAILS CLOSED — the secret scan below
   # is line-anchored and cannot see a jsonl body, so this is the only control that stands.
   if [ -d "$BRAIN/dm" ]; then
-    if ! grep -qxF 'dm/' "$BRAIN/.gitignore" 2>/dev/null; then
+    if ! git -C "$ROOT" check-ignore --no-index -q -- .brain/dm/.brain-ignore-probe 2>/dev/null; then
       printf 'dm/\n' >> "$BRAIN/.gitignore" 2>/dev/null \
-        || { _lock_release commit; _die "cannot write .brain/.gitignore to exclude dm/ — refusing to commit"; }
-      grep -qxF 'dm/' "$BRAIN/.gitignore" 2>/dev/null \
-        || { _lock_release commit; _die "could not verify the dm/ ignore rule — refusing to commit"; }
+        || _commit_abort "cannot write .brain/.gitignore to exclude dm/ — refusing to commit"
+      git -C "$ROOT" check-ignore --no-index -q -- .brain/dm/.brain-ignore-probe 2>/dev/null \
+        || _commit_abort "could not verify the dm/ ignore rule — refusing to commit"
       _warn "added missing 'dm/' to .brain/.gitignore — DM inboxes must never be committed"
     fi
     # An ignore rule does not apply to files git already TRACKS, and does not un-stage. Purge
     # every dm path git knows about, not merely the ones showing in a staged diff.
     if git -C "$ROOT" ls-files --cached -- .brain/dm 2>/dev/null | grep -q .; then
       git -C "$ROOT" rm -r --cached -q --ignore-unmatch -- .brain/dm 2>/dev/null \
-        || { _lock_release commit; _die "could not un-track .brain/dm/ — refusing to commit"; }
+        || _commit_abort "could not un-track .brain/dm/ — refusing to commit"
       _warn "un-tracked .brain/dm/ — DM inboxes are per-machine and must never be committed"
     fi
   fi
@@ -850,25 +888,77 @@ cmd_commit() {
       done < "$_deny"
     fi
   done
-  if [ -n "$_hit" ]; then _lock_release commit; _die "secret-scan abort: $_hit"; fi
+  [ -z "$_hit" ] || _commit_abort "secret-scan abort: $_hit"
 
-  git -C "$ROOT" add -- .brain 2>/dev/null
+  _commit_git_dir=$(git -C "$ROOT" rev-parse --git-dir 2>/dev/null) \
+    || _commit_abort "could not resolve git directory for temporary commit index"
+  case "$_commit_git_dir" in
+    /*) ;;
+    *) _commit_git_dir="$ROOT/$_commit_git_dir" ;;
+  esac
+  [ -d "$_commit_git_dir" ] \
+    || _commit_abort "git directory is not a directory: $_commit_git_dir"
+  _commit_index="$_commit_git_dir/brain-commit-index.$$"
+  _commit_index_n=0
+  while [ -e "$_commit_index" ] || [ -L "$_commit_index" ] \
+     || [ -e "$_commit_index.lock" ] || [ -L "$_commit_index.lock" ]; do
+    _commit_index_n=$((_commit_index_n + 1))
+    _commit_index="$_commit_git_dir/brain-commit-index.$$-$_commit_index_n"
+  done
+
+  _commit_parent=$(git -C "$ROOT" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || _commit_parent=""
+  if [ -n "$_commit_parent" ]; then
+    GIT_INDEX_FILE="$_commit_index" git -C "$ROOT" read-tree "$_commit_parent" 2>/dev/null \
+      || _commit_abort "could not seed temporary commit index from HEAD"
+  else
+    GIT_INDEX_FILE="$_commit_index" git -C "$ROOT" read-tree --empty 2>/dev/null \
+      || _commit_abort "could not initialize temporary commit index"
+  fi
+  GIT_INDEX_FILE="$_commit_index" git -C "$ROOT" add -A -- .brain 2>/dev/null \
+    || _commit_abort "could not stage .brain into temporary commit index"
   # Re-purge AFTER staging: a DM landing between the pre-check and `git add` would otherwise
-  # ride along. Then assert the invariant on the actual index — fail closed if it does not hold.
-  git -C "$ROOT" rm -r --cached -q --ignore-unmatch -- .brain/dm 2>/dev/null || true
-  if git -C "$ROOT" diff --cached --name-only -- .brain/dm 2>/dev/null | grep -q .; then
-    _lock_release commit
-    _die "refusing to commit: .brain/dm/ is still staged after purge — DM bodies must never be committed"
+  # ride along. Then assert the invariant on the sanitized index — fail closed if any DM entry
+  # remains, while allowing the intended deletion of DM entries inherited from HEAD.
+  GIT_INDEX_FILE="$_commit_index" git -C "$ROOT" rm -r --cached -q --ignore-unmatch -- .brain/dm 2>/dev/null || true
+  _commit_dm_entries=$(GIT_INDEX_FILE="$_commit_index" git -C "$ROOT" ls-files --cached -- .brain/dm 2>/dev/null) \
+    || _commit_abort "could not verify temporary commit index after DM purge"
+  [ -z "$_commit_dm_entries" ] \
+    || _commit_abort "refusing to commit: .brain/dm/ is still staged after purge — DM bodies must never be committed"
+
+  _commit_tree=$(GIT_INDEX_FILE="$_commit_index" git -C "$ROOT" write-tree 2>/dev/null) \
+    || _commit_abort "could not write sanitized .brain tree"
+  if [ -n "$_commit_parent" ]; then
+    _commit_parent_tree=$(git -C "$ROOT" rev-parse "$_commit_parent^{tree}" 2>/dev/null) \
+      || _commit_abort "could not resolve HEAD tree"
+    if [ "$_commit_tree" = "$_commit_parent_tree" ]; then
+      git -C "$ROOT" reset -q HEAD -- .brain 2>/dev/null \
+        || _commit_abort "could not reconcile the real index for .brain"
+      _commit_finish
+      printf 'brain: nothing to commit\n'
+      return 0
+    fi
+    _commit_new=$(git -C "$ROOT" commit-tree "$_commit_tree" -p "$_commit_parent" \
+      -m "chore(brain): sync coordination vault" 2>/dev/null) \
+      || _commit_abort "commit failed"
+    git -C "$ROOT" update-ref -m "brain commit: sync coordination vault" HEAD \
+      "$_commit_new" "$_commit_parent" 2>/dev/null \
+      || _commit_abort "commit failed: HEAD changed while building the sanitized commit"
+  else
+    _commit_new=$(git -C "$ROOT" commit-tree "$_commit_tree" \
+      -m "chore(brain): sync coordination vault" 2>/dev/null) \
+      || _commit_abort "commit failed"
+    git -C "$ROOT" update-ref -m "brain commit: sync coordination vault" HEAD \
+      "$_commit_new" 2>/dev/null || _commit_abort "commit failed"
   fi
-  if git -C "$ROOT" diff --cached --quiet -- .brain 2>/dev/null; then
-    _lock_release commit; printf 'brain: nothing to commit\n'; return 0
-  fi
-  git -C "$ROOT" commit -q -m "chore(brain): sync coordination vault" -- .brain || { _lock_release commit; _die "commit failed"; }
+  # The temp index produced the new HEAD; reconcile only .brain in the developer's real index.
+  # This leaves unrelated staged work intact and never re-reads the working tree into the commit.
+  git -C "$ROOT" reset -q HEAD -- .brain 2>/dev/null \
+    || _commit_abort "committed, but could not reconcile the real index for .brain"
   # ff-only rebase onto the fresh integration branch; never force-push (push is the caller's job)
   git -C "$ROOT" fetch -q "$(_main_remote)" "$(_main_branch)" 2>/dev/null && \
     git -C "$ROOT" rebase -q "$(_main_ref)" 2>/dev/null || \
     _warn "could not rebase onto $(_main_ref) (resolve manually before pushing)"
-  _lock_release commit
+  _commit_finish
   printf 'brain: committed .brain/ (chore(brain): sync coordination vault)\n'
 }
 
@@ -1123,21 +1213,8 @@ cmd_hook() {
 }
 
 # ── install (machine-global pieces that do NOT travel with git) ───────────────────────────────
-cmd_install() {
-  ROOT=$(brain_root) || _die "not inside a git repository"
-  BRAIN="$ROOT/.brain"
-  _src="$BRAIN/templates/navigation-standards.SKILL.md"
-  [ -f "$_src" ] || _die "missing nav-skill template (run brain init first): $_src"
-
-  _skills="${BRAIN_SKILLS_DIR:-$HOME/.claude/skills}/navigation-standards"
-  mkdir -p "$_skills"; cp "$_src" "$_skills/SKILL.md"
-
-  _gs="${BRAIN_GLOBAL_SETTINGS:-$HOME/.claude/settings.json}"
-  mkdir -p "$(dirname "$_gs")"; [ -f "$_gs" ] || printf '{}\n' > "$_gs"
-  _disp_ss='d="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0; case "$d" in /*) ;; *) d="$(cd "$d" 2>/dev/null && pwd)" || exit 0;; esac; r="$(dirname "$d")"; [ -x "$r/.brain/bin/brain" ] && exec "$r/.brain/bin/brain" hook session-start || exit 0'
-  _disp_pt='d="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0; case "$d" in /*) ;; *) d="$(cd "$d" 2>/dev/null && pwd)" || exit 0;; esac; r="$(dirname "$d")"; [ -x "$r/.brain/bin/brain" ] && exec "$r/.brain/bin/brain" hook pre-tool || exit 0'
-  _tmp=$(mktemp)
-  jq --arg ss "$_disp_ss" --arg pt "$_disp_pt" --arg dir "$BRAIN" --arg allow "Bash($BRAIN/bin/brain:*)" '
+_filter_global_settings() {
+  jq --arg ss "$_rgs_ss" --arg pt "$_rgs_pt" --arg dir "$BRAIN" --arg allow "Bash($BRAIN/bin/brain:*)" '
     .hooks = (.hooks // {}) |
     .hooks.SessionStart = (.hooks.SessionStart // []) |
     .hooks.PreToolUse = (.hooks.PreToolUse // []) |
@@ -1148,23 +1225,65 @@ cmd_install() {
     .permissions = (.permissions // {}) |
     .permissions.additionalDirectories = ((.permissions.additionalDirectories // []) + [$dir] | unique) |
     .permissions.allow = ((.permissions.allow // []) + [$allow] | unique)
-  ' "$_gs" > "$_tmp" && mv "$_tmp" "$_gs" || { rm -f "$_tmp"; _die "failed to merge global settings"; }
+  '
+}
+
+_render_global_settings() { # <source> <session-dispatcher> <pretool-dispatcher>
+  _rgs_source=$1; _rgs_ss=$2; _rgs_pt=$3
+  if [ -f "$_rgs_source" ]; then
+    _filter_global_settings < "$_rgs_source"
+  else
+    printf '{}\n' | _filter_global_settings
+  fi
+}
+
+cmd_install() {
+  ROOT=$(brain_root) || _die "not inside a git repository"
+  BRAIN="$ROOT/.brain"
+  _src="$BRAIN/templates/navigation-standards.SKILL.md"
+  [ -f "$_src" ] || _die "missing nav-skill template (run brain init first): $_src"
+
+  _skills="${BRAIN_SKILLS_DIR:-$HOME/.claude/skills}/navigation-standards"
+  mkdir -p "$_skills" || _die "could not create nav-skill directory: $_skills"
+  _atomic_place cat "$_skills/SKILL.md" "$_src" \
+    || _die "could not install nav skill: $_skills/SKILL.md"
+
+  _gs="${BRAIN_GLOBAL_SETTINGS:-$HOME/.claude/settings.json}"
+  _gs_dir=$(dirname "$_gs")
+  mkdir -p "$_gs_dir" || _die "could not create global settings directory: $_gs_dir"
+  _disp_ss='d="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0; case "$d" in /*) ;; *) d="$(cd "$d" 2>/dev/null && pwd)" || exit 0;; esac; r="$(dirname "$d")"; [ -x "$r/.brain/bin/brain" ] && exec "$r/.brain/bin/brain" hook session-start || exit 0'
+  _disp_pt='d="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0; case "$d" in /*) ;; *) d="$(cd "$d" 2>/dev/null && pwd)" || exit 0;; esac; r="$(dirname "$d")"; [ -x "$r/.brain/bin/brain" ] && exec "$r/.brain/bin/brain" hook pre-tool || exit 0'
+  _atomic_place _render_global_settings "$_gs" "$_gs" "$_disp_ss" "$_disp_pt" \
+    || _die "failed to merge global settings"
 
   printf 'brain: installed nav skill → %s\n' "$_skills/SKILL.md"
   printf 'brain: merged global dispatcher + allowlist → %s\n' "$_gs"
+}
+
+_filter_project_settings() {
+  jq --arg dir "$BRAIN" --arg allow "Bash($BRAIN/bin/brain:*)" '
+    .permissions = (.permissions // {}) |
+    .permissions.additionalDirectories = ((.permissions.additionalDirectories // []) + [$dir] | unique) |
+    .permissions.allow = ((.permissions.allow // []) + [$allow] | unique)
+  '
+}
+
+_render_project_settings() { # <source>
+  _rps_source=$1
+  if [ -f "$_rps_source" ]; then
+    _filter_project_settings < "$_rps_source"
+  else
+    printf '{}\n' | _filter_project_settings
+  fi
 }
 
 _write_project_settings() {
   # project .claude/settings.json: write-allowlist only (no hooks; hooks live in the global
   # dispatcher to avoid double-fire). .claude/settings.json is gitignored → main-worktree-local.
   _sf="$ROOT/.claude/settings.json"
-  mkdir -p "$ROOT/.claude"; [ -f "$_sf" ] || printf '{}\n' > "$_sf"
-  _tmp=$(mktemp)
-  jq --arg dir "$BRAIN" --arg allow "Bash($BRAIN/bin/brain:*)" '
-    .permissions = (.permissions // {}) |
-    .permissions.additionalDirectories = ((.permissions.additionalDirectories // []) + [$dir] | unique) |
-    .permissions.allow = ((.permissions.allow // []) + [$allow] | unique)
-  ' "$_sf" > "$_tmp" && mv "$_tmp" "$_sf" || { rm -f "$_tmp"; _warn "could not write project settings"; }
+  mkdir -p "$ROOT/.claude" || { _warn "could not create project settings directory"; return 1; }
+  _atomic_place _render_project_settings "$_sf" "$_sf" \
+    || { _warn "could not write project settings"; return 1; }
 }
 
 # ── init (scaffold the brain into a repo) ────────────────────────────────────────────────────
@@ -1204,8 +1323,9 @@ cmd_init() {
     printf 'brain: scaffolded %s\n' "$BRAIN"
   fi
 
-  _write_project_settings
-  printf 'brain: wrote project write-allowlist → %s/.claude/settings.json\n' "$ROOT"
+  if _write_project_settings; then
+    printf 'brain: wrote project write-allowlist → %s/.claude/settings.json\n' "$ROOT"
+  fi
 
   if [ "$_no_install" = 0 ]; then
     cmd_install
