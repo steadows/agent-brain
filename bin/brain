@@ -20,7 +20,10 @@ DM_MAX_BODY=4096
 DM_INJECT_MAX_LINES=40
 DM_INJECT_MAX_COLS=2000
 DM_FILENAME_MAX_BYTES=255
-DM_INJECT_MAX_TOTAL=$((DM_INJECT_MAX_LINES * (DM_INJECT_MAX_COLS + 1)))
+# Aggregate digest bound (seam must-survive #4) holds STRUCTURALLY, with no runtime accounting:
+# both consume loops cap at DM_INJECT_MAX_LINES entries and _dm_digest bounds every emitted line
+# to DM_INJECT_MAX_COLS bytes, so the total is ≤ LINES × (COLS + 1) by construction. A prior
+# per-message wc -c accumulator guarded exactly that unreachable branch and was removed.
 # Digest per-field starting budget: reserve DM_DIGEST_ENVELOPE cols for the JSON envelope,
 # then divide by DM_ESCAPE_FACTOR — worst-case JSON escaping (\uXXXX) expands one character
 # into six output characters. The serializer reduces this budget further when needed.
@@ -42,7 +45,7 @@ brain_root() {
 # ── Small helpers ────────────────────────────────────────────────────────────────────────────
 _now_iso()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 _now_compact() { date -u +%Y%m%dT%H%M%SZ; }   # filename-safe clock (dm message IDs)
-_now_epoch()   { date -u +%s; }               # filename-safe collision suffixes
+_now_epoch()   { date -u +%s; }               # epoch clock (collision suffixes)
 _today()    { date -u +%Y-%m-%d; }
 # Test seam: BRAIN_TEST_BRANCH overrides the resolved branch (used by the smoke test only).
 _branch()   { printf '%s\n' "${BRAIN_TEST_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)}"; }
@@ -340,8 +343,7 @@ _dm_id_in_use() { # <lane> <id>
   _iu_lane=$1; _iu_id=$2
   for _iu_state in pending read failed; do
     _iu_file="$BRAIN/dm/$_iu_lane/$_iu_state/$_iu_id"
-    [ -e "$_iu_file" ] || [ -L "$_iu_file" ] || continue
-    return 0
+    if [ -e "$_iu_file" ] || [ -L "$_iu_file" ]; then return 0; fi
   done
   return 1
 }
@@ -397,7 +399,6 @@ _dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
 # original name when NAME_MAX allows; a checksum fallback keeps long records distinct.
 _dm_collision_dest() { # <lane> <read|failed> <name>
   _cd_lane=$1; _cd_state=$2; _cd_name=$3
-  case "$_cd_state" in read|failed) ;; *) return 2 ;; esac
   _cd_dir="$BRAIN/dm/$_cd_lane/$_cd_state"; _cd_dest="$_cd_dir/$_cd_name"
   if ! _dm_dest_occupied "$_cd_dest"; then printf '%s\n' "$_cd_dest"; return 0; fi
   _cd_stamp=$(_now_epoch) || return 1
@@ -439,17 +440,6 @@ _dm_jq_preflight() {
       >/dev/null 2>&1
 }
 
-_dm_message_ok() { # <message-file>
-  jq -e -s '
-    length == 1
-    and (.[0] | type) == "object"
-    and (.[0].from | type) == "string"
-    and (.[0].to | type) == "string"
-    and (.[0].ts | type) == "string"
-    and (.[0].content | type) == "string"
-  ' "$1" >/dev/null 2>&1
-}
-
 # Rebuild one validated pending object from only the bounded wire fields plus its stable ID. The
 # recursive byte check preserves the content head while keeping the serialized record valid.
 _dm_digest() { # <message-file> <message-id>
@@ -486,27 +476,28 @@ _dm_digest() { # <message-file> <message-id>
   ' "$_dg_file" 2>/dev/null
 }
 
-# Return 0 with one digest line, 2 only for a structurally invalid regular message, and 1 for
-# path or rendering failures that must remain pending.
+# Digest one pending message — the shared per-message step of BOTH consume paths (take and
+# SessionStart), owning validation, quarantine, and the warn for every outcome so callers never
+# duplicate policy. rc 0: digest line on stdout, file left pending for the caller's emit→archive
+# sequence. rc 2: structurally invalid — quarantined into failed/ HERE. rc 3: structurally
+# invalid AND the quarantine itself failed (file left pending). rc 1: transient failure — file
+# left pending (a system error is not proof of invalidity; jq's own error() exit, 5, is).
 _dm_pending_digest() { # <lane> <message-file>
   _pd_lane=$1; _pd_file=$2; _pd_name=${_pd_file##*/}
   _dm_dir_ok "$_pd_file" || return 1
   if ! _dm_id_ok "$_pd_name"; then
     _warn "invalid pending dm name for @$_pd_lane: $_pd_name"
+    _dm_route_failed "$_pd_lane" "$_pd_file" "structurally invalid dm message" || return 3
     return 2
   fi
-  _dm_message_ok "$_pd_file"
-  _pd_message_rc=$?
-  case "$_pd_message_rc" in
-    0) ;;
-    1|4|5) _warn "invalid dm object in $_pd_file"; return 2 ;;
-    *) return 1 ;;
-  esac
   _dm_digest "$_pd_file" "$_pd_name"
   _pd_digest_rc=$?
   case "$_pd_digest_rc" in
     0) return 0 ;;
-    5) _warn "invalid dm object in $_pd_file"; return 2 ;;
+    5)
+      _warn "invalid dm object in $_pd_file"
+      _dm_route_failed "$_pd_lane" "$_pd_file" "structurally invalid dm message" || return 3
+      return 2 ;;
     *)
       _warn "could not digest pending dm message for @$_pd_lane: $_pd_name; leaving it pending"
       return 1 ;;
@@ -520,9 +511,10 @@ _dm_archive() { # <lane> <message-file>
   _dm_dir_ok "$BRAIN/dm/$_ar_lane/read" || return 1
   _dm_dir_ok "$_ar_file" || return 1
   _dm_id_ok "$_ar_name" || { _warn "invalid pending dm name at archive: $_ar_name"; return 1; }
-  _ar_dest=$(_dm_collision_dest "$_ar_lane" read "$_ar_name") || return 1
-  _dm_dest_occupied "$_ar_dest" \
-    && { _warn "dm read destination became occupied for $_ar_name"; return 1; }
+  _ar_dest="$BRAIN/dm/$_ar_lane/read/$_ar_name"
+  if _dm_dest_occupied "$_ar_dest"; then
+    _ar_dest=$(_dm_collision_dest "$_ar_lane" read "$_ar_name") || return 1
+  fi
   if command mv -f -- "$_ar_file" "$_ar_dest" 2>/dev/null; then return 0; fi
   _warn "could not archive emitted dm message for @$_ar_lane: $_ar_name"
   return 1
@@ -543,34 +535,21 @@ cmd_dm_take() {
   _dm_ensure_tree "$_dt_lane" || return 1
   _dt_pending="$BRAIN/dm/$_dt_lane/pending"
   _dm_dir_ok "$_dt_pending" || return 1
-  _dt_count=0; _dt_bytes=0; _dt_rc=0
+  _dt_count=0; _dt_rc=0
   for _dt_file in "$_dt_pending"/*; do
     [ -e "$_dt_file" ] || [ -L "$_dt_file" ] || continue
     [ "$_dt_count" -lt "$DM_INJECT_MAX_LINES" ] || break
     _dt_count=$((_dt_count + 1))
     _dt_digest=$(_dm_pending_digest "$_dt_lane" "$_dt_file")
-    _dt_digest_rc=$?
-    case "$_dt_digest_rc" in
+    case $? in
       0) ;;
-      2)
-        _dm_route_failed "$_dt_lane" "$_dt_file" "structurally invalid dm message" \
-          || _dt_rc=1
-        continue ;;
-      *)
-        _warn "could not digest pending dm message for @$_dt_lane: ${_dt_file##*/}; leaving it pending"
-        _dt_rc=1
-        continue ;;
+      2) continue ;;
+      *) _dt_rc=1; continue ;;
     esac
-    _dt_line_bytes=$(LC_ALL=C printf '%s\n' "$_dt_digest" | wc -c | tr -d ' \n')
-    if [ $((_dt_bytes + _dt_line_bytes)) -gt "$DM_INJECT_MAX_TOTAL" ]; then
-      _warn "dm digest aggregate cap reached for @$_dt_lane; leaving remaining messages pending"
-      break
-    fi
     if ! printf '%s\n' "$_dt_digest"; then
       _warn "could not emit pending dm messages for @$_dt_lane; leaving them pending"
       return 1
     fi
-    _dt_bytes=$((_dt_bytes + _dt_line_bytes))
     _dm_archive "$_dt_lane" "$_dt_file" || _dt_rc=1
   done
   return "$_dt_rc"
@@ -1204,7 +1183,7 @@ _hook_session_start() {
   # (b2) Inspect a bounded batch in pending/. Structurally invalid regular files are quarantined
   # independently; valid files stay pending until the complete SessionStart payload is emitted.
   _ib="$BRAIN/dm/$_feat/pending"
-  _dm_block=""; _digest=""; _valid_names=""; _batch_count=0; _batch_bytes=0; _more_dm=0
+  _dm_block=""; _digest=""; _valid_names=""; _batch_count=0; _more_dm=0
   if _dm_ensure_tree "$_feat"; then
     if ! _dm_jq_preflight; then
       _warn "SessionStart dm consume: jq is unavailable or incompatible; leaving all messages pending"
@@ -1217,23 +1196,11 @@ _hook_session_start() {
         fi
         _batch_count=$((_batch_count + 1))
         _digest_line=$(_dm_pending_digest "$_feat" "$_pending_file")
-        _digest_rc=$?
-        case "$_digest_rc" in
+        case $? in
           0) ;;
-          2)
-            _dm_route_failed "$_feat" "$_pending_file" "structurally invalid dm message" \
-              || _warn "could not quarantine invalid dm message for @$_feat: ${_pending_file##*/}"
-            continue ;;
-          *)
-            _warn "could not digest pending dm message for @$_feat: ${_pending_file##*/}; leaving it pending"
-            continue ;;
+          3) _warn "could not quarantine invalid dm message for @$_feat: ${_pending_file##*/}"; continue ;;
+          *) continue ;;
         esac
-        _digest_bytes=$(LC_ALL=C printf '%s\n' "$_digest_line" | wc -c | tr -d ' \n')
-        if [ $((_batch_bytes + _digest_bytes)) -gt "$DM_INJECT_MAX_TOTAL" ]; then
-          _more_dm=1
-          break
-        fi
-        _batch_bytes=$((_batch_bytes + _digest_bytes))
         _digest="${_digest}${_digest:+
 }${_digest_line}"
         _pending_name=${_pending_file##*/}
