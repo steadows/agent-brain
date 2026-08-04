@@ -194,6 +194,17 @@ dies with `_inbox_rotate` itself. TOCTOU residual documented at the helper, once
 ### `_dm_new_id` — message-ID mint
 consumers: `_dm_send` only (but the format is contract — filenames ARE message IDs).
 contract: `$(_now_compact)-$$`, bump `-<n>` while target exists. Reuses `_now_compact` as-is.
+**A fresh send mints attempt counter ZERO: `<id>.a0`** (gap (b) closed 2026-08-04 — the map was
+silent; the RED suite pins `.a0` at Q.S/2 and this ruling ratifies it).
+
+### `<claim-ts>` encoding — RULED: Unix epoch seconds (gap (a) closed 2026-08-04)
+The map pinned `.c<claim-ts>-<claimer-pid>` without choosing an encoding. Ruling: **epoch
+seconds** (`date +%s`), NOT `_now_compact`. Reason it isn't a coin flip: staleness is judged by
+arithmetic (`now - claim_ts > DM_CLAIM_MAX_AGE`), and epoch seconds make that a portable integer
+compare — parsing `_now_compact` back to epoch requires `date -j -f` (BSD) vs `date -d` (GNU),
+exactly the portability fork a POSIX-sh engine must not stand on. Digits are filename-safe. The
+RED suite's `age_claim` instrument detects either encoding, so no test change is forced by this
+ruling — but the implementation and any future scenario pin epoch seconds.
 
 ### `_dm_claim_all <lane>` / `_dm_recover_stale <lane>` / `_dm_ack <lane> <claimed-name>` — lifecycle
 consumers: `_hook_session_start` (recover → claim → digest → emit → ack-each) and the new live
