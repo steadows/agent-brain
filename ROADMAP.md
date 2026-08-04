@@ -39,6 +39,22 @@ v1 is filesystem-only and deliberately small; this is the backlog for "further d
 
 ---
 
+## Known issue — `brain commit` wedges for one class of legacy vault (open, 2026-08-04)
+
+Found by the UR-4a RED audit; **pre-existing, not introduced by v1.1**, and NOT closed by the
+UR-4a fix. If a vault has `dm/` un-ignored, an inbox that is **tracked and unmodified**, and that
+inbox's body contains a line matching the commit secret scan's `^[A-Z][A-Z0-9_]*=.+`, then
+`brain commit` aborts on the scan — and because the pre-purge's staged deletion persists, it
+aborts again on every rerun. Permanent, same as the UR-4a wedge it otherwise fixes.
+
+Exposure is bounded: a real `inbox.jsonl` line starts with `{` and cannot match the anchored
+pattern, so the trigger requires a truncated write, a hand-edit, or a pre-v1 body format.
+No scenario covers it (the RED suite's fixtures use JSON bodies deliberately, to keep the scan
+out of the way of the UR-4a assertions). Mechanism and full measurement in
+`.context/seams/dm-v1.1-queue.md` under the UR-4a ruling. **Do not "simplify" either purge in
+`cmd_commit` without reading it** — the pre-purge looks like dead code on the fixed engine and
+is not.
+
 ## v1.1 — DM per-message queue (⚠ PROMOTED TO SHIP-BLOCKING, Steve 2026-08-03 evening)
 
 > **Status changed the same day it was written.** The 7.4 ultrareview (report:

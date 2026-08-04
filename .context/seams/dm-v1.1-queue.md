@@ -283,9 +283,26 @@ archive-name recipe and its comment block · `_inbox_ensure`'s append-creation s
   real index untouched. This is NOT the same as seeding the temp index from the CURRENT index —
   that is precisely what swept the unrelated work. **But it does not satisfy (4) on its own**: the
   implementation must additionally reconcile the real index's `.brain` entries with the new HEAD
-  (e.g. `git read-tree` the committed `.brain` paths back into the real index) WITHOUT disturbing
-  any other staged path. Verify against both limbs — unrelated staged work absent from the commit,
-  AND `git status` clean for `.brain` after it.
+  WITHOUT disturbing any other staged path. **The verified shape is `git reset -q HEAD -- .brain`
+  after `update-ref`** — NOT a blanket `git read-tree HEAD`, which fixes the index but silently
+  un-stages the developer's unrelated work (measured: read-tree fails the "still staged" limb and
+  nothing else). `reset` with a pathspec is index-only, so the working tree is never touched.
+  Adversarially verified against partially-staged files inside AND outside `.brain`, a staged
+  deletion, and a rename inside `.brain` — byte-identical to today's engine on every axis.
+  **⚠ KNOWN LIMITATION, pre-existing, NOT closed by this fix (recorded 2026-08-04, round 3).**
+  UR-4a's cleanup still wedges **permanently** for one class of legacy vault: `dm/` never ignored,
+  the inbox **tracked and unmodified**, and its body containing a line matching the commit secret
+  scan's `^[A-Z][A-Z0-9_]*=.+`. Mechanism: the pre-purge stages the DM deletion *before* the scan,
+  and that staged deletion is what pulls the still-on-disk file into the scan's list — so
+  `brain commit` aborts, and the staged deletion persists, so it aborts again on every rerun.
+  (Remove the pre-purge and the file is tracked-and-unmodified, appears in neither
+  `--others --modified` nor `diff --cached`, is never scanned, and the commit succeeds — which is
+  why the pre-purge is **live code, not dead**, despite no scenario catching its removal.)
+  Exposure is bounded: a real `inbox.jsonl` line starts with `{` and cannot match, so the trigger
+  needs a truncated write, a hand-edit, or a pre-v1 body format. Today's engine behaves
+  identically, so this is not a regression — but the fix does not complete the cleanup for every
+  legacy vault, and any future claim that a purge is redundant must name both its architecture
+  AND this secret-scan path.
 - **UR-4b:** replace the `grep -qxF 'dm/'` ignore check with `git check-ignore --no-index`.
   **Audit note:** a fixed-string grep that special-cases the fixture (`grep 'dm/' && ! grep '!dm/'`)
   scores 12/12 — the negation spelling is the only discriminating axis, and `!dm/`, `!/dm/` and
