@@ -254,7 +254,29 @@ archive-name recipe and its comment block · `_inbox_ensure`'s append-creation s
   of un-tracked-on-purpose paths* (proceed). Commit via a sanitized index path per the
   ultrareview's sketch. The existing prefix-scoped `dm/` literals already cover the new subtree
   (Stage-2 finding) — no layout work.
+  **⚠ RULING 2026-08-04 — UR-4a is a THREE-way constraint, not two.** The obvious fixes satisfy
+  two and silently break the third. All three are mandatory:
+  1. **Unwedge** — a staged deletion of an intentionally-untracked DM path must not abort, and
+     must not abort on RETRY either (permanence is the defect; a one-shot success proves nothing).
+  2. **No pathspec semantics on the commit** — `git commit -- .brain` re-reads the WORKING TREE
+     for those paths, so a live inbox on disk can be committed even after the index was purged
+     (the ultrareview's own reason for the sanitized-index sketch).
+  3. **Still path-scoped IN EFFECT** — ONLY `.brain` paths may land in the commit. The engine
+     advertises "path-scoped" in its usage (`bin/brain:1232`) and the current call is
+     pathspec-scoped (`:866`). Dropping the pathspec to satisfy (1)+(2) makes `git commit` take
+     the WHOLE index, sweeping a developer's unrelated staged work into
+     `chore(brain): sync coordination vault`. **Measured by the audit: four independent candidate
+     fixes — including the ultrareview's own temp-index sketch and the RED author's prototype —
+     all did exactly this and still scored 12/12** before the path-scoping assertion existed.
+  The shape that satisfies all three: seed a temp index from **HEAD**, stage only `.brain` paths
+  into it (DM entries excluded), then `write-tree` → `commit-tree` → `update-ref`, leaving the
+  real index untouched. This is NOT the same as seeding the temp index from the CURRENT index —
+  that is precisely what swept the unrelated work.
 - **UR-4b:** replace the `grep -qxF 'dm/'` ignore check with `git check-ignore --no-index`.
+  **Audit note:** a fixed-string grep that special-cases the fixture (`grep 'dm/' && ! grep '!dm/'`)
+  scores 12/12 — the negation spelling is the only discriminating axis, and `!dm/`, `!/dm/` and
+  `!dm` all re-include while all three heal. The RED must parametrize over all three; that raises
+  any non-`check-ignore` implementation to "reimplement gitignore matching."
 - **UR-7:** `cmd_install` — check every `mkdir`/`cp`, route the skill copy through
   `_atomic_place`. (`cmd_init`'s `|| true` copies are out of scope — pre-existing, not
   deploy-load-bearing.)
