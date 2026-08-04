@@ -8,27 +8,18 @@
 # (the portable equivalent — mkdir is atomic create on POSIX filesystems).
 
 set -u
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # Clear the vault-resolution sentinel at process entry: it is a marker for "this process ran
 # brain_root()", and an inherited value would let a caller's environment stand in for that.
 _BRAIN_RESOLVED=""
 
 # DM bounds. One file per message removes the old append-atomicity rationale; the body cap now
-# bounds storage and digest work. The lease and attempt cap make interrupted delivery recoverable
-# without letting a poison message loop forever.
+# bounds storage and digest work. Consumption is bounded by the surviving digest limits.
 DM_MAX_BODY=4096
 DM_INJECT_MAX_LINES=40
 DM_INJECT_MAX_COLS=2000
-DM_CLAIM_MAX_AGE=600
-DM_MAX_ATTEMPTS=3
-DM_TEMP_MAX_AGE=300
-DM_TRANSITION_MAX=40
-DM_CLAIM_EPOCH_MAX_DIGITS=10
-DM_CLAIMER_PID_MAX_DIGITS=10
 DM_FILENAME_MAX_BYTES=255
-# Reserve `.a<max-attempt>.c<max-epoch>-<max-pid>` inside NAME_MAX for every accepted ID.
-DM_ID_MAX_BYTES=$((DM_FILENAME_MAX_BYTES - 2 - ${#DM_MAX_ATTEMPTS} - 2 - DM_CLAIM_EPOCH_MAX_DIGITS - 1 - DM_CLAIMER_PID_MAX_DIGITS))
 DM_INJECT_MAX_TOTAL=$((DM_INJECT_MAX_LINES * (DM_INJECT_MAX_COLS + 1)))
 # Digest per-field starting budget: reserve DM_DIGEST_ENVELOPE cols for the JSON envelope,
 # then divide by DM_ESCAPE_FACTOR — worst-case JSON escaping (\uXXXX) expands one character
@@ -51,7 +42,7 @@ brain_root() {
 # ── Small helpers ────────────────────────────────────────────────────────────────────────────
 _now_iso()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 _now_compact() { date -u +%Y%m%dT%H%M%SZ; }   # filename-safe clock (dm message IDs)
-_now_epoch()   { date -u +%s; }               # epoch clock (dm claim stamps + lease math)
+_now_epoch()   { date -u +%s; }               # filename-safe collision suffixes
 _today()    { date -u +%Y-%m-%d; }
 # Test seam: BRAIN_TEST_BRANCH overrides the resolved branch (used by the smoke test only).
 _branch()   { printf '%s\n' "${BRAIN_TEST_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)}"; }
@@ -259,8 +250,8 @@ cmd_announce() {
 # ── dm (direct lane-to-lane message; the fast path, NOT the record) ──────────────────────────
 # The journal stays the durable record and connections stay the state. A DM is the SIGNAL that
 # something changed — it exists to cut unblock latency from "next session boot" to seconds.
-# Queue entries move pending → claimed → read, with stale claims retried and poison messages
-# retained in failed/. Rename arbitration is the only concurrency control; this path takes no lock.
+# Queue entries stay pending until emission succeeds, then move directly to read/. Structurally
+# invalid messages move to failed/. The single-session queue path takes no lock.
 _feat_ok() {
   case "$1" in
     ''|.*|-*|*'..'*|*[!A-Za-z0-9._-]*) return 1 ;;
@@ -292,7 +283,7 @@ _dm_dir_ok() { # <dm-root|lane-dir|state-dir|message-file>
   [ "$_do_rest" = "$_do_lane" ] && return 0
 
   _do_tail=${_do_rest#*/}; _do_state=${_do_tail%%/*}
-  case "$_do_state" in pending|claimed|read|failed) ;; *)
+  case "$_do_state" in pending|read|failed) ;; *)
     _warn "invalid dm queue state: $_do_state"; return 1 ;;
   esac
   _do_state_path="$_do_lane_path/$_do_state"
@@ -331,7 +322,7 @@ _dm_ensure_tree() { # <lane>
   _et_lane_dir="$BRAIN/dm/$_et_lane"
   _dm_make_dir "$BRAIN/dm" || return 1
   _dm_make_dir "$_et_lane_dir" || return 1
-  for _et_state in pending claimed read failed; do
+  for _et_state in pending read failed; do
     _dm_make_dir "$_et_lane_dir/$_et_state" || return 1
   done
 }
@@ -347,20 +338,19 @@ cmd_inbox() {
 
 _dm_id_in_use() { # <lane> <id>
   _iu_lane=$1; _iu_id=$2
-  for _iu_state in pending claimed read failed; do
-    for _iu_file in "$BRAIN/dm/$_iu_lane/$_iu_state/$_iu_id".a*; do
-      [ -e "$_iu_file" ] || [ -L "$_iu_file" ] || continue
-      return 0
-    done
+  for _iu_state in pending read failed; do
+    _iu_file="$BRAIN/dm/$_iu_lane/$_iu_state/$_iu_id"
+    [ -e "$_iu_file" ] || [ -L "$_iu_file" ] || continue
+    return 0
   done
   return 1
 }
 
-# One producer-shaped ID bound for BOTH consume paths (claim + recover):
+# Producer-shaped stable message ID:
 # `<YYYYmmddTHHMMSSZ>-<decimal-pid>[-<decimal-collision-bump>]`.
 _dm_id_ok() {
   _io_id=$1
-  [ "${#_io_id}" -le "$DM_ID_MAX_BYTES" ] || return 1
+  [ "${#_io_id}" -le "$DM_FILENAME_MAX_BYTES" ] || return 1
   case "$_io_id" in
     [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-[0-9]*) ;;
     *) return 1 ;;
@@ -374,20 +364,6 @@ _dm_id_ok() {
   if [ -n "$_io_bump" ]; then
     case "$_io_bump" in *[!0-9]*) return 1 ;; esac
   fi
-}
-
-# Queue decimals are untrusted filename components. Canonical, width-bounded validation must
-# happen before arithmetic expansion because an invalid operand can terminate the whole shell.
-_dm_decimal_ok() { # <value> <max-digits>
-  _dc_value=$1; _dc_max_digits=$2
-  case "$_dc_value" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; esac
-  [ "${#_dc_value}" -le "$_dc_max_digits" ]
-}
-
-_dm_attempt_ok() { # <value>
-  _at_value=$1
-  _dm_decimal_ok "$_at_value" "${#DM_MAX_ATTEMPTS}" || return 1
-  [ "$_at_value" -le "$DM_MAX_ATTEMPTS" ]
 }
 
 _dm_new_id() { # <lane>
@@ -411,55 +387,39 @@ _dm_send() { # <from> <to> <msg> <ts>
   _ds_from=$1; _ds_to=$2; _ds_msg=$3; _ds_ts=$4
   _dm_ensure_tree "$_ds_to" || return 1
   _ds_id=$(_dm_new_id "$_ds_to") || return 1
-  _ds_dest="$BRAIN/dm/$_ds_to/pending/$_ds_id.a0"
+  _ds_dest="$BRAIN/dm/$_ds_to/pending/$_ds_id"
   _atomic_place _dm_write_json "$_ds_dest" "$_ds_from" "$_ds_to" "$_ds_msg" "$_ds_ts"
-}
-
-_dm_purge_stale_temps() { # <lane>
-  _pt_lane=$1; _pt_pending="$BRAIN/dm/$_pt_lane/pending"; _pt_regular=0
-  _dm_dir_ok "$_pt_pending" || return 1
-  for _pt_file in "$_pt_pending"/.tmp-*; do
-    [ -e "$_pt_file" ] || [ -L "$_pt_file" ] || continue
-    if [ -L "$_pt_file" ] || [ ! -f "$_pt_file" ]; then
-      _warn "refusing non-regular dm temp: $_pt_file"
-      continue
-    fi
-    _pt_regular=1
-  done
-  [ "$_pt_regular" = 1 ] || return 0
-  _pt_minutes=$((DM_TEMP_MAX_AGE / 60))
-  # The expanded direct children are pruned, so one find pass never descends into a planted dir.
-  find "$_pt_pending"/.tmp-* -prune -type f -mmin "+$_pt_minutes" \
-    -exec rm -f -- {} + 2>/dev/null \
-    || { _warn "could not sweep stale dm temps under $_pt_pending"; return 1; }
 }
 
 _dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
 
-# Pick a never-occupied failed/ destination. Preserve the full original name when NAME_MAX allows;
-# a checksum fallback keeps collision records distinct when the original already fills NAME_MAX.
-_dm_failed_dest() { # <lane> <name>
-  _fd_lane=$1; _fd_name=$2; _fd_dir="$BRAIN/dm/$_fd_lane/failed"
-  _fd_dest="$_fd_dir/$_fd_name"
-  if ! _dm_dest_occupied "$_fd_dest"; then printf '%s\n' "$_fd_dest"; return 0; fi
-  _fd_stamp=$(_now_epoch) || return 1
-  _fd_suffix=".collision-$_fd_stamp-$$"; _fd_candidate="$_fd_name$_fd_suffix"
-  _fd_bytes=$(LC_ALL=C printf '%s' "$_fd_candidate" | wc -c | tr -d ' \n')
-  if [ "$_fd_bytes" -gt "$DM_FILENAME_MAX_BYTES" ]; then
-    _fd_sum=$(printf '%s' "$_fd_name" | cksum) || return 1
-    _fd_sum=${_fd_sum%% *}
-    _fd_candidate="collision-$_fd_sum-$_fd_stamp-$$"
+# Pick a never-occupied state destination with one shared collision-bump idiom. Preserve the
+# original name when NAME_MAX allows; a checksum fallback keeps long records distinct.
+_dm_collision_dest() { # <lane> <read|failed> <name>
+  _cd_lane=$1; _cd_state=$2; _cd_name=$3
+  case "$_cd_state" in read|failed) ;; *) return 2 ;; esac
+  _cd_dir="$BRAIN/dm/$_cd_lane/$_cd_state"; _cd_dest="$_cd_dir/$_cd_name"
+  if ! _dm_dest_occupied "$_cd_dest"; then printf '%s\n' "$_cd_dest"; return 0; fi
+  _cd_stamp=$(_now_epoch) || return 1
+  _cd_suffix=".collision-$_cd_stamp-$$"; _cd_candidate="$_cd_name$_cd_suffix"
+  _cd_bytes=$(LC_ALL=C printf '%s' "$_cd_candidate" | wc -c | tr -d ' \n')
+  if [ "$_cd_bytes" -gt "$DM_FILENAME_MAX_BYTES" ]; then
+    _cd_sum=$(printf '%s' "$_cd_name" | cksum) || return 1
+    _cd_sum=${_cd_sum%% *}
+    _cd_candidate="collision-$_cd_sum-$_cd_stamp-$$"
   fi
-  _fd_n=0; _fd_dest="$_fd_dir/$_fd_candidate"
-  while _dm_dest_occupied "$_fd_dest"; do
-    _fd_n=$((_fd_n + 1)); _fd_dest="$_fd_dir/$_fd_candidate-$_fd_n"
+  _cd_n=0; _cd_dest="$_cd_dir/$_cd_candidate"
+  while _dm_dest_occupied "$_cd_dest"; do
+    _cd_n=$((_cd_n + 1)); _cd_dest="$_cd_dir/$_cd_candidate-$_cd_n"
   done
-  printf '%s\n' "$_fd_dest"
+  printf '%s\n' "$_cd_dest"
 }
 
 _dm_route_failed() { # <lane> <message-file> <reason>
   _rf_lane=$1; _rf_file=$2; _rf_reason=$3; _rf_name=${_rf_file##*/}
-  _rf_dest=$(_dm_failed_dest "$_rf_lane" "$_rf_name") || return 1
+  _dm_dir_ok "$BRAIN/dm/$_rf_lane/failed" || return 1
+  _dm_dir_ok "$_rf_file" || return 1
+  _rf_dest=$(_dm_collision_dest "$_rf_lane" failed "$_rf_name") || return 1
   _dm_dest_occupied "$_rf_dest" \
     && { _warn "dm failed destination became occupied for $_rf_name"; return 1; }
   if command mv -f -- "$_rf_file" "$_rf_dest" 2>/dev/null; then
@@ -471,247 +431,147 @@ _dm_route_failed() { # <lane> <message-file> <reason>
   return 1
 }
 
-_dm_recover_stale() { # <lane> <transition-budget> — print transitions consumed
-  _rs_lane=$1; _rs_budget=${2:-$DM_TRANSITION_MAX}; _rs_used=0
-  _dm_ensure_tree "$_rs_lane" || return 1
-  _dm_purge_stale_temps "$_rs_lane" || return 1
-  _rs_claimed="$BRAIN/dm/$_rs_lane/claimed"; _rs_now=""
-  for _rs_file in "$_rs_claimed"/*; do
-    [ -e "$_rs_file" ] || [ -L "$_rs_file" ] || continue
-    _dm_dir_ok "$_rs_file" || continue
-    _rs_name=${_rs_file##*/}
-    case "$_rs_name" in *.a*.c*-*) ;; *)
-      [ "$_rs_used" -lt "$_rs_budget" ] || break
-      _dm_route_failed "$_rs_lane" "$_rs_file" "invalid claimed dm name" || return 1
-      _rs_used=$((_rs_used + 1))
-      continue ;;
-    esac
-    _rs_pre=${_rs_name%.c*}; _rs_stamp=${_rs_name##*.c}
-    _rs_claim_ts=${_rs_stamp%-*}; _rs_pid=${_rs_stamp##*-}
-    _rs_attempt=${_rs_pre##*.a}; _rs_id=${_rs_pre%.a*}
-    if ! _dm_decimal_ok "$_rs_claim_ts" "$DM_CLAIM_EPOCH_MAX_DIGITS"; then
-      [ "$_rs_used" -lt "$_rs_budget" ] || break
-      _dm_route_failed "$_rs_lane" "$_rs_file" "invalid claim epoch" || return 1
-      _rs_used=$((_rs_used + 1))
-      continue
-    fi
-    if ! _dm_decimal_ok "$_rs_pid" "$DM_CLAIMER_PID_MAX_DIGITS"; then
-      [ "$_rs_used" -lt "$_rs_budget" ] || break
-      _dm_route_failed "$_rs_lane" "$_rs_file" "invalid claimer pid" || return 1
-      _rs_used=$((_rs_used + 1))
-      continue
-    fi
-    if ! _dm_attempt_ok "$_rs_attempt"; then
-      [ "$_rs_used" -lt "$_rs_budget" ] || break
-      _dm_route_failed "$_rs_lane" "$_rs_file" "invalid delivery attempt" || return 1
-      _rs_used=$((_rs_used + 1))
-      continue
-    fi
-    if ! _dm_id_ok "$_rs_id"; then
-      [ "$_rs_used" -lt "$_rs_budget" ] || break
-      _dm_route_failed "$_rs_lane" "$_rs_file" "invalid message id" || return 1
-      _rs_used=$((_rs_used + 1))
-      continue
-    fi
-    [ -n "$_rs_now" ] || _rs_now=$(_now_epoch) || return 1
-    _rs_age=$((_rs_now - _rs_claim_ts))
-    if [ "$_rs_now" -ge "$_rs_claim_ts" ] && [ "$_rs_age" -le "$DM_CLAIM_MAX_AGE" ]; then
-      continue
-    fi
-    [ "$_rs_used" -lt "$_rs_budget" ] || break
-    _rs_next=$((_rs_attempt + 1))
-    if [ "$_rs_next" -gt "$DM_MAX_ATTEMPTS" ]; then
-      _rs_dest="$BRAIN/dm/$_rs_lane/failed/$_rs_id.a$_rs_next"
-    else
-      _rs_dest="$BRAIN/dm/$_rs_lane/pending/$_rs_id.a$_rs_next"
-    fi
-    if _dm_dest_occupied "$_rs_dest"; then
-      _dm_route_failed "$_rs_lane" "$_rs_file" "occupied dm recovery destination" || return 1
-      _rs_used=$((_rs_used + 1))
-      continue
-    fi
-    if command mv -f -- "$_rs_file" "$_rs_dest" 2>/dev/null; then
-      _rs_used=$((_rs_used + 1))
-      continue
-    fi
-    [ -e "$_rs_file" ] || [ -L "$_rs_file" ] || continue
-    _warn "could not recover stale dm claim: $_rs_file"
-    return 1
-  done
-  printf '%s\n' "$_rs_used"
+# Prove jq supports the exact consumer primitives once before inspecting any message. A failure
+# here is global, so callers leave every entry pending.
+_dm_jq_preflight() {
+  command -v jq >/dev/null 2>&1 \
+    && jq -e -n '"x" | (utf8bytelength == 1 and ((tojson | type) == "string"))' \
+      >/dev/null 2>&1
 }
 
-_dm_claim_all() { # <lane> <transition-budget> — print the names won by this process
-  _ca_lane=$1; _ca_budget=${2:-$DM_TRANSITION_MAX}
-  _dm_ensure_tree "$_ca_lane" || return 1
-  _ca_pending="$BRAIN/dm/$_ca_lane/pending"; _ca_claimed="$BRAIN/dm/$_ca_lane/claimed"
-  _ca_epoch=""; _ca_used=0
-  for _ca_file in "$_ca_pending"/*; do
-    [ -e "$_ca_file" ] || [ -L "$_ca_file" ] || continue
-    [ "$_ca_used" -lt "$_ca_budget" ] || break
-    _dm_dir_ok "$_ca_file" || continue
-    _ca_name=${_ca_file##*/}; _ca_attempt=${_ca_name##*.a}; _ca_id=${_ca_name%.a*}
-    if [ "$_ca_id" = "$_ca_name" ] || ! _dm_id_ok "$_ca_id" || ! _dm_attempt_ok "$_ca_attempt"; then
-      _dm_route_failed "$_ca_lane" "$_ca_file" "invalid pending dm name" || return 1
-      _ca_used=$((_ca_used + 1))
-      continue
-    fi
-    [ -n "$_ca_epoch" ] || _ca_epoch=$(_now_epoch) || return 1
-    _ca_claim_name="$_ca_name.c$_ca_epoch-$$"; _ca_dest="$_ca_claimed/$_ca_claim_name"
-    if _dm_dest_occupied "$_ca_dest"; then
-      _dm_route_failed "$_ca_lane" "$_ca_file" "occupied dm claim destination" || return 1
-      _ca_used=$((_ca_used + 1))
-      continue
-    fi
-    if command mv -f -- "$_ca_file" "$_ca_dest" 2>/dev/null; then
-      printf '%s\n' "$_ca_claim_name"
-      _ca_used=$((_ca_used + 1))
-      continue
-    fi
-    [ -e "$_ca_file" ] || [ -L "$_ca_file" ] || continue
-    _warn "could not claim pending dm: $_ca_file"
-    return 1
-  done
+_dm_message_ok() { # <message-file>
+  jq -e -s '
+    length == 1
+    and (.[0] | type) == "object"
+    and (.[0].from | type) == "string"
+    and (.[0].to | type) == "string"
+    and (.[0].ts | type) == "string"
+    and (.[0].content | type) == "string"
+  ' "$1" >/dev/null 2>&1
 }
 
-_dm_ack() { # <lane> <claimed-name>
-  _ak_lane=$1; _ak_name=$2; _ak_claim="$BRAIN/dm/$_ak_lane/claimed/$_ak_name"
-  # Claim ensured the tree in every live caller; validate only the read/ dir the mv enters.
-  # If it vanished, ack fails and the message stays claimed → lease-recovered, never lost.
-  _dm_dir_ok "$BRAIN/dm/$_ak_lane/read" || return 1
-  if [ ! -e "$_ak_claim" ] && [ ! -L "$_ak_claim" ]; then
-    _warn "dm claim disappeared before ack (it may have been recovered): $_ak_name"
-    return 0
-  fi
-  _dm_dir_ok "$_ak_claim" || return 1
-  case "$_ak_name" in *.a*.c*-*) ;; *) _warn "invalid claimed dm name: $_ak_name"; return 1 ;; esac
-  _ak_read_name=${_ak_name%.c*}; _ak_dest="$BRAIN/dm/$_ak_lane/read/$_ak_read_name"
-  _dm_dest_occupied "$_ak_dest" \
-    && { _warn "refusing occupied dm ack destination: $_ak_dest"; return 1; }
-  if command mv -f -- "$_ak_claim" "$_ak_dest" 2>/dev/null; then return 0; fi
-  if [ ! -e "$_ak_claim" ] && [ ! -L "$_ak_claim" ]; then
-    _warn "dm claim disappeared before ack (it may have been recovered): $_ak_name"
-    return 0
-  fi
-  _warn "could not ack dm claim: $_ak_name"
-  return 1
-}
-
-_dm_ack_all() { # <lane> <claimed-name>... — ack each; nonzero if ANY failed (those stay replayable)
-  _aa_lane=$1; shift; _aa_rc=0
-  for _aa_claim in "$@"; do _dm_ack "$_aa_lane" "$_aa_claim" || _aa_rc=1; done
-  return "$_aa_rc"
-}
-
-# Validate one object per file, then rebuild only the bounded wire contract. The recursive bound
-# preserves the existing content head when ordinary metadata fits, shrinking all four fields only
-# when JSON escaping would otherwise push the serialized record over the column cap.
-_dm_digest() { # <lane> <claimed-name>...
-  _dg_lane=$1; shift; _dg_count=$#
-  [ "$_dg_count" -gt 0 ] || return 0
-  [ "$_dg_count" -le "$DM_INJECT_MAX_LINES" ] \
-    || { _warn "dm digest batch for @$_dg_lane exceeds $DM_INJECT_MAX_LINES messages"; return 1; }
-  _dg_dir="$BRAIN/dm/$_dg_lane/claimed"
-  _dm_dir_ok "$_dg_dir" || return 1
-  for _dg_name in "$@"; do
-    case "$_dg_name" in ''|*/*) _warn "invalid claimed dm name in digest for @$_dg_lane: $_dg_name"; return 1 ;; esac
-    _dg_file="$_dg_dir/$_dg_name"
-    _dm_dir_ok "$_dg_file" || return 1
-    jq -e -s '
-      length == 1
-      and (.[0] | type) == "object"
-      and (.[0].from | type) == "string"
-      and (.[0].to | type) == "string"
-      and (.[0].ts | type) == "string"
-      and (.[0].content | type) == "string"
-    ' "$_dg_file" >/dev/null 2>&1 \
-      || { _warn "invalid dm object in $_dg_file"; return 1; }
-  done
+# Rebuild one validated pending object from only the bounded wire fields plus its stable ID. The
+# recursive byte check preserves the content head while keeping the serialized record valid.
+_dm_digest() { # <message-file> <message-id>
+  _dg_file=$1; _dg_id=$2
   _dg_field_max=$(((DM_INJECT_MAX_COLS - DM_DIGEST_ENVELOPE) / DM_ESCAPE_FACTOR))
   [ "$_dg_field_max" -gt 0 ] || _dg_field_max=1
-  (
-    cd "$_dg_dir" || exit 1
-    jq -c -s -r \
-      --argjson field_max "$_dg_field_max" \
-      --argjson line_max "$DM_INJECT_MAX_COLS" \
-      --argjson total_max "$DM_INJECT_MAX_TOTAL" '
-      def bounded($limit):
-        . as $message
-        | {
-            from: $message.from[0:$limit],
-            to: $message.to[0:$limit],
-            ts: $message.ts[0:$limit],
-            content: $message.content[0:$limit]
-          } as $record
+  jq -c -s -r \
+    --arg id "$_dg_id" \
+    --argjson field_max "$_dg_field_max" \
+    --argjson line_max "$DM_INJECT_MAX_COLS" '
+    if length == 1
+       and (.[0] | type) == "object"
+       and (.[0].from | type) == "string"
+       and (.[0].to | type) == "string"
+       and (.[0].ts | type) == "string"
+       and (.[0].content | type) == "string"
+    then .[0]
+    else error("invalid dm object")
+    end
+    | . as $message
+    | def bounded($limit):
+        {
+          from: $message.from[0:$limit],
+          to: $message.to[0:$limit],
+          ts: $message.ts[0:$limit],
+          content: $message.content[0:$limit],
+          id: $id
+        } as $record
         | if (($record | tojson | utf8bytelength) <= $line_max) or $limit <= 1
           then $record
-          else ($message | bounded((($limit / 2) | floor)))
+          else bounded((($limit / 2) | floor))
           end;
-      map(bounded($field_max) | tojson) as $records
-      | (reduce $records[] as $record (0; . + ($record | utf8bytelength) + 1)) as $total
-      | if $total > $total_max then error("dm digest exceeds aggregate cap")
-        else $records[]
-        end
-    ' "$@" 2>/dev/null
-  )
+      bounded($field_max) | tojson
+  ' "$_dg_file" 2>/dev/null
 }
 
-# A fresh claim creates no filesystem event when its lease later expires. Arm one detached sweep
-# for the earliest canonical claim; recovery moves it to pending/, which wakes the lane's watcher.
-_dm_arm_lease_sweep() { # <lane>
-  _ls_lane=$1; _ls_claimed="$BRAIN/dm/$_ls_lane/claimed"; _ls_delay=""
-  _dm_dir_ok "$_ls_claimed" || return 1
-  _ls_now=$(_now_epoch) || return 1
-  for _ls_file in "$_ls_claimed"/*; do
-    [ -e "$_ls_file" ] || [ -L "$_ls_file" ] || continue
-    _dm_dir_ok "$_ls_file" || continue
-    _ls_name=${_ls_file##*/}; _ls_stamp=${_ls_name##*.c}; _ls_ts=${_ls_stamp%-*}
-    _dm_decimal_ok "$_ls_ts" "$DM_CLAIM_EPOCH_MAX_DIGITS" || continue
-    if [ "$_ls_now" -lt "$_ls_ts" ]; then
-      _ls_candidate=1
-    else
-      _ls_candidate=$((_ls_ts + DM_CLAIM_MAX_AGE + 1 - _ls_now))
-      [ "$_ls_candidate" -gt 0 ] || _ls_candidate=1
-    fi
-    if [ -z "$_ls_delay" ] || [ "$_ls_candidate" -lt "$_ls_delay" ]; then
-      _ls_delay=$_ls_candidate
-    fi
-  done
-  [ -n "$_ls_delay" ] || return 0
-  # The suite's branch override is an explicit test seam; do not leave ten-minute sleepers
-  # behind its disposable repos. Near-expiry coverage still arms the real detached sweep.
-  if [ -n "${BRAIN_TEST_BRANCH:-}" ] && [ "$_ls_delay" -gt 10 ]; then return 0; fi
-  (
-    sleep "$_ls_delay"
-    _dm_recover_stale "$_ls_lane" "$DM_TRANSITION_MAX" >/dev/null || true
-    _dm_arm_lease_sweep "$_ls_lane" || true
-  ) </dev/null >> "$BRAIN/.hook-errors.log" 2>&1 &
+# Return 0 with one digest line, 2 only for a structurally invalid regular message, and 1 for
+# path or rendering failures that must remain pending.
+_dm_pending_digest() { # <lane> <message-file>
+  _pd_lane=$1; _pd_file=$2; _pd_name=${_pd_file##*/}
+  _dm_dir_ok "$_pd_file" || return 1
+  if ! _dm_id_ok "$_pd_name"; then
+    _warn "invalid pending dm name for @$_pd_lane: $_pd_name"
+    return 2
+  fi
+  _dm_message_ok "$_pd_file"
+  _pd_message_rc=$?
+  case "$_pd_message_rc" in
+    0) ;;
+    1|4|5) _warn "invalid dm object in $_pd_file"; return 2 ;;
+    *) return 1 ;;
+  esac
+  _dm_digest "$_pd_file" "$_pd_name"
+  _pd_digest_rc=$?
+  case "$_pd_digest_rc" in
+    0) return 0 ;;
+    5) _warn "invalid dm object in $_pd_file"; return 2 ;;
+    *)
+      _warn "could not digest pending dm message for @$_pd_lane: $_pd_name; leaving it pending"
+      return 1 ;;
+  esac
+}
+
+# Move a successfully emitted pending message into read/, preserving any occupied transcript via
+# the same collision-bump helper used by failed/.
+_dm_archive() { # <lane> <message-file>
+  _ar_lane=$1; _ar_file=$2; _ar_name=${_ar_file##*/}
+  _dm_dir_ok "$BRAIN/dm/$_ar_lane/read" || return 1
+  _dm_dir_ok "$_ar_file" || return 1
+  _dm_id_ok "$_ar_name" || { _warn "invalid pending dm name at archive: $_ar_name"; return 1; }
+  _ar_dest=$(_dm_collision_dest "$_ar_lane" read "$_ar_name") || return 1
+  _dm_dest_occupied "$_ar_dest" \
+    && { _warn "dm read destination became occupied for $_ar_name"; return 1; }
+  if command mv -f -- "$_ar_file" "$_ar_dest" 2>/dev/null; then return 0; fi
+  _warn "could not archive emitted dm message for @$_ar_lane: $_ar_name"
+  return 1
 }
 
 cmd_dm_take() {
   _require_brain
   _dt_lane=$(cmd_whoami)
   [ -n "$_dt_lane" ] || _die "brain dm take: whoami is empty"
-  _dt_recovered=$(_dm_recover_stale "$_dt_lane" "$DM_TRANSITION_MAX") || return 1
-  case "$_dt_recovered" in ''|*[!0-9]*) return 1 ;; esac
-  _dt_remaining=$((DM_TRANSITION_MAX - _dt_recovered))
-  _dt_claims=$(_dm_claim_all "$_dt_lane" "$_dt_remaining") || return 1
-  [ -n "$_dt_claims" ] || return 0
-  # Only validated queue names cross this split; absolute paths are rebuilt after it.
-  # shellcheck disable=SC2086
-  set -- $_dt_claims
-  _dt_rc=0
-  for _dt_claim in "$@"; do
-    if ! _dt_digest=$(_dm_digest "$_dt_lane" "$_dt_claim"); then
-      _warn "could not digest claimed dm message for @$_dt_lane: $_dt_claim"
-      _dt_rc=1
-      continue
+  if ! _dm_jq_preflight; then
+    _warn "brain dm take: jq is unavailable or incompatible; leaving all messages pending"
+    return 1
+  fi
+  if ! { true >&1; } 2>/dev/null; then
+    _warn "brain dm take: stdout is unavailable; leaving all messages pending"
+    return 1
+  fi
+  _dm_ensure_tree "$_dt_lane" || return 1
+  _dt_pending="$BRAIN/dm/$_dt_lane/pending"
+  _dm_dir_ok "$_dt_pending" || return 1
+  _dt_count=0; _dt_bytes=0; _dt_rc=0
+  for _dt_file in "$_dt_pending"/*; do
+    [ -e "$_dt_file" ] || [ -L "$_dt_file" ] || continue
+    [ "$_dt_count" -lt "$DM_INJECT_MAX_LINES" ] || break
+    _dt_count=$((_dt_count + 1))
+    _dt_digest=$(_dm_pending_digest "$_dt_lane" "$_dt_file")
+    _dt_digest_rc=$?
+    case "$_dt_digest_rc" in
+      0) ;;
+      2)
+        _dm_route_failed "$_dt_lane" "$_dt_file" "structurally invalid dm message" \
+          || _dt_rc=1
+        continue ;;
+      *)
+        _warn "could not digest pending dm message for @$_dt_lane: ${_dt_file##*/}; leaving it pending"
+        _dt_rc=1
+        continue ;;
+    esac
+    _dt_line_bytes=$(LC_ALL=C printf '%s\n' "$_dt_digest" | wc -c | tr -d ' \n')
+    if [ $((_dt_bytes + _dt_line_bytes)) -gt "$DM_INJECT_MAX_TOTAL" ]; then
+      _warn "dm digest aggregate cap reached for @$_dt_lane; leaving remaining messages pending"
+      break
     fi
     if ! printf '%s\n' "$_dt_digest"; then
-      _warn "could not emit claimed dm messages for @$_dt_lane; leaving them replayable"
+      _warn "could not emit pending dm messages for @$_dt_lane; leaving them pending"
       return 1
     fi
-    _dm_ack "$_dt_lane" "$_dt_claim" || _dt_rc=1
+    _dt_bytes=$((_dt_bytes + _dt_line_bytes))
+    _dm_archive "$_dt_lane" "$_dt_file" || _dt_rc=1
   done
   return "$_dt_rc"
 }
@@ -862,12 +722,12 @@ cmd_status() {
   [ -s "$BRAIN/.hook-errors.log" ] && \
     printf '\n⚠ hook errors logged — see .brain/.hook-errors.log\n'
 
-  # Poison messages are terminal but never silent or auto-deleted. The -d gate keeps the
-  # common no-failures boot from paying a subshell fork just to hear "0".
+  # Structurally invalid messages are quarantined but never silent or auto-deleted. The -d gate
+  # keeps the common no-failures boot from paying a subshell fork just to hear "0".
   if [ -n "$_me" ] && [ -d "$BRAIN/dm/$_me/failed" ]; then
     _failed_count=$(_dm_failed_count "$_me" 2>/dev/null) || _failed_count=0
     [ "$_failed_count" -gt 0 ] 2>/dev/null && \
-      printf '\n⚠ %s DM message(s) failed permanently — inspect .brain/dm/%s/failed/\n' \
+      printf '\n⚠ %s DM message(s) failed structural validation — inspect .brain/dm/%s/failed/\n' \
         "$_failed_count" "$_me"
   fi
 
@@ -1341,38 +1201,60 @@ _hook_session_start() {
     esac
     exit 0                               # non-feature branch → silent
   fi
-  # (b2) Recover → claim → digest. Ack happens only after the complete SessionStart payload was
-  # emitted successfully, so an interrupted boot leaves every message replayable.
-  _recover_used=$(_dm_recover_stale "$_feat" "$DM_TRANSITION_MAX") || _recover_used=$DM_TRANSITION_MAX
-  case "$_recover_used" in ''|*[!0-9]*) _recover_used=$DM_TRANSITION_MAX ;; esac
-  _recover_remaining=$((DM_TRANSITION_MAX - _recover_used))
-  # The queue path is a fixed composition; recover/claim just ensured the tree exists, so
-  # re-deriving it through cmd_inbox would only re-walk the tree to print the same string.
+  # (b2) Inspect a bounded batch in pending/. Structurally invalid regular files are quarantined
+  # independently; valid files stay pending until the complete SessionStart payload is emitted.
   _ib="$BRAIN/dm/$_feat/pending"
-  _dm_block=""; _digest_ok=0; _valid_claims=""; _digest=""
-  if _claims=$(_dm_claim_all "$_feat" "$_recover_remaining") && [ -n "$_claims" ]; then
-    # Only validated queue names cross this split; absolute paths are rebuilt after it.
-    # shellcheck disable=SC2086
-    set -- $_claims
-    for _claim in "$@"; do
-      if _digest_line=$(_dm_digest "$_feat" "$_claim"); then
+  _dm_block=""; _digest=""; _valid_names=""; _batch_count=0; _batch_bytes=0; _more_dm=0
+  if _dm_ensure_tree "$_feat"; then
+    if ! _dm_jq_preflight; then
+      _warn "SessionStart dm consume: jq is unavailable or incompatible; leaving all messages pending"
+    elif _dm_dir_ok "$_ib"; then
+      for _pending_file in "$_ib"/*; do
+        [ -e "$_pending_file" ] || [ -L "$_pending_file" ] || continue
+        if [ "$_batch_count" -ge "$DM_INJECT_MAX_LINES" ]; then
+          _more_dm=1
+          break
+        fi
+        _batch_count=$((_batch_count + 1))
+        _digest_line=$(_dm_pending_digest "$_feat" "$_pending_file")
+        _digest_rc=$?
+        case "$_digest_rc" in
+          0) ;;
+          2)
+            _dm_route_failed "$_feat" "$_pending_file" "structurally invalid dm message" \
+              || _warn "could not quarantine invalid dm message for @$_feat: ${_pending_file##*/}"
+            continue ;;
+          *)
+            _warn "could not digest pending dm message for @$_feat: ${_pending_file##*/}; leaving it pending"
+            continue ;;
+        esac
+        _digest_bytes=$(LC_ALL=C printf '%s\n' "$_digest_line" | wc -c | tr -d ' \n')
+        if [ $((_batch_bytes + _digest_bytes)) -gt "$DM_INJECT_MAX_TOTAL" ]; then
+          _more_dm=1
+          break
+        fi
+        _batch_bytes=$((_batch_bytes + _digest_bytes))
         _digest="${_digest}${_digest:+
 }${_digest_line}"
-        _valid_claims="${_valid_claims}${_valid_claims:+ }$_claim"
-      else
-        _warn "could not digest claimed dm message for @$_feat: $_claim; leaving it replayable"
-      fi
-    done
-    if [ -n "$_valid_claims" ]; then
-      _dm_block="Unread DMs delivered while you were away:
+        _pending_name=${_pending_file##*/}
+        _valid_names="${_valid_names}${_valid_names:+ }$_pending_name"
+      done
+    fi
+  fi
+  if [ -n "$_valid_names" ]; then
+    _dm_block="Unread DMs delivered while you were away:
 $_digest
 
 "
-      _digest_ok=1
-      # Only validated queue names cross this split.
-      # shellcheck disable=SC2086
-      set -- $_valid_claims
-    fi
+    # Only grammar-validated message IDs cross this split; absolute paths are rebuilt after it.
+    # shellcheck disable=SC2086
+    set -- $_valid_names
+  fi
+  _continue_dm=""
+  if [ "$_more_dm" = 1 ]; then
+    _continue_dm="
+More DMs remain pending after this bounded batch. Continue by running: \"$BRAIN/bin/brain\" dm take
+"
   fi
   # (c) cheap auto-fixes, robust to a never-wraps agent
   cmd_reconcile >/dev/null 2>&1 || true
@@ -1381,17 +1263,21 @@ $_digest
   if _emit_session_ctx "${_dm_block}Run the **navigation-standards** skill now (the Agent-Brain coordination protocol).
 
 Your DM pending queue — arm a watch on directory activity: $_ib
-On activity, claim and consume it with: \"$BRAIN/bin/brain\" dm take
+On activity, consume it by running: \"$BRAIN/bin/brain\" dm take
+${_continue_dm}
 
 $_st"; then
-    if [ "$_digest_ok" = 1 ]; then
-      _dm_ack_all "$_feat" "$@" \
-        || _warn "one or more DMs were emitted but could not be acked; they remain replayable"
+    if [ -n "$_valid_names" ]; then
+      _archive_rc=0
+      for _emitted_name in "$@"; do
+        _dm_archive "$_feat" "$_ib/$_emitted_name" || _archive_rc=1
+      done
+      [ "$_archive_rc" = 0 ] \
+        || _warn "one or more DMs were emitted but could not be archived; they remain pending and may replay"
     fi
   else
-    _warn "could not emit SessionStart context; claimed DMs remain replayable"
+    _warn "could not emit SessionStart context; DMs remain pending and replayable"
   fi
-  _dm_arm_lease_sweep "$_feat" || true
   exit 0
 }
 
@@ -1591,7 +1477,7 @@ brain — Agent Brain coordination vault (v1, filesystem-only)
   brain whoami                          resolve the current feature (empty = not a brain branch)
   brain announce "<msg>"                append a line to today's journal
   brain dm @<feature>|@all "<msg>"      direct-message a lane's queue (@all = every lane but you)
-  brain dm take                         claim, print, and acknowledge this lane's pending DMs
+  brain dm take                         validate, print, and archive this lane's pending DMs
   brain inbox [<feature>]               print (and create) a lane's pending/ queue directory
   brain status                          live dashboard (features, connections, banners)
   brain reconcile [--check]             validate + cheap auto-fixes (--check = validate only)
