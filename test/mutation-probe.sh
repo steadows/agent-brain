@@ -9,28 +9,28 @@ cd "$(dirname "$0")/.." || exit 1
 
 EXPECTED_SCENARIOS=$(grep -c '^scenario ' test/dm.sh 2>/dev/null)
 case "$EXPECTED_SCENARIOS" in ''|*[!0-9]*|0) echo "ABORT: could not count dm scenarios"; exit 1 ;; esac
+ENGINE_SOURCE="$(pwd -P)/bin/brain"
 
 PROBE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/brain-mutation-probe.XXXXXX") || exit 1
 ENGINE_BACKUP="$PROBE_TMP/brain.original"
+MUTANT_ENGINE="$PROBE_TMP/brain.mutant"
 cp -p bin/brain "$ENGINE_BACKUP" || exit 1
 
 cleanup() {
-  [ -f "$ENGINE_BACKUP" ] && cp -p "$ENGINE_BACKUP" bin/brain 2>/dev/null || true
   case "$PROBE_TMP" in */brain-mutation-probe.*) rm -rf "$PROBE_TMP" ;; esac
 }
 trap 'cleanup' 0
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
-restore_engine() { cp -p "$ENGINE_BACKUP" bin/brain; }
 norm() { printf '%s\n' "$1" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' '; }
 
 # run_suite [command] — status and failures are globals because command substitution would hide
 # them in a subshell. Return 0 means COMPLETE, not green; RUN_EXIT carries the suite's real status.
 run_suite() {
-  _suite=${1:-./test/dm.sh}; _suite_out="$PROBE_TMP/suite.out"
+  _suite=${1:-./test/dm.sh}; _engine=${2:-$ENGINE_SOURCE}; _suite_out="$PROBE_TMP/suite.out"
   RUN_EXIT=0; RUN_FAILURES=""; RUN_FAILED=""; RUN_TOTAL=""
-  if "$_suite" >"$_suite_out" 2>&1; then RUN_EXIT=0; else RUN_EXIT=$?; fi
+  if BRAIN_BIN="$_engine" "$_suite" >"$_suite_out" 2>&1; then RUN_EXIT=0; else RUN_EXIT=$?; fi
   RUN_FAILURES=$(grep '^FAIL' "$_suite_out" 2>/dev/null \
     | sed 's/^FAIL  *//;s/ .*//' | tr '\n' ' ')
 
@@ -54,7 +54,7 @@ run_suite() {
 }
 
 baseline_ok() {
-  run_suite "$1" || return 1
+  run_suite "$1" "${2:-$ENGINE_SOURCE}" || return 1
   [ "$RUN_EXIT" = 0 ] && [ "$RUN_FAILED" = 0 ] && [ -z "$RUN_FAILURES" ]
 }
 
@@ -86,20 +86,20 @@ instrument_selfcheck() {
 
 probe() { # <label> <declared-failing-ids> <sed-program>
   _label=$1; _declared=$2; _sed=$3
-  restore_engine || { echo "$_label: RESTORE FAILED ❌"; rc=1; return; }
-  sed -i '' "$_sed" bin/brain || { echo "$_label: SED FAILED ❌"; rc=1; return; }
-  if cmp -s "$ENGINE_BACKUP" bin/brain; then
+  cp -p "$ENGINE_BACKUP" "$MUTANT_ENGINE" \
+    || { echo "$_label: MUTANT COPY FAILED ❌"; rc=1; return; }
+  sed -i '' "$_sed" "$MUTANT_ENGINE" || { echo "$_label: SED FAILED ❌"; rc=1; return; }
+  if cmp -s "$ENGINE_BACKUP" "$MUTANT_ENGINE"; then
     echo "$_label: mutant did not apply (pattern drifted) ❌"; rc=1; return
   fi
-  if ! sh -n bin/brain 2>/dev/null || ! dash -n bin/brain 2>/dev/null; then
-    echo "$_label: mutant broke syntax — INVALID ❌"; restore_engine; rc=1; return
+  if ! sh -n "$MUTANT_ENGINE" 2>/dev/null || ! dash -n "$MUTANT_ENGINE" 2>/dev/null; then
+    echo "$_label: mutant broke syntax — INVALID ❌"; rc=1; return
   fi
-  if ! run_suite; then
+  if ! run_suite ./test/dm.sh "$MUTANT_ENGINE"; then
     echo "$_label: suite did not complete its $EXPECTED_SCENARIOS-scenario summary ❌"
-    restore_engine; rc=1; return
+    rc=1; return
   fi
   _got=$RUN_FAILURES; _suite_exit=$RUN_EXIT
-  restore_engine || { echo "$_label: RESTORE FAILED ❌"; rc=1; return; }
 
   case "$_suite_exit" in 1|3) ;; *)
     echo "$_label: suite exit $_suite_exit is not a completed failing-suite status ❌"; rc=1; return ;;
@@ -152,9 +152,9 @@ probe "M12 utf8 byte caps  " "U.M1/56" \
   's|utf8bytelength|length|g'
 
 echo "=== final tree check ==="
-if cmp -s "$ENGINE_BACKUP" bin/brain; then
-  echo "bin/brain restored byte-for-byte ✅"
+if cmp -s "$ENGINE_BACKUP" "$ENGINE_SOURCE"; then
+  echo "bin/brain remained byte-for-byte unchanged ✅"
 else
-  echo "DIRTY — RESTORE FAILED ❌"; rc=1
+  echo "DIRTY — bin/brain changed while isolated mutants ran ❌"; rc=1
 fi
 exit "$rc"

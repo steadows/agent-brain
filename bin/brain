@@ -371,7 +371,9 @@ _dm_id_ok() {
     *) _io_pid=$_io_tail; _io_bump="" ;;
   esac
   case "$_io_pid" in [1-9]|[1-9][0-9]*) ;; *) return 1 ;; esac
-  case "$_io_bump" in ''|[1-9]|[1-9][0-9]*) ;; *) return 1 ;; esac
+  if [ -n "$_io_bump" ]; then
+    case "$_io_bump" in *[!0-9]*) return 1 ;; esac
+  fi
 }
 
 # Queue decimals are untrusted filename components. Canonical, width-bounded validation must
