@@ -1,7 +1,6 @@
 # Agent-Brain Lane DM — GSD Plan
 
-**Status:** `[~]` P0–P4 ✅ + gates 7.1/7.2 + 7.4 ultrareview ✅; **v1.2.2-r2 is GREEN and
-review-converged** — v1.2 (claim layer deleted) → v1.2.1 (rulings 1–6+1a) → v1.2.2 (rulings
+**Status:** `[~]` P0–P4 ✅ + gates 7.1/7.2 + 7.4 ultrareview ✅; **v1.2.2 hardening arc GREEN; convergence gate OPEN** — v1.2 (claim layer deleted) → v1.2.1 (rulings 1–6+1a) → v1.2.2 (rulings
 7–9) → v1.2.2-r2/r3 (rulings 10–12 + all /simplify + pre-PR review + final-sweep findings), every ruling a
 standalone map commit in `.context/seams/dm-v1.1-queue.md`. Suite at **75 scenarios**, engine
 at commit `baff2ee` (VERSION 1.2.2), 75/75 DM + 15/15 commit/install under `sh` AND **real
