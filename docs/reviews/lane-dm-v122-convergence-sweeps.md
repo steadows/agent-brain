@@ -47,4 +47,7 @@ fully-byzantine forged-payload adversary out of the threat model (code-execution
 equivalent). Ruling 14 covers finding 3. Fix round r4 (`docs/prompts/dm-v122-fix4.md`)
 implements W1–W4.
 
-## Round 3 — pending (dispatches after r4 lands + full orchestrator regate)
+## Round 3 — on `3774640` (r4) — IN FLIGHT
+
+r4 landed W1-W4 (V.U/76-79, RED-proven; full orchestrator regate green: 79/79 sh+dash,
+15/15 both, shellcheck 11 = baseline, probe 16/16 byte-restored).

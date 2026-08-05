@@ -1,9 +1,9 @@
 # Agent-Brain Lane DM — GSD Plan
 
 **Status:** `[~]` P0–P4 ✅ + gates 7.1/7.2 + 7.4 ultrareview ✅; **v1.2.2 hardening arc GREEN; convergence gate OPEN** — v1.2 (claim layer deleted) → v1.2.1 (rulings 1–6+1a) → v1.2.2 (rulings
-7–9) → v1.2.2-r2/r3 (rulings 10–12 + all /simplify + pre-PR review + final-sweep findings), every ruling a
-standalone map commit in `.context/seams/dm-v1.1-queue.md`. Suite at **75 scenarios**, engine
-at commit `baff2ee` (VERSION 1.2.2), 75/75 DM + 15/15 commit/install under `sh` AND **real
+7–9) → v1.2.2-r2/r3/r4 (rulings 10–14 + all /simplify + pre-PR review + sweep findings), every ruling a
+standalone map commit in `.context/seams/dm-v1.1-queue.md`. Suite at **79 scenarios**, engine
+at commit `3774640` (VERSION 1.2.2), 79/79 DM + 15/15 commit/install under `sh` AND **real
 dash**; mutation probe 16/16, tree byte-restored; each fix round RED-proven by A/B against
 the pre-fix engine. Gates this arc: /simplify (4-angle) → /steadows-code-review (5-agent +
 verified-claims filter) → single-agent Codex adversarial sweeps at max (one per round; final

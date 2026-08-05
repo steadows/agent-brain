@@ -26,15 +26,19 @@ seam map; its entry was never added here.)
   leaves everything pending — and invalidates the WHOLE staged SessionStart batch, including
   entries digested before the failure. SessionStart archives only after a staged,
   verified-non-empty, pinned emit succeeds — a jq exiting 0 with empty output can no longer archive undelivered
-  messages. The send path resolves-and-pins too (no contract probes).
+  messages. The send path resolves-and-pins too (no contract probes). Every payload-bearing call
+  additionally gates on a cheap structural witness (object-shaped, carries the known id /
+  the four field keys) — a probe-passing binary returning well-formed-looking `{}` with
+  rc 0 can no longer archive, publish, or journal anything; the fully-byzantine
+  forged-payload adversary is declared out of the threat model in the seam map.
 - **Collision names are re-checked against the byte cap at every suffix (ruling 11).** A
   candidate at NAME_MAX no longer overflows on its first `-<n>` bump; the compact checksum
   fallback reserves worst-case counter headroom.
 - **`.tmp-*` is the only sanctioned hidden namespace (ruling 12).** Any other dot-prefixed
   child of `pending/` (`.poison`, `.DS_Store`, hostile symlinks) is enumerated and classified
   via the ruling-1 path (grammar-invalid → quarantine) instead of being invisible forever.
-- **Suite: 75 scenarios** (V.R/67-75 added; each fix round RED-proven by A/B against its
-  pre-fix engine),
+- **Suite: 79 scenarios** (V.R/67-75 + V.U/76-79 added; each fix round RED-proven by A/B
+  against its pre-fix engine),
   declared gap [Q6] for the scanner-internal TOCTOU witnesses, and the jq re-probe is now
   genuinely driven (an in-place-overwriting PATH shim; stub-flip verified). Mutation probe
   re-anchored; M8/MQ1 kill sets strengthened.
