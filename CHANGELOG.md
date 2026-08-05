@@ -2,8 +2,8 @@
 
 ## v1.2.2 — 2026-08-05 — enumeration is fatal-not-empty; paths, identities and the emit are byte-exact and pinned
 
-Five hardening rounds (v1.2.2 + r2/r3/r4/r5) closing seam-map rulings 7-14 (`.context/seams/
-dm-v1.1-queue.md` § v1.2.2 / v1.2.3 / v1.2.4 + erratum 13a), each round found by an
+Seven hardening rounds (v1.2.2 + r2-r7) closing seam-map rulings 7-14 (`.context/seams/
+dm-v1.1-queue.md` § v1.2.2 / v1.2.3 / v1.2.4 + errata 13a/13b), each round found by an
 adversarial gate on code the prior gate passed. (The intermediate v1.2.1 round — rulings 1-6 + 1a — is recorded in the plan and
 seam map; its entry was never added here.)
 
@@ -39,9 +39,28 @@ seam map; its entry was never added here.)
 - **`.tmp-*` is the only sanctioned hidden namespace (ruling 12).** Any other dot-prefixed
   child of `pending/` (`.poison`, `.DS_Store`, hostile symlinks) is enumerated and classified
   via the ruling-1 path (grammar-invalid → quarantine) instead of being invisible forever.
-- **Suite: 85 scenarios** (V.R/67-75, V.U/76-79, V.V/80-85 added; each fix round RED-proven
-  by A/B against its pre-fix engine),
-  declared gap [Q6] for the scanner-internal TOCTOU witnesses, and the jq re-probe is now
+- **The witness layer STOPS at r5 — ruling 13b, signed (erratum, `b5b5b83`).** Convergence
+  sweeps 3 and 4 each holed the shell-side JSON witnesses; the cause is structural (POSIX
+  shell cannot parse JSON, payload bytes are unconstrained), so tightening is
+  non-convergent. Witness-passing-but-invalid output folds into ruling 13's byzantine
+  boundary (requires a deliberately defective jq on PATH); residual exposure — a message
+  archived undelivered, recoverable from `read/` — is accepted on the record.
+- **Status absence is PROVEN through validated ancestors (r6, ruling 14 completion).** A
+  `dm/` root or `dm/<lane>` corrupted into a regular file / symlink / unsearchable dir used
+  to make the failed-banner gate silently skip (leaf `-e`/`-L` false ≠ proven absent).
+  `_dm_failed_state` now walks root→lane tri-state: missing under validated parents =
+  proven absent (silent); malformed/uninspectable ancestor = the cannot-inspect banner.
+- **One authoritative failed-count call, fork-free and revalidated (r7).** `_dm_failed_count`
+  runs the tri-state walk itself, revalidates the directory AFTER glob expansion (a mid-scan
+  permission flip cannot render zero), and returns via `_DM_FAILED_COUNT` — no `$( )` on
+  either the empty or positive status path. The probe gained an address-cardinality
+  self-check: every sed selector (21 across 16 mutants) is asserted against its declared
+  engine match count, closing the class where an ambiguous address hits the right line by
+  ordering luck (M6 matched 3 lines; re-addressed to 1).
+- **Suite: 91 scenarios** (V.R/67-75, V.U/76-79, V.V/80-85, V.Y/86-89, V.Z/90-91 added;
+  each fix round RED-proven by A/B against its pre-fix engine),
+  declared gaps [Q6] (scanner-internal TOCTOU witnesses) and [Q7] (fork-free/revalidation
+  internals not CLI-observable; no hollow mutant spent on them), and the jq re-probe is now
   genuinely driven (an in-place-overwriting PATH shim; stub-flip verified). Mutation probe
   re-anchored; M8/MQ1 kill sets strengthened.
 

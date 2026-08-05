@@ -56,7 +56,62 @@ envelope bare-id substring satisfiable by status text; status banner bypassed wh
 is a non-directory; CHANGELOG/probe-header drift. All mechanical; Steve approved r5
 explicitly (first decision after waking).
 
-## Round 4 — on r5 — IN FLIGHT
+## Round 4 — on `c879468` (r5) → NOT READY, 2 HIGH / 2 MEDIUM → ruling 13b + fix round r6
 
-r5 landed X1-X4 (V.V/80-85, RED-proven; full orchestrator regate green: 85/85 sh+dash,
-15/15 both, shellcheck 11 = baseline, probe 16/16 byte-restored).
+Brief: `docs/prompts/dm-v122-final-sweep-r4.md` · Job: task-msg6oxid-54yuvl
+(r5 had landed X1-X4 — V.V/80-85, RED-proven; full orchestrator regate green: 85/85
+sh+dash, 15/15 both, shellcheck 11 = baseline, probe 16/16 byte-restored.)
+
+1. **HIGH — framing witnesses mistake an inner/data `}` for the outer delimiter** — a
+   truncated envelope emits and authorizes archival; a truncated send body publishes.
+2. **HIGH — the escaped-ID witness is not unique to the DM block** — a status field
+   containing `"id":"<pending-id>"` satisfies it while the DM block is dropped.
+3. **MEDIUM — absence not proven through ancestors**: `dm/<lane>` as a regular file /
+   unsearchable dir makes both leaf tests false and status silently skips the banner;
+   `_dm_failed_count` early-returns zero the same way.
+4. **MEDIUM — audit-trail drift**: plan named `fe1a329` as "the final sweep", CHANGELOG
+   still said 79 scenarios.
+
+**Adjudication (orchestrator + Steve, on the record):** findings 1–2 are the SECOND
+consecutive round holing the witness layer (round 3 was the first). The root cause is
+structural — POSIX shell cannot parse JSON, message content may contain any byte, so no
+`case` pattern separates an outer delimiter from a data byte; tightening is non-convergent
+by construction. **Steve signed ruling 13b (`b5b5b83`): the witness layer STOPS at r5.**
+Witness-passing-but-invalid output folds into ruling 13's byzantine boundary (requires a
+deliberately defective jq on PATH = code execution as the user); residual exposure — a
+message archived without delivery, recoverable from `read/` — accepted on the record.
+Finding 3 → fix round r6 (`d30c736`): `_dm_failed_state` tri-state root→lane walk,
+V.Y/86-89. Finding 4 → orchestrator (`e3e7dc3`).
+
+## Round 5 — on `d30c736` (r6) → NOT READY, 0 HIGH / 4 MEDIUM → fix round r7
+
+Brief: `docs/prompts/dm-v122-final-sweep-r5.md` · Job: task-msgaoe8u-dwgo60
+The brief declared the 13b ceiling and invited a one-paragraph "boundary objection" if the
+sweep believed the ceiling wrong. **No objection was filed.** Zero findings landed on the
+witness layer or message lifecycle — the round moved entirely to performance-claim,
+instrument, and record hygiene:
+
+1. **MEDIUM (Z1) — healthy status path not fork-free as the r6 brief claimed** (`$( )`
+   around `_dm_failed_count`; V.Y/89 tested a manufactured absent-leaf, not the ordinary
+   existing-empty state).
+2. **MEDIUM (Z2) — `_dm_failed_count` trusts its glob without post-expansion revalidation**,
+   and its r6 ancestor block was redundant with `cmd_status`'s own gate (deleting it left
+   V.Y/86-89 green).
+3. **MEDIUM (Z3) — probe M6's sed address matches THREE engine lines**, hits the intended
+   one by ordering luck; the manifest self-checked replacements, not address cardinality.
+4. **MEDIUM (Z4) — records stopped at r5/85** while the branch held r6/89 (this file's
+   round 4 still read IN FLIGHT).
+
+**Disposition:** Z1-Z3 + the test-header half of Z4 → fix round r7
+(`docs/prompts/dm-v122-fix7.md`, job task-msgbgefd-z6ez9j): `_dm_failed_count` became the
+one authoritative tri-state+count call returning via `_DM_FAILED_COUNT` (fork-free both
+paths, post-enumeration revalidation), the probe gained an address-cardinality self-check
+over all 21 selectors × 16 mutants (M6 re-addressed: 3 matches → 1 — RED-proven, the old
+address fails the new check), scenarios V.Z/90-91 pin the ordinary empty/positive states,
+and the non-drivable revalidation defense is DECLARED as suite gap [Q7] rather than
+spending the round's one-mutant budget on a hollow probe (zero new mutants). Doc half of
+Z4 → orchestrator (this reconciliation). Orchestrator regate on the delivered tree: 91/91
++ 15/15 under sh AND dash, sh -n/dash -n clean, shellcheck 11 = baseline (same 4 codes),
+A/B vs `d30c736` confirms V.Z/90-91 are guards (pass both engines — the engine change is
+a refactor + a declared-non-drivable defense; the discriminating gain is the probe's own
+RED: old M6 address = 3 matches, re-addressed = 1, measured independently).
