@@ -1,5 +1,45 @@
 # Changelog
 
+## v1.2.2 — 2026-08-05 — enumeration is fatal-not-empty; paths, identities and the emit are byte-exact and pinned
+
+Two hardening rounds (v1.2.2 + v1.2.2-r2) closing seam-map rulings 7-12 (`.context/seams/
+dm-v1.1-queue.md` § v1.2.2 + § v1.2.3), each found by an adversarial gate on code the prior
+gate passed. (The intermediate v1.2.1 round — rulings 1-6 + 1a — is recorded in the plan and
+seam map; its entry was never added here.)
+
+- **Enumeration failure is operation-fatal, never "empty"/"free" (ruling 7).** A queue dir
+  that is writable+searchable but not readable (0300) defeated every glob scan: ids read as
+  free, non-empty queues read as empty, `dm take` returned success with messages sitting
+  there. Scans now validate read+search on BOTH sides of an empty expansion and return a
+  distinct "unestablishable" rc; every consumer aborts with a diagnostic and leaves messages
+  pending. The consuming loops also re-validate after exhaustion — their own glob expansion
+  is a scan too.
+- **A path is an opaque byte string; nothing travels through `$( )` (ruling 8).** Command
+  substitution strips trailing newlines, which let a hostile basename permanently defeat
+  quarantine and reinstate head-of-line starvation. `_dm_collision_dest`, whoami/lane
+  identities, and the presence-slug derivation all return via caller-visible variables now;
+  an invalid inherited `BRAIN_FEATURE` is rejected at the resolver with a diagnostic.
+- **jq identity is pinned per operation (rulings 9 + 10).** One PATH resolution per consume;
+  every probe, digest, and the SessionStart serialization invoke that exact binary. A digest
+  failure authorizes quarantine only if the recorded exit-code contract still holds for the
+  same executable; a systemic contract change aborts the batch once, names the binary, and
+  leaves everything pending — and invalidates the WHOLE staged SessionStart batch, including
+  entries digested before the failure. SessionStart archives only after a staged,
+  verified-non-empty, pinned emit succeeds — a jq exiting 0 with empty output can no longer archive undelivered
+  messages. The send path resolves-and-pins too (no contract probes).
+- **Collision names are re-checked against the byte cap at every suffix (ruling 11).** A
+  candidate at NAME_MAX no longer overflows on its first `-<n>` bump; the compact checksum
+  fallback reserves worst-case counter headroom.
+- **`.tmp-*` is the only sanctioned hidden namespace (ruling 12).** Any other dot-prefixed
+  child of `pending/` (`.poison`, `.DS_Store`, hostile symlinks) is enumerated and classified
+  via the ruling-1 path (grammar-invalid → quarantine) instead of being invisible forever.
+- **Suite: 75 scenarios** (V.R/67-75 added; each fix round RED-proven by A/B against its
+  pre-fix engine),
+  declared gap [Q6] for the scanner-internal TOCTOU witnesses, and the jq re-probe is now
+  genuinely driven (an in-place-overwriting PATH shim; stub-flip verified). Mutation probe
+  re-anchored; M8/MQ1 kill sets strengthened.
+
+
 ## v1.2.0 — 2026-08-04 — the claim layer is deleted
 
 Steve's ruling (`.context/seams/dm-v1.1-queue.md` § v1.2), after three consecutive adversarial

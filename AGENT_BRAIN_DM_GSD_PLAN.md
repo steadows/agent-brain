@@ -1,10 +1,16 @@
 # Agent-Brain Lane DM — GSD Plan
 
-**Status:** `[~]` P0–P4 ✅ + gates 7.1/7.2 + 7.4 ultrareview ✅; **v1.2 (claim layer DELETED
-per the acked ruling in `.context/seams/dm-v1.1-queue.md` § v1.2) is GREEN** — suite rewritten
-and frozen (54 scenarios), engine at commit `6d9199a`, 54/54 DM + 15/15 commit/install under
-`sh` AND **real dash** (rewritten-shebang engine, not the harness-only invocation).
-**Next: Phase 5 deploy**, then P6 live e2e → 7.3 PR → 7.G.
+**Status:** `[~]` P0–P4 ✅ + gates 7.1/7.2 + 7.4 ultrareview ✅; **v1.2.2-r2 is GREEN and
+review-converged** — v1.2 (claim layer deleted) → v1.2.1 (rulings 1–6+1a) → v1.2.2 (rulings
+7–9) → v1.2.2-r2/r3 (rulings 10–12 + all /simplify + pre-PR review + final-sweep findings), every ruling a
+standalone map commit in `.context/seams/dm-v1.1-queue.md`. Suite at **75 scenarios**, engine
+at commit `baff2ee` (VERSION 1.2.2), 75/75 DM + 15/15 commit/install under `sh` AND **real
+dash**; mutation probe 16/16, tree byte-restored; each fix round RED-proven by A/B against
+the pre-fix engine. Gates this arc: /simplify (4-angle) → /steadows-code-review (5-agent +
+verified-claims filter) → single-agent Codex adversarial sweeps at max (one per round; final
+convergence sweep on `fe1a329` recorded in `docs/reviews/`).
+**Next: Phase 5 deploy** (Steve's explicit go, separate from any plan approval), then P6
+live e2e → 7.3 PR (Steve clicks) → 7.G.
 **Owner:** @pm · **Repo:** `~/agent-brain` (branch `fix/pretool-collision-warning`) → deployed to `<main-worktree>/.brain/`
 **Evidence:** `docs/research/agent-lane-dm-mechanisms-eval.md` (E0–E15) in `enterprise_research_dashboard-pm`
 **Predecessor:** `~/agent-brain/docs/AGENT-DM-CHANNELS.md` (2026-06-15, superseded in part)
