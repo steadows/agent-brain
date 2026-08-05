@@ -780,10 +780,31 @@ cmd_dm_take() {
   return "$_dt_rc"
 }
 
+# Establish failed/ one component at a time. rc 0 means the leaf exists and is validated,
+# rc 1 means a child is proven absent beneath a validated parent, and rc 2 means an existing
+# ancestor or leaf cannot be inspected. This stays shell-only on the common absent path.
+_dm_failed_state() { # <lane>
+  _fs_root="$BRAIN/dm"
+  [ -e "$_fs_root" ] || [ -L "$_fs_root" ] || return 1
+  _dm_dir_ok "$_fs_root" || return 2
+
+  _fs_lane="$_fs_root/$1"
+  [ -e "$_fs_lane" ] || [ -L "$_fs_lane" ] || return 1
+  _dm_dir_ok "$_fs_lane" || return 2
+
+  _fs_failed="$_fs_lane/failed"
+  [ -e "$_fs_failed" ] || [ -L "$_fs_failed" ] || return 1
+  _dm_dir_ok "$_fs_failed" || return 2
+}
+
 _dm_failed_count() { # <lane>
   _fc_dir="$BRAIN/dm/$1/failed"; _fc_count=0
-  [ -e "$_fc_dir" ] || [ -L "$_fc_dir" ] || { printf '0\n'; return 0; }
-  _dm_dir_ok "$_fc_dir" || return 1
+  _dm_failed_state "$1"
+  case $? in
+    0) ;;
+    1) printf '0\n'; return 0 ;;
+    *) return 1 ;;
+  esac
   # Display-only count — the dir was just validated; every visible or dot-named artifact in
   # failed/ belongs in the operator's "inspect failed/" total.
   for _fc_file in "$_fc_dir"/* "$_fc_dir"/.*; do
@@ -928,18 +949,27 @@ cmd_status() {
   [ -s "$BRAIN/.hook-errors.log" ] && \
     printf '\n⚠ hook errors logged — see .brain/.hook-errors.log\n'
 
-  # Structurally invalid messages are quarantined but never silent or auto-deleted. Proven
-  # absence keeps the common no-failures boot from paying a subshell fork just to hear "0".
-  if [ -n "$_me" ] &&
-     { [ -e "$BRAIN/dm/$_me/failed" ] || [ -L "$BRAIN/dm/$_me/failed" ]; }; then
-    if _failed_count=$(_dm_failed_count "$_me" 2>/dev/null); then
-      [ "$_failed_count" -gt 0 ] 2>/dev/null && \
-        printf '\n⚠ %s DM message(s) failed structural validation — inspect .brain/dm/%s/failed/\n' \
-          "$_failed_count" "$_me"
-    else
+  # Structurally invalid messages are quarantined but never silent or auto-deleted. The
+  # tri-state ancestor probe keeps proven absence fork-free while refusing to infer absence
+  # through a malformed or uninspectable dm root/lane.
+  if [ -n "$_me" ]; then
+    _dm_failed_state "$_me" 2>/dev/null
+    _failed_state_rc=$?
+    case $_failed_state_rc in
+      0)
+        if _failed_count=$(_dm_failed_count "$_me" 2>/dev/null); then
+          [ "$_failed_count" -gt 0 ] 2>/dev/null && \
+            printf '\n⚠ %s DM message(s) failed structural validation — inspect .brain/dm/%s/failed/\n' \
+              "$_failed_count" "$_me"
+        else
+          _failed_state_rc=2
+        fi
+        ;;
+      1) ;;
+    esac
+    [ "$_failed_state_rc" -le 1 ] || \
       printf '\n⚠ DM failed/ state cannot be inspected for @%s — check .brain/dm/%s/failed/\n' \
         "$_me" "$_me"
-    fi
   fi
 
   # recent journal lines relevant to me

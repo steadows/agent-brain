@@ -4635,6 +4635,109 @@ sc_status_surfaces_regular_file_failed_state() {
     "ruling 14 absence-only fast path for an existing failed/ regular file"
 }
 
+# ════════════════ V.Y — v1.2.4 ruling 14 ancestor validation (RED) ════════════════
+# V.Y/86 — Y1: a regular-file lane makes failed/ uninspectable, not absent. The leaf itself is
+# missing, so this discriminates the ancestor walk from ruling 13a's existing-leaf coverage.
+sc_status_surfaces_regular_file_lane_ancestor() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  lane="$fx/.brain/dm/bravo"
+
+  run_brain "$fx" bravo inbox
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: ensure the failed-state tree" || return 0
+  mv "$lane" "$lane.real" \
+    || { fail "fixture: could not move the healthy lane directory"; return 0; }
+  printf 'not-a-directory\n' > "$lane" \
+    || { fail "fixture: could not plant the regular-file lane"; return 0; }
+
+  run_brain "$fx" bravo status
+  status_rc=$?
+  need_rc "$status_rc" 0 "brain status with the lane ancestor as a regular file"
+  need_file_has "$OUT" 'DM failed/ state cannot be inspected for @bravo' \
+    "ruling 14 must reject a regular-file lane ancestor before treating failed/ as absent"
+  need_file_lacks "$OUT" '⚠ 0 DM message(s)' \
+    "a malformed lane ancestor must never render as proven-empty"
+}
+
+# V.Y/87 — Y1: a symlinked dm root that resolves to a regular file cannot be searched for the
+# lane or failed/ leaf. The root's existence is enough to require validation before absence.
+sc_status_surfaces_symlinked_file_dm_root_ancestor() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  dm_root="$fx/.brain/dm"
+  target="$(dirname "$fx")/dm-root-file-target"
+
+  run_brain "$fx" bravo inbox
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: ensure the failed-state tree" || return 0
+  mv "$dm_root" "$dm_root.real" \
+    || { fail "fixture: could not move the healthy dm root"; return 0; }
+  printf 'not-a-directory\n' > "$target" \
+    || { fail "fixture: could not plant the dm-root symlink target"; return 0; }
+  ln -s "$target" "$dm_root" \
+    || { fail "fixture: could not symlink the dm root to a regular file"; return 0; }
+
+  run_brain "$fx" bravo status
+  status_rc=$?
+  need_rc "$status_rc" 0 "brain status with dm/ symlinked to a regular file"
+  need_file_has "$OUT" 'DM failed/ state cannot be inspected for @bravo' \
+    "ruling 14 must reject a symlinked dm-root ancestor before treating failed/ as absent"
+  need_file_lacks "$OUT" '⚠ 0 DM message(s)' \
+    "a malformed dm-root ancestor must never render as proven-empty"
+}
+
+# V.Y/88 — Y1: an empty 0300 lane is searchable but not enumerable. Its missing failed/ child
+# is not proven absent because the lane itself fails ruling 7's read+search validation.
+sc_status_surfaces_unreadable_lane_ancestor() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  lane="$fx/.brain/dm/bravo"
+
+  run_brain "$fx" bravo inbox
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: ensure the failed-state tree" || return 0
+  mv "$lane" "$lane.real" \
+    || { fail "fixture: could not move the healthy lane directory"; return 0; }
+  mkdir "$lane" || { fail "fixture: could not create the empty lane directory"; return 0; }
+  make_unreadable_dir "$lane"
+  unreadable_rc=$?
+  case "$unreadable_rc" in
+    0) ;;
+    2) fail "instrument blind: the 0300 lane directory is still enumerable (running as root?)"; return 0 ;;
+    *) fail "fixture: could not make the lane unreadable-but-searchable (rc=$unreadable_rc)"; return 0 ;;
+  esac
+
+  run_brain "$fx" bravo status
+  status_rc=$?
+  status_out="$(dirname "$fx")/unreadable-lane-status.out"
+  cp "$OUT" "$status_out" 2>/dev/null || : > "$status_out"
+  chmod 755 "$lane" 2>/dev/null || true  # restore BEFORE any assertion can return early
+
+  need_rc "$status_rc" 0 "brain status with an unreadable lane ancestor"
+  need_file_has "$status_out" 'DM failed/ state cannot be inspected for @bravo' \
+    "ruling 14 must reject an unreadable lane ancestor before treating failed/ as absent"
+  need_file_lacks "$status_out" '⚠ 0 DM message(s)' \
+    "an unreadable lane ancestor must never render as proven-empty"
+}
+
+# V.Y/89 — control: failed/ genuinely does not exist beneath a healthy real dm root and lane.
+# This is the fork-free common path ruling 14 preserves; absence produces no failed-DM banner.
+sc_status_keeps_proven_absent_failed_state_silent() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  fd=$(q_dir "$fx" bravo failed)
+
+  run_brain "$fx" bravo inbox
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: ensure the failed-state tree" || return 0
+  rmdir "$fd" || { fail "fixture: could not remove the empty failed/ directory"; return 0; }
+
+  run_brain "$fx" bravo status
+  status_rc=$?
+  need_rc "$status_rc" 0 "brain status with failed/ proven absent under healthy ancestors"
+  need_file_lacks "$OUT" 'DM failed/ state cannot be inspected for @bravo' \
+    "proven absence under healthy ancestors must remain banner-free"
+  need_file_lacks "$OUT" 'DM message(s) failed structural validation' \
+    "proven-empty failed/ state must not render a spurious zero or positive banner"
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
 printf 'brain lane-DM v1.2 RED suite (claim layer deleted) + v1.2.1-v1.2.4 contract addenda\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
@@ -4731,6 +4834,10 @@ scenario red   "V.V/82  rc0-truncated-send-is-rejected"     sc_rc0_truncated_sen
 scenario red   "V.V/83  send-witness-requires-key-syntax"   sc_send_witness_requires_key_syntax
 scenario red   "V.V/84  envelope-needs-escaped-digest-id"   sc_envelope_witness_requires_escaped_digest_id
 scenario red   "V.V/85  regular-file-failed-status-banner"  sc_status_surfaces_regular_file_failed_state
+scenario red   "V.Y/86  regular-file-lane-status-banner"    sc_status_surfaces_regular_file_lane_ancestor
+scenario red   "V.Y/87  symlinked-file-root-status-banner"  sc_status_surfaces_symlinked_file_dm_root_ancestor
+scenario red   "V.Y/88  unreadable-lane-status-banner"      sc_status_surfaces_unreadable_lane_ancestor
+scenario guard "V.Y/89  proven-absent-failed-is-silent"     sc_status_keeps_proven_absent_failed_state_silent
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'
