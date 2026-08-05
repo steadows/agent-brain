@@ -752,3 +752,23 @@ quarantine becomes invisible exactly when `failed/` is unreadable or malformed (
 fail-open shape ruling 7 banned on the consume path). **Ruling:** enumeration/validation
 failure on the status path surfaces an explicit "DM failed/ state cannot be inspected"
 banner; zero is reserved for a PROVEN-empty failed/.
+
+## 13a. ERRATUM + TIGHTENING (sweep round 3): "object-shaped" means framed, and witnesses match syntax, not substrings
+
+Round 3 falsified ruling 13's coverage claim as written: a `{`-prefix check does NOT cover
+truncated output (a payload missing its closing `}` passed all three witnesses), a quoted-word
+check is not a key check (`{"values":["from","to","ts","content"]}` passed the send witness),
+and a bare-id substring can be supplied by unrelated context text (`current_ticket`) after the
+DM block itself was dropped. Corrections, same cheapness class (`case` patterns only):
+
+- **object-shaped** = `{`-prefixed AND `}`-terminated (final byte, after the usual trailing-
+  newline handling);
+- **key witnesses** match key syntax — `"from":` `"to":` `"ts":` `"content":` — never bare
+  quoted words;
+- **the envelope witness** matches the ESCAPED digest fragment `\"id\":\"<staged-id>\"` (the
+  form the digest block necessarily takes inside the serialized context string), which
+  ordinary status text cannot supply;
+- **ruling 14's fast path** is reserved for proven ABSENCE: any existing `failed/` path —
+  regular file, FIFO, symlink, directory — goes through the count/banner logic.
+
+The trust boundary paragraph is unchanged.
