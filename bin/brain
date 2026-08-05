@@ -8,7 +8,7 @@
 # (the portable equivalent — mkdir is atomic create on POSIX filesystems).
 
 set -u
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 # Clear the vault-resolution sentinel at process entry: it is a marker for "this process ran
 # brain_root()", and an inherited value would let a caller's environment stand in for that.
@@ -24,9 +24,10 @@ DM_FILENAME_MAX_BYTES=255
 # both consume loops cap at DM_INJECT_MAX_LINES entries and _dm_digest bounds every emitted line
 # to DM_INJECT_MAX_COLS bytes, so the total is ≤ LINES × (COLS + 1) by construction. A prior
 # per-message wc -c accumulator guarded exactly that unreachable branch and was removed.
-# Digest per-field starting budget: reserve DM_DIGEST_ENVELOPE cols for the JSON envelope,
-# then divide by DM_ESCAPE_FACTOR — worst-case JSON escaping (\uXXXX) expands one character
-# into six output characters. The serializer reduces this budget further when needed.
+# Digest per-field starting budget: reserve DM_DIGEST_ENVELOPE cols for the four bounded wire
+# fields' JSON envelope, then divide by DM_ESCAPE_FACTOR — worst-case JSON escaping (\uXXXX)
+# expands one character into six output characters. The stable id is bounded separately by
+# _dm_id_ok; the serializer reduces the field budget further when needed.
 DM_DIGEST_ENVELOPE=512
 DM_ESCAPE_FACTOR=6
 
@@ -342,39 +343,54 @@ cmd_inbox() {
 _dm_id_in_use() { # <lane> <id>
   _iu_lane=$1; _iu_id=$2
   for _iu_state in pending read failed; do
-    _iu_file="$BRAIN/dm/$_iu_lane/$_iu_state/$_iu_id"
-    if [ -e "$_iu_file" ] || [ -L "$_iu_file" ]; then return 0; fi
+    # Collision-bumped transcripts still reserve their original stable id. This is a strict
+    # widening of the safety scan: <id> and every <id>* variant count as occupied.
+    for _iu_file in "$BRAIN/dm/$_iu_lane/$_iu_state/$_iu_id"*; do
+      [ -e "$_iu_file" ] || [ -L "$_iu_file" ] || continue
+      return 0
+    done
   done
   return 1
 }
 
 # Producer-shaped stable message ID:
-# `<YYYYmmddTHHMMSSZ>-<decimal-pid>[-<decimal-collision-bump>]`.
+# `<YYYYmmddTHHMMSSZ>-<decimal-pid>[-<decimal-collision-bump>]`. Its byte cap also
+# bounds the stable id that _dm_digest injects outside bounded()'s four-field recursion.
+_dm_digits_ok() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
 _dm_id_ok() {
   _io_id=$1
   [ "${#_io_id}" -le "$DM_FILENAME_MAX_BYTES" ] || return 1
-  case "$_io_id" in
-    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-[0-9]*) ;;
+  _io_stamp=${_io_id%%-*}
+  case "$_io_stamp" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) ;;
     *) return 1 ;;
   esac
+  [ "$_io_stamp" != "$_io_id" ] || return 1
   _io_tail=${_io_id#*-}
   case "$_io_tail" in
-    *-*) _io_pid=${_io_tail%-*}; _io_bump=${_io_tail##*-} ;;
+    *-*)
+      _io_pid=${_io_tail%%-*}; _io_bump=${_io_tail#*-}
+      case "$_io_bump" in *-*) return 1 ;; esac
+      _dm_digits_ok "$_io_bump" || return 1
+      ;;
     *) _io_pid=$_io_tail; _io_bump="" ;;
   esac
-  case "$_io_pid" in [1-9]|[1-9][0-9]*) ;; *) return 1 ;; esac
-  if [ -n "$_io_bump" ]; then
-    case "$_io_bump" in *[!0-9]*) return 1 ;; esac
-  fi
+  case "$_io_pid" in [1-9]*) ;; *) return 1 ;; esac
+  _dm_digits_ok "$_io_pid"
 }
 
 _dm_new_id() { # <lane>
-  # One compact stamp per process: a broadcast mints N ids in the same second anyway, and the
-  # bump loop below already arbitrates same-base collisions.
-  [ -n "${_DM_ID_TS:-}" ] || _DM_ID_TS=$(_now_compact)
-  _ni_lane=$1; _ni_base="$_DM_ID_TS-$$"; _ni_id=$_ni_base; _ni_n=0
+  # Identity is derived on demand, never inherited from the environment. The clock must really
+  # succeed; a valid-looking fallback would make clock failure indistinguishable from a mint.
+  _ni_lane=$1
+  _ni_ts=$(_now_compact) || return 1
+  [ -n "$_ni_ts" ] || return 1
+  _ni_base="$_ni_ts-$$"; _ni_id=$_ni_base; _ni_n=0
+  _dm_id_ok "$_ni_id" || return 1
   while _dm_id_in_use "$_ni_lane" "$_ni_id"; do
     _ni_n=$((_ni_n + 1)); _ni_id="$_ni_base-$_ni_n"
+    _dm_id_ok "$_ni_id" || return 1
   done
   printf '%s\n' "$_ni_id"
 }
@@ -388,12 +404,33 @@ _dm_write_json() { # <from> <to> <msg> <ts>
 _dm_send() { # <from> <to> <msg> <ts>
   _ds_from=$1; _ds_to=$2; _ds_msg=$3; _ds_ts=$4
   _dm_ensure_tree "$_ds_to" || return 1
+  _ds_pending="$BRAIN/dm/$_ds_to/pending"
+  _dm_dir_ok "$_ds_pending" || return 1
   _ds_id=$(_dm_new_id "$_ds_to") || return 1
-  _ds_dest="$BRAIN/dm/$_ds_to/pending/$_ds_id"
+  _dm_id_ok "$_ds_id" || return 1
+  _ds_dest="$_ds_pending/$_ds_id"
+  [ "${_ds_dest%/*}" = "$_ds_pending" ] || return 1
   _atomic_place _dm_write_json "$_ds_dest" "$_ds_from" "$_ds_to" "$_ds_msg" "$_ds_ts"
 }
 
 _dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
+
+# Fork-free queue probe. Callers validate the directory first; this only answers whether the
+# ordinary pending glob has a direct child (broken symlinks included).
+_dm_dir_has_entries() {
+  for _dhe_file in "$1"/*; do
+    [ -e "$_dhe_file" ] || [ -L "$_dhe_file" ] || continue
+    return 0
+  done
+  return 1
+}
+
+_dm_direct_pending_entry() { # <lane> <entry-path>; type is deliberately not constrained here
+  _dpe_dir="$BRAIN/dm/$1/pending"
+  _dm_dir_ok "$_dpe_dir" || return 1
+  [ "${2%/*}" = "$_dpe_dir" ] \
+    || { _warn "refusing non-direct pending dm entry: $2"; return 1; }
+}
 
 # Pick a never-occupied state destination with one shared collision-bump idiom. Preserve the
 # original name when NAME_MAX allows; a checksum fallback keeps long records distinct.
@@ -401,11 +438,18 @@ _dm_collision_dest() { # <lane> <read|failed> <name>
   _cd_lane=$1; _cd_state=$2; _cd_name=$3
   _cd_dir="$BRAIN/dm/$_cd_lane/$_cd_state"; _cd_dest="$_cd_dir/$_cd_name"
   if ! _dm_dest_occupied "$_cd_dest"; then printf '%s\n' "$_cd_dest"; return 0; fi
-  _cd_stamp=$(_now_epoch) || return 1
+  _warn "dm $_cd_state destination is occupied for $_cd_name; using a collision-safe name"
+  _cd_stamp=$(_now_epoch) || {
+    _warn "could not construct dm collision destination for $_cd_name: clock failed"
+    return 1
+  }
   _cd_suffix=".collision-$_cd_stamp-$$"; _cd_candidate="$_cd_name$_cd_suffix"
   _cd_bytes=$(LC_ALL=C printf '%s' "$_cd_candidate" | wc -c | tr -d ' \n')
   if [ "$_cd_bytes" -gt "$DM_FILENAME_MAX_BYTES" ]; then
-    _cd_sum=$(printf '%s' "$_cd_name" | cksum) || return 1
+    _cd_sum=$(printf '%s' "$_cd_name" | cksum) || {
+      _warn "could not construct dm collision destination for $_cd_name: checksum failed"
+      return 1
+    }
     _cd_sum=${_cd_sum%% *}
     _cd_candidate="collision-$_cd_sum-$_cd_stamp-$$"
   fi
@@ -419,7 +463,7 @@ _dm_collision_dest() { # <lane> <read|failed> <name>
 _dm_route_failed() { # <lane> <message-file> <reason>
   _rf_lane=$1; _rf_file=$2; _rf_reason=$3; _rf_name=${_rf_file##*/}
   _dm_dir_ok "$BRAIN/dm/$_rf_lane/failed" || return 1
-  _dm_dir_ok "$_rf_file" || return 1
+  _dm_direct_pending_entry "$_rf_lane" "$_rf_file" || return 1
   _rf_dest=$(_dm_collision_dest "$_rf_lane" failed "$_rf_name") || return 1
   _dm_dest_occupied "$_rf_dest" \
     && { _warn "dm failed destination became occupied for $_rf_name"; return 1; }
@@ -432,18 +476,28 @@ _dm_route_failed() { # <lane> <message-file> <reason>
   return 1
 }
 
-# Prove jq supports the exact consumer primitives once before inspecting any message. A failure
-# here is global, so callers leave every entry pending.
+# Prove jq supports the exact consumer primitives once before inspecting any message, and record
+# this build's measured parse-error and error() exit codes. A failure here is global, so callers
+# leave every entry pending rather than treating an unestablished verdict as proof.
 _dm_jq_preflight() {
-  command -v jq >/dev/null 2>&1 \
-    && jq -e -n '"x" | (utf8bytelength == 1 and ((tojson | type) == "string"))' \
-      >/dev/null 2>&1
+  _DM_JQ_PARSE_RC=""; _DM_JQ_ERROR_RC=""
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -e -n '"x" | (utf8bytelength == 1 and ((tojson | type) == "string"))' \
+    >/dev/null 2>&1 || return 1
+  printf '{' | jq -e . >/dev/null 2>&1
+  _DM_JQ_PARSE_RC=$?
+  [ "$_DM_JQ_PARSE_RC" != 0 ] || return 1
+  jq -n 'error("dm preflight")' >/dev/null 2>&1
+  _DM_JQ_ERROR_RC=$?
+  [ "$_DM_JQ_ERROR_RC" != 0 ] || return 1
 }
 
 # Rebuild one validated pending object from only the bounded wire fields plus its stable ID. The
 # recursive byte check preserves the content head while keeping the serialized record valid.
 _dm_digest() { # <message-file> <message-id>
   _dg_file=$1; _dg_id=$2
+  # _dg_id is intentionally outside bounded()'s four-field recursion. _dm_id_ok's filename-byte
+  # cap is therefore a serializer precondition, paired with DM_DIGEST_ENVELOPE's reserved space.
   _dg_field_max=$(((DM_INJECT_MAX_COLS - DM_DIGEST_ENVELOPE) / DM_ESCAPE_FACTOR))
   [ "$_dg_field_max" -gt 0 ] || _dg_field_max=1
   jq -c -s -r \
@@ -481,9 +535,15 @@ _dm_digest() { # <message-file> <message-id>
 # duplicate policy. rc 0: digest line on stdout, file left pending for the caller's emit→archive
 # sequence. rc 2: structurally invalid — quarantined into failed/ HERE. rc 3: structurally
 # invalid AND the quarantine itself failed (file left pending). rc 1: transient failure — file
-# left pending (a system error is not proof of invalidity; jq's own error() exit, 5, is).
+# left pending (a system error is not proof; only this jq build's probed invalidity codes are).
 _dm_pending_digest() { # <lane> <message-file>
   _pd_lane=$1; _pd_file=$2; _pd_name=${_pd_file##*/}
+  _dm_direct_pending_entry "$_pd_lane" "$_pd_file" || return 1
+  if [ -L "$_pd_file" ] || [ ! -f "$_pd_file" ]; then
+    _warn "structurally unusable non-regular dm queue entry for @$_pd_lane: $_pd_name"
+    _dm_route_failed "$_pd_lane" "$_pd_file" "structurally unusable dm queue entry" || return 3
+    return 2
+  fi
   _dm_dir_ok "$_pd_file" || return 1
   if ! _dm_id_ok "$_pd_name"; then
     _warn "invalid pending dm name for @$_pd_lane: $_pd_name"
@@ -492,16 +552,15 @@ _dm_pending_digest() { # <lane> <message-file>
   fi
   _dm_digest "$_pd_file" "$_pd_name"
   _pd_digest_rc=$?
-  case "$_pd_digest_rc" in
-    0) return 0 ;;
-    5)
-      _warn "invalid dm object in $_pd_file"
-      _dm_route_failed "$_pd_lane" "$_pd_file" "structurally invalid dm message" || return 3
-      return 2 ;;
-    *)
-      _warn "could not digest pending dm message for @$_pd_lane: $_pd_name; leaving it pending"
-      return 1 ;;
-  esac
+  [ "$_pd_digest_rc" = 0 ] && return 0
+  if { [ -n "${_DM_JQ_PARSE_RC:-}" ] && [ "$_pd_digest_rc" = "$_DM_JQ_PARSE_RC" ]; } \
+     || { [ -n "${_DM_JQ_ERROR_RC:-}" ] && [ "$_pd_digest_rc" = "$_DM_JQ_ERROR_RC" ]; }; then
+    _warn "invalid dm object in $_pd_file"
+    _dm_route_failed "$_pd_lane" "$_pd_file" "structurally invalid dm message" || return 3
+    return 2
+  fi
+  _warn "could not digest pending dm message for @$_pd_lane: $_pd_name; leaving it pending"
+  return 1
 }
 
 # Move a successfully emitted pending message into read/, preserving any occupied transcript via
@@ -511,10 +570,7 @@ _dm_archive() { # <lane> <message-file>
   _dm_dir_ok "$BRAIN/dm/$_ar_lane/read" || return 1
   _dm_dir_ok "$_ar_file" || return 1
   _dm_id_ok "$_ar_name" || { _warn "invalid pending dm name at archive: $_ar_name"; return 1; }
-  _ar_dest="$BRAIN/dm/$_ar_lane/read/$_ar_name"
-  if _dm_dest_occupied "$_ar_dest"; then
-    _ar_dest=$(_dm_collision_dest "$_ar_lane" read "$_ar_name") || return 1
-  fi
+  _ar_dest=$(_dm_collision_dest "$_ar_lane" read "$_ar_name") || return 1
   if command mv -f -- "$_ar_file" "$_ar_dest" 2>/dev/null; then return 0; fi
   _warn "could not archive emitted dm message for @$_ar_lane: $_ar_name"
   return 1
@@ -524,6 +580,10 @@ cmd_dm_take() {
   _require_brain
   _dt_lane=$(cmd_whoami)
   [ -n "$_dt_lane" ] || _die "brain dm take: whoami is empty"
+  _dm_ensure_tree "$_dt_lane" || return 1
+  _dt_pending="$BRAIN/dm/$_dt_lane/pending"
+  _dm_dir_ok "$_dt_pending" || return 1
+  _dm_dir_has_entries "$_dt_pending" || return 0
   if ! _dm_jq_preflight; then
     _warn "brain dm take: jq is unavailable or incompatible; leaving all messages pending"
     return 1
@@ -532,9 +592,6 @@ cmd_dm_take() {
     _warn "brain dm take: stdout is unavailable; leaving all messages pending"
     return 1
   fi
-  _dm_ensure_tree "$_dt_lane" || return 1
-  _dt_pending="$BRAIN/dm/$_dt_lane/pending"
-  _dm_dir_ok "$_dt_pending" || return 1
   _dt_count=0; _dt_rc=0
   for _dt_file in "$_dt_pending"/*; do
     [ -e "$_dt_file" ] || [ -L "$_dt_file" ] || continue
@@ -552,6 +609,9 @@ cmd_dm_take() {
     fi
     _dm_archive "$_dt_lane" "$_dt_file" || _dt_rc=1
   done
+  if [ "$_dt_count" -ge "$DM_INJECT_MAX_LINES" ] && _dm_dir_has_entries "$_dt_pending"; then
+    _warn "brain dm take: more messages remain pending after this bounded batch"
+  fi
   return "$_dt_rc"
 }
 
@@ -1183,11 +1243,12 @@ _hook_session_start() {
   # (b2) Inspect a bounded batch in pending/. Structurally invalid regular files are quarantined
   # independently; valid files stay pending until the complete SessionStart payload is emitted.
   _ib="$BRAIN/dm/$_feat/pending"
-  _dm_block=""; _digest=""; _valid_names=""; _batch_count=0; _more_dm=0
-  if _dm_ensure_tree "$_feat"; then
+  _dm_block=""; _digest=""; _batch_count=0; _more_dm=0
+  set --
+  if _dm_ensure_tree "$_feat" && _dm_dir_ok "$_ib" && _dm_dir_has_entries "$_ib"; then
     if ! _dm_jq_preflight; then
       _warn "SessionStart dm consume: jq is unavailable or incompatible; leaving all messages pending"
-    elif _dm_dir_ok "$_ib"; then
+    else
       for _pending_file in "$_ib"/*; do
         [ -e "$_pending_file" ] || [ -L "$_pending_file" ] || continue
         if [ "$_batch_count" -ge "$DM_INJECT_MAX_LINES" ]; then
@@ -1204,18 +1265,15 @@ _hook_session_start() {
         _digest="${_digest}${_digest:+
 }${_digest_line}"
         _pending_name=${_pending_file##*/}
-        _valid_names="${_valid_names}${_valid_names:+ }$_pending_name"
+        set -- "$@" "$_pending_name"
       done
     fi
   fi
-  if [ -n "$_valid_names" ]; then
+  if [ "$#" -gt 0 ]; then
     _dm_block="Unread DMs delivered while you were away:
 $_digest
 
 "
-    # Only grammar-validated message IDs cross this split; absolute paths are rebuilt after it.
-    # shellcheck disable=SC2086
-    set -- $_valid_names
   fi
   _continue_dm=""
   if [ "$_more_dm" = 1 ]; then
@@ -1234,7 +1292,7 @@ On activity, consume it by running: \"$BRAIN/bin/brain\" dm take
 ${_continue_dm}
 
 $_st"; then
-    if [ -n "$_valid_names" ]; then
+    if [ "$#" -gt 0 ]; then
       _archive_rc=0
       for _emitted_name in "$@"; do
         _dm_archive "$_feat" "$_ib/$_emitted_name" || _archive_rc=1
