@@ -590,3 +590,78 @@ Corollary for the suite: a scenario whose outcome depends on this accounting is 
 robust. Fixtures that need "entries remain past the cap" must carry a margin that holds under
 either policy (measured during the v1.2.1 RED audit: a zero-margin fixture false-reds under the
 non-consuming policy).
+
+---
+
+# v1.2.2 — ADDENDUM: unestablishable state is leave-pending, and paths are opaque byte strings
+
+**Status: proposed by @pm from the v1.2.1 adversarial review (`docs/prompts/dm-v121-adversarial-review.md`,
+single-agent Codex at max). Two of three findings were reproduced by the orchestrator before
+acceptance.** Standalone map commit ahead of implementation, per the architecture-first lock.
+
+## 7. Ruling 2's fail-safe generalizes: ANY unestablishable state leaves messages pending
+
+Ruling 2 said a jq whose behaviour cannot be established fails safe to leave-pending. That
+principle was written about a *dependency*; it applies equally to the **queue itself**.
+
+**Measured:** a queue directory that is writable and searchable but NOT readable (mode `0300`)
+cannot be enumerated by a glob — the pattern stays literal and every existence test on it is
+false. Verified under `/bin/sh`:
+
+```
+exact-path [ -e d/abc ] : TRUE    <- an exact path still resolves on search permission alone
+glob scan  d/abc*       : no      <- the glob cannot expand; the scan reports "nothing here"
+```
+
+**Ruling:** enumeration failure is a distinct, operation-fatal outcome — never "empty" and never
+"free". Concretely: `_dm_id_in_use` must not conclude an id is available, `_dm_dir_has_entries`
+must not conclude a queue is empty, and a consume or mint that cannot establish queue state
+**aborts with a diagnostic and leaves messages pending**. Verify the state directories are
+readable and searchable before trusting any scan.
+
+**⚠ This corrects a dispatcher justification, on the record.** v1.2.1 shipped the `<id>*` glob
+widening untested on my stated reasoning that it was a *strict widening* — "it can report 'in use'
+more often, never less, so it cannot introduce a new failure mode." **That reasoning was wrong**,
+and the unreadable-directory case is the counterexample: the glob reports *less* than the exact
+path it replaced. The lesson is not "don't widen" — it is that a claim of strict-widening must
+name the enumeration mechanism it depends on, because swapping an exact test for a search changes
+the failure mode, not just the match set. Keep an exact-path test alongside any bumped-variant
+scan.
+
+## 8. A filesystem path is an opaque byte string; never transport one through `$( )`
+
+**Measured:** command substitution strips trailing newlines, so a path whose basename ends in one
+is silently truncated:
+
+```
+p=$(printf 'failed/0001\n')   ->   f a i l e d / 0 0 0 1     (the newline is gone)
+```
+
+`_dm_collision_dest` returns its destination on stdout and both callers capture it with `$( )`. For
+a non-regular entry named with a trailing newline, the helper evaluates a free destination, returns
+a *different* (truncated) path, the caller's re-check finds that one occupied, and the move is
+refused — the entry stays pending forever. Forty such entries reinstate exactly the head-of-line
+starvation ruling 1 closed. Reachable because ruling 1 quarantines non-regular entries **before**
+the `_dm_id_ok` grammar check, so the digits-only grammar does not gate this path.
+
+**Ruling:** paths do not travel through command substitution. The collision helper either sets a
+caller-visible variable or performs the rename itself, preserving every byte of the name except
+NUL. This applies to any future helper that computes a path — the grammar is not a substitute,
+because the quarantine path exists precisely to handle entries that never satisfy it.
+
+## 9. A dependency's identity is pinned for the operation, not just probed once
+
+Ruling 2 probes jq's exit-code contract at preflight, but `_dm_digest` re-resolves `jq` for every
+message, so the binary that produced a failure is not provably the binary that was probed. A
+PATH-resolvable replacement can pass all probes and then return a recorded status (e.g. `5`) for an
+*invocation* failure on healthy JSON — quarantining good messages, up to a whole batch.
+
+**Ruling:** resolve the interpreter once per operation and invoke that resolved path throughout; a
+nonzero digest result may authorize quarantine only if the probe still holds for that same
+executable. Any mismatch leaves the message pending.
+
+**Severity note, stated honestly:** an attacker who can replace a binary on the user's PATH already
+has code execution as that user, so this is not the sharpest threat in the model. It is ruled
+anyway because the *fail-safe direction* is what makes it cheap: pinning costs one resolution and
+converts a silent misclassification into a leave-pending, and quarantine is the one irreversible
+transition in the queue.
