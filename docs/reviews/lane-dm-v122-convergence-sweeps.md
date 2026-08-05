@@ -151,3 +151,18 @@ absent from the manifest (0 matches vs 1 on the real engine).
 6 combined — 0 product defects, 5 instrument/record defects. Production code has not
 changed since `1249b99`; the engine has not changed since `d30c736` except r7's fork-free
 refactor. The loop's findings have moved fully off the shipping surface.
+
+## GATE CLOSED — Steve's ruling, 2026-08-05
+
+The header rule ("the gate closes only on a clean READY sweep") is superseded for this arc
+by an explicit product decision, same form as ruling 13b. Grounds, presented to Steve and
+accepted: sweeps 5+6 returned ZERO product findings between them; sweep 6's sole finding
+(instrument blind spot) was closed in r8 with a MEASURED two-way discriminator — the
+motivating counterexample now fails exactly V.N/50 behaviorally and is rejected by the
+exact-line manifest structurally, both re-established by the orchestrator on the final
+tree (`9b78ab0`) — which is stronger evidence than a further review round; and a sweep 7
+over a 24-line test-only diff would be inspecting the test tooling's test tooling, the
+treadmill the proportionality brake names. Residual risks remain as declared: the 13b
+byzantine boundary, suite gaps [Q1]-[Q7], and the standing fact that nothing has run
+against the live `.brain` until Phase 6. Next: 7.3 PR (Steve opens), Steve review + merge,
+then Phase 5 deploy on its own explicit go.
