@@ -797,13 +797,16 @@ _dm_failed_state() { # <lane>
   _dm_dir_ok "$_fs_failed" || return 2
 }
 
+# Authoritative status scan: preserve the state probe's tri-state return and publish a count only
+# after enumeration is revalidated. Callers read _DM_FAILED_COUNT; no path crosses stdout.
 _dm_failed_count() { # <lane>
+  _DM_FAILED_COUNT=0
   _fc_dir="$BRAIN/dm/$1/failed"; _fc_count=0
   _dm_failed_state "$1"
   case $? in
     0) ;;
-    1) printf '0\n'; return 0 ;;
-    *) return 1 ;;
+    1) return 1 ;;
+    *) return 2 ;;
   esac
   # Display-only count — the dir was just validated; every visible or dot-named artifact in
   # failed/ belongs in the operator's "inspect failed/" total.
@@ -813,7 +816,11 @@ _dm_failed_count() { # <lane>
     [ -e "$_fc_file" ] || [ -L "$_fc_file" ] || continue
     _fc_count=$((_fc_count + 1))
   done
-  printf '%s\n' "$_fc_count"
+  # Re-establish the directory after expansion: a mid-scan permission flip must not turn an
+  # uninspectable failed/ into a caller-visible zero.
+  _dm_dir_ok "$_fc_dir" || return 2
+  _DM_FAILED_COUNT=$_fc_count
+  return 0
 }
 
 cmd_dm() {
@@ -950,24 +957,20 @@ cmd_status() {
     printf '\n⚠ hook errors logged — see .brain/.hook-errors.log\n'
 
   # Structurally invalid messages are quarantined but never silent or auto-deleted. The
-  # tri-state ancestor probe keeps proven absence fork-free while refusing to infer absence
-  # through a malformed or uninspectable dm root/lane.
+  # authoritative tri-state+count call keeps both zero and positive results fork-free while
+  # refusing to infer absence through a malformed or uninspectable dm root/lane.
   if [ -n "$_me" ]; then
-    _dm_failed_state "$_me" 2>/dev/null
-    _failed_state_rc=$?
-    case $_failed_state_rc in
+    _dm_failed_count "$_me" 2>/dev/null
+    _failed_count_rc=$?
+    case $_failed_count_rc in
       0)
-        if _failed_count=$(_dm_failed_count "$_me" 2>/dev/null); then
-          [ "$_failed_count" -gt 0 ] 2>/dev/null && \
-            printf '\n⚠ %s DM message(s) failed structural validation — inspect .brain/dm/%s/failed/\n' \
-              "$_failed_count" "$_me"
-        else
-          _failed_state_rc=2
-        fi
+        [ "$_DM_FAILED_COUNT" -gt 0 ] 2>/dev/null && \
+          printf '\n⚠ %s DM message(s) failed structural validation — inspect .brain/dm/%s/failed/\n' \
+            "$_DM_FAILED_COUNT" "$_me"
         ;;
       1) ;;
     esac
-    [ "$_failed_state_rc" -le 1 ] || \
+    [ "$_failed_count_rc" -le 1 ] || \
       printf '\n⚠ DM failed/ state cannot be inspected for @%s — check .brain/dm/%s/failed/\n' \
         "$_me" "$_me"
   fi

@@ -2,7 +2,7 @@
 # Mutation probe for the DM v1.2.2 queue engine (including the v1.2.4 contract addendum).
 #
 # Every mutant breaks ONE load-bearing production mechanism and declares the scenario IDs that
-# must fail. Three properties are load-bearing in the harness itself and are not negotiable:
+# must fail. Four properties are load-bearing in the harness itself and are not negotiable:
 #
 #   1. ISOLATED ENGINE COPIES. A mutant is written to a scratch copy and the suite is pointed at
 #      it with BRAIN_BIN. bin/brain is never edited — the suite spawns the engine many times per
@@ -18,6 +18,10 @@
 #      anchors had silently died — a probe that cannot apply its mutant is a gate that lies.
 #      Per-mutant, the CHANGED-LINE COUNT is also declared, so an over-broad pattern that happens
 #      to still match is caught as surely as one that matches nothing.
+#   4. ADDRESS CARDINALITY. Every sed address below is declared with its intended engine match
+#      count and checked with sed's own BRE semantics. The exact-line manifest proves the intended
+#      replacement exists; this complementary check proves a broad address cannot reach it merely
+#      because the intended occurrence happens to be first.
 #
 # A mutant that kills NOTHING proves the suite does not pin the mechanism. A mutant that kills
 # MORE than it declared is not evidence either — it is a blunt instrument, and the run says so.
@@ -162,6 +166,44 @@ ANCHORS
   [ "$_bad" = 0 ]
 }
 
+# Every selector used by a mutant, including the deliberately multi-line `g` substitutions.
+# Format: expected-count~mutant/selector label~sed BRE. `~` is excluded from every address.
+addresses_ok() {
+  _bad=0
+  while IFS='~' read -r _want _label _address; do
+    [ -n "$_address" ] || continue
+    _n=$(sed -n "\\%${_address}%p" "$ENGINE_BACKUP" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$_n" != "$_want" ]; then
+      printf '%s address matches %s line(s), want %s: [%s]\n' \
+        "$_label" "$_n" "$_want" "$_address"
+      _bad=1
+    fi
+  done <<'ADDRESSES'
+1~M1 batch arm~^      2) continue ;;$
+1~M2 stdout preflight~^  if ! { true >&1; } 2>/dev/null; then$
+1~M2 emit-warn scope~could not emit pending dm messages
+1~M3 parse status~^  _JM_PARSE_RC=\$?$
+1~M3 digest-case scope~^    case "\$_pd_digest" in$
+1~M4 error status~^  _JM_ERROR_RC=\$?$
+1~M5 bounded serializer~^      bounded(\$field_max) | tojson$
+1~M6 digest id field~^          id: \$id$
+1~M6 digest-case scope~^    case "\$_pd_digest" in$
+1~M6 envelope witness~^    case "\$_esc_payload" in .*_DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac$
+2~M7 byte metric~utf8bytelength
+1~M8 collision predicate~^_dm_dest_occupied() { \[ -e "\$1" \] || \[ -L "\$1" \]; }$
+1~MQ1 nonregular route~^    _dm_route_failed "\$_pd_lane" "\$_pd_file" "structurally unusable dm queue entry" || return 3$
+1~MQ2 derived stamp~^  _ni_ts=\$(_now_compact) || return 1$
+1~MQ2 id validation~^  _dm_id_ok "\$_ni_id" || return 1$
+1~MQ3 derived stamp~^  _ni_ts=\$(_now_compact) || return 1$
+1~MQ4 empty gate~^  case \$? in 0) ;; 1) return 0 ;; \*) return 1 ;; esac$
+1~MQ5 pid grammar~^  _dm_digits_ok "\$_io_pid"$
+1~M9 journal line~dm → @\$_to (transcripts: .brain/dm/\$_to/)
+5~M10 engine path~\$BRAIN/bin/brain
+1~M11 directive~^On activity, consume it by running: \\"\$BRAIN/bin/brain\\" dm take$
+ADDRESSES
+  [ "$_bad" = 0 ]
+}
+
 # probe <label> <required-ids> <permitted-ids> <expected-changed-lines> <sed-program>
 # The sed runs into a COPY (never -i, which is spelled differently on BSD and GNU). The changed
 # line count is asserted so a drifted pattern (0 changed) and an over-broad one (too many) are
@@ -228,6 +270,13 @@ probe() {
 
 echo "=== instrument self-check ==="
 instrument_selfcheck || { echo "mutation instrument self-check failed ❌"; exit 1; }
+
+echo "=== sed address cardinality ==="
+if addresses_ok; then
+  echo "every mutant address has its declared engine cardinality ✅"
+else
+  echo "MUTANT ADDRESS AMBIGUOUS — re-address before trusting any result below ❌"; exit 1
+fi
 
 echo "=== anchor manifest ==="
 if anchors_ok; then
@@ -308,7 +357,7 @@ probe "M5  prose-digest         " "V.W/26 V.W/27 V.W/28" "" 1 \
 probe "M6  digest-drops-id      " "V.N/52" "" 3 \
   's@^          id: \$id$@          id: ""@
 /^    case "\$_pd_digest" in$/{n;s@^      .*@      \\{*id*\\})@;}
-/^  if \[ "\$#" -gt 0 \]; then$/{n;s@^    case .*@    case "$_esc_payload" in *id*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac@;}'
+s@^    case "\$_esc_payload" in .*_DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac$@    case "$_esc_payload" in *id*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac@'
 
 # Must-survive #6: the wire caps are BYTE caps (utf8bytelength), not code-point counts. Both
 # source sites move together — the shared measurement used by preflight/re-probe, plus digest —

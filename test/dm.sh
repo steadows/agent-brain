@@ -5,7 +5,10 @@
 #   0. .context/seams/dm-v1.1-queue.md, the `# v1.2.2`, `# v1.2.3`, and `# v1.2.4`
 #      CONTRACT ADDENDA — the latest rulings. Rulings 7/8/9 map to section V.R/67-71;
 #      rulings 10/11/12 map to V.R/72-75; rulings 13/14 map to V.U/76-79; ruling 13a maps to
-#      V.V/80-85. Everything they do not name is unchanged, so items 1-4 below still govern.
+#      V.V/80-84; ruling 14's existing-leaf and ancestor validation map to V.V/85 and V.Y/86-89.
+#      Erratum 13b is the signed witness ceiling: no later scenario may reopen shell-side JSON
+#      witness tightening. Everything these rulings do not name is unchanged, so items 1-4 below
+#      still govern.
 #   1. .context/seams/dm-v1.1-queue.md, the `# v1.2.1 — CONTRACT ADDENDUM` section
 #      (committed 33efc2d, authorized by Steve). It AMENDS the `# v1.2` section's
 #      "Poison, without a counter" ruling and must-survive items 3 and 6; its six numbered
@@ -130,6 +133,14 @@
 #     upfront probe but before the same process expands its glob is not drivable through one CLI
 #     invocation without bespoke cross-process coordination. The upfront operation-fatal contract
 #     remains pinned by V.R/67; the internal TOCTOU witnesses are declared, not claimed. [Q6]
+#   · `_dm_failed_count`'s fork-free caller-visible scalar and post-expansion revalidation are
+#     not independently observable through the CLI on a stable filesystem. V.Z/90-91 pin the
+#     ordinary existing-empty and positive-count outcomes, while V.V/85 and V.Y/86-89 pin the
+#     authoritative tri-state ancestor walk. Reintroducing command substitution preserves those
+#     outputs, and deleting only the final revalidation needs the same permission-flip machinery
+#     rejected at [Q6], so a single probe mutant would kill nothing. Per the round-7 instrument
+#     budget: no new harness, no hollow mutant; this residual structural coverage gap is declared.
+#     [Q7]
 #   · Read-side `_dm_collision_dest` is unreachable for hostile names: `_dm_archive`'s grammar
 #     gate precedes it. Hostile-name collision coverage therefore belongs to failed/ quarantine.
 #
@@ -4738,6 +4749,51 @@ sc_status_keeps_proven_absent_failed_state_silent() {
     "proven-empty failed/ state must not render a spurious zero or positive banner"
 }
 
+# ═══════════════ V.Z — round-7 failed-count status controls (guards) ═══════════════
+
+# V.Z/90 — Z1 ordinary state: inbox/tree setup leaves a REAL, EXISTING, EMPTY failed/ directory.
+# This is deliberately not V.Y/89's rmdir-manufactured absent leaf. Status must establish zero
+# without inventing either a positive-count banner or a cannot-inspect banner.
+sc_status_keeps_existing_empty_failed_state_silent() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  fd=$(q_dir "$fx" bravo failed)
+
+  run_brain "$fx" bravo inbox
+  inbox_rc=$?
+  need_rc "$inbox_rc" 0 "prerequisite: ensure the ordinary failed-state tree" || return 0
+  need_real_dir "$fd" "ordinary failed/ state" || return 0
+  need_count "$fd" 0 "ordinary failed/ state before status" || return 0
+
+  run_brain "$fx" bravo status
+  status_rc=$?
+  need_rc "$status_rc" 0 "brain status with an existing empty failed/ state"
+  need_file_lacks "$OUT" 'DM failed/ state cannot be inspected for @bravo' \
+    "an inspectable empty failed/ state must remain banner-free"
+  need_file_lacks "$OUT" 'DM message(s) failed structural validation' \
+    "proven-empty failed/ must not render a zero or positive failed-message banner"
+}
+
+# V.Z/91 — Z1 positive path: the same authoritative call that proves emptiness must surface a
+# real count after an artifact appears, without falling through to the cannot-inspect banner.
+sc_status_counts_existing_failed_entries() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  fd=$(q_dir "$fx" bravo failed)
+
+  run_brain "$fx" bravo inbox
+  inbox_rc=$?
+  need_rc "$inbox_rc" 0 "prerequisite: ensure the positive failed-state tree" || return 0
+  printf 'positive-failed-count-round7\n' > "$fd/failed-entry-round7" \
+    || { fail "fixture: could not plant the positive failed-state entry"; return 0; }
+
+  run_brain "$fx" bravo status
+  status_rc=$?
+  need_rc "$status_rc" 0 "brain status with one failed/ artifact"
+  need_file_has "$OUT" '⚠ 1 DM message(s) failed structural validation' \
+    "the positive failed/ count path"
+  need_file_lacks "$OUT" 'DM failed/ state cannot be inspected for @bravo' \
+    "an inspectable positive failed/ state must not render cannot-inspect"
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
 printf 'brain lane-DM v1.2 RED suite (claim layer deleted) + v1.2.1-v1.2.4 contract addenda\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
@@ -4838,6 +4894,8 @@ scenario red   "V.Y/86  regular-file-lane-status-banner"    sc_status_surfaces_r
 scenario red   "V.Y/87  symlinked-file-root-status-banner"  sc_status_surfaces_symlinked_file_dm_root_ancestor
 scenario red   "V.Y/88  unreadable-lane-status-banner"      sc_status_surfaces_unreadable_lane_ancestor
 scenario guard "V.Y/89  proven-absent-failed-is-silent"     sc_status_keeps_proven_absent_failed_state_silent
+scenario guard "V.Z/90  existing-empty-failed-is-silent"    sc_status_keeps_existing_empty_failed_state_silent
+scenario guard "V.Z/91  positive-failed-count-is-visible"  sc_status_counts_existing_failed_entries
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'
