@@ -772,3 +772,25 @@ DM block itself was dropped. Corrections, same cheapness class (`case` patterns 
   regular file, FIFO, symlink, directory — goes through the count/banner logic.
 
 The trust boundary paragraph is unchanged.
+
+## 13b. THE WITNESS CEILING (Steve's sign-off, 2026-08-05 morning): shell witnesses stop here
+
+Sweep rounds 3 and 4 each holed the witness layer itself — last-char framing cannot
+distinguish an outer `}` from a nested or data `}`, and no `case` pattern can, because POSIX
+shell cannot parse JSON and message content may contain any byte. Tightening further is a
+non-convergent game played inside the instrument, not the product.
+
+**Ruling (signed by Steve):** the witnesses as shipped in r5 are the CEILING for shell-side
+output validation. They catch every realistic accidental shape: empty output, `{}`
+wrong-objects, missing keys, plain truncation. A binary that passes the full probed
+contract, exits 0, and emits output that still satisfies these witnesses while being
+structurally invalid is hereby folded into ruling 13's declared byzantine boundary — such a
+binary is deliberately defective, cannot arise from any known real jq build or accidental
+failure, and requires an attacker who already executes code as this user. Findings of this
+class are answered by this paragraph. The residual exposure, stated honestly: under exactly
+that adversary, a message can be archived without delivery — recoverable from read/, within
+the at-least-once contract's spirit.
+
+Ancestor-state validation (a `dm/<lane>` corrupted into a regular file must banner, never
+silently skip) is NOT witness territory — it is ruling 7/14 queue-state validation, in the
+product, and is fixed as such.
