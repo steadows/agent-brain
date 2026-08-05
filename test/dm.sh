@@ -3696,6 +3696,116 @@ sc_jq_contract_reprobe_aborts_batch() {
   done
 }
 
+# V.R/75 — ruling 10's operation-wide half: a systemic jq failure invalidates every digest
+# staged by this SessionStart batch, including entries digested successfully before the failure.
+# The pinned shim digests the first entry normally, returns the recorded parse status for the
+# second, fails the same-executable contract re-probe, then reports serialization success with
+# `{}`. It captures the serializer's actual context argument so an unfixed hook cannot hide the
+# staged first digest behind that empty-looking output while still archiving its message.
+sc_hook_discards_staged_batch_on_systemic_jq_failure() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+  marker1="jq-systemic-hook-one-v123"
+  marker2="jq-systemic-hook-two-v123"
+
+  run_brain "$fx" alpha dm @bravo "$marker1"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: queue the first staged-batch victim" || return 0
+  run_brain "$fx" alpha dm @bravo "$marker2"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: queue the second staged-batch victim" || return 0
+  need_count "$pd" 2 "prerequisite: two healthy staged-batch victims" || return 0
+
+  first_pending=$(first_file "$pd") \
+    || { fail "fixture: could not resolve the first pending entry"; return 0; }
+  if grep -qF -- "$marker1" "$first_pending" 2>/dev/null; then
+    first_marker=$marker1
+  elif grep -qF -- "$marker2" "$first_pending" 2>/dev/null; then
+    first_marker=$marker2
+  else
+    fail "fixture: the first pending entry carries neither staged-batch marker"
+    return 0
+  fi
+
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  printf '{' | "$real_jq" -e . >/dev/null 2>&1
+  measured_parse_rc=$?
+  [ "$measured_parse_rc" != 0 ] \
+    || { fail "instrument: real jq parse failure unexpectedly returned success"; return 0; }
+
+  shim_dir="$base/jq-systemic-hook-bin"
+  shim_state="$base/jq-systemic-hook.state"
+  payload_log="$base/jq-systemic-hook.payload"
+  mkdir -p "$shim_dir" \
+    || { fail "fixture: could not create the staged-batch jq shim directory"; return 0; }
+  # The shim is stable at one path for the whole operation. It captures `--arg c` byte-for-byte,
+  # counts only `--arg id` digest calls, and fails every post-second-digest capability probe.
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf '_state="%s"\n' "$shim_state"
+    printf '_payload="%s"\n' "$payload_log"
+    printf '_n=0; [ ! -f "$_state" ] || _n=$(sed -n "1p" "$_state" 2>/dev/null)\n'
+    printf 'case "$_n" in ""|*[!0-9]*) _n=0 ;; esac\n'
+    printf '_prev=""; _capture=0; _digest=0\n'
+    printf 'for _arg in "$@"; do\n'
+    printf '  if [ "$_capture" = 1 ]; then printf "%%s" "$_arg" > "$_payload" || exit 96; printf "{}\\n"; exit 0; fi\n'
+    printf '  if [ "$_prev" = "--arg" ] && [ "$_arg" = "c" ]; then _capture=1; fi\n'
+    printf '  if [ "$_prev" = "--arg" ] && [ "$_arg" = "id" ]; then _digest=1; fi\n'
+    printf '  _prev=$_arg\n'
+    printf 'done\n'
+    printf 'if [ "$_digest" = 1 ]; then _n=$((_n + 1)); printf "%%s\\n" "$_n" > "$_state" || exit 95; [ "$_n" = 1 ] || exit %s; fi\n' "$measured_parse_rc"
+    printf '[ "$_n" -lt 2 ] || exit 97\n'
+    printf 'exec "%s" "$@"\n' "$real_jq"
+  } > "$shim_dir/jq" || { fail "fixture: could not write the staged-batch jq shim"; return 0; }
+  chmod +x "$shim_dir/jq" \
+    || { fail "fixture: could not make the staged-batch jq shim executable"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  jq -e -n '1' >/dev/null 2>&1
+  hostile_rc=$?
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the staged-batch jq shim is STILL what PATH resolves after the restore"; return 0 ;;
+  esac
+  hook_added="$base/jq-systemic-hook.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_eq "$(sed -n '1p' "$shim_state" 2>/dev/null)" 2 \
+    "instrument: exactly two digest invocations must precede the systemic re-probe failure" || return 0
+  need_eq "$hostile_rc" 97 \
+    "instrument: the pinned jq must remain systemically unsafe after the second digest" || return 0
+  need_file "$payload_log" \
+    "instrument: the jq shim must capture the SessionStart serializer's context argument" || return 0
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status contract"
+  contract_warns=$(grep -cF 'jq contract changed during dm consume' "$hook_added" 2>/dev/null)
+  need_eq "$contract_warns" 1 \
+    "ruling 10: the systemic hook failure must warn exactly once for the whole batch"
+  need_file_has "$hook_added" "$shim_dir/jq" \
+    "the systemic warning must name the pinned jq executable"
+  need_file_lacks "$payload_log" "$first_marker" \
+    "the SessionStart serializer must not receive a digest staged before the operation became unsafe"
+  need_count "$pd" 2 "pending/ after the systemic hook failure — the entire staged batch stays retryable"
+  need_count "$rd" 0 "read/ after the systemic hook failure — no archive may rest on the unsafe operation"
+  need_count "$fd" 0 "failed/ after the systemic hook failure"
+
+  run_brain "$fx" bravo hook session-start
+  retry_rc=$?
+  need_rc "$retry_rc" 0 "stable-jq SessionStart retry" || return 0
+  need_file_has "$OUT" "$marker1" "the first retained message must deliver on stable-jq retry"
+  need_file_has "$OUT" "$marker2" "the second retained message must deliver on stable-jq retry"
+  need_count "$pd" 0 "pending/ after the stable-jq retry"
+  need_count "$rd" 2 "read/ after the stable-jq retry"
+  need_count "$fd" 0 "failed/ after the stable-jq retry"
+}
+
 # V.R/72 — v1.2.3 ruling 10: SessionStart's serializer is part of the pinned operation. The
 # preflight executable removes itself only AFTER producing the final digest; the next PATH jq
 # exits 0 with zero bytes. Re-resolving that replacement would make an empty emit look successful
@@ -3921,6 +4031,12 @@ sc_hidden_pending_entries_are_classified() {
     need_count "$fd" 0 "visible failed/ entries after pending/.poison is classified"
     need_eq "$(count_dotfiles "$fd")" 1 "failed/ must contain exactly the quarantined .poison"
 
+    run_brain "$fx" bravo status
+    status_rc=$?
+    need_rc "$status_rc" 0 "brain status after the $mode path quarantines a dot-named entry"
+    need_file_has "$OUT" '⚠ 1 DM message(s) failed structural validation' \
+      "the failed-DM banner must count the quarantined dot-named entry"
+
     run_brain "$fx" bravo dm take
     empty_rc=$?
     need_rc "$empty_rc" 0 "queue with only .tmp-* remaining must read empty"
@@ -4034,6 +4150,7 @@ scenario red   "V.R/71  jq-contract-reprobe-aborts-batch"    sc_jq_contract_repr
 scenario red   "V.R/72  pinned-nonempty-session-emit"        sc_session_emit_is_pinned_and_nonempty
 scenario red   "V.R/73  collision-rechecks-name-max"         sc_collision_suffix_rechecks_name_max
 scenario red   "V.R/74  hidden-pending-entries-classified"   sc_hidden_pending_entries_are_classified
+scenario red   "V.R/75  systemic-hook-discards-staged-batch" sc_hook_discards_staged_batch_on_systemic_jq_failure
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'

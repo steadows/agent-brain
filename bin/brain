@@ -378,7 +378,7 @@ _dm_id_in_use() { # <lane> <id>
     _dm_dest_occupied "$_iu_exact" && return 0
     # Collision-bumped transcripts still reserve their original stable id. This is a strict
     # widening of the safety scan: <id> and every <id>* variant count as occupied.
-    for _iu_file in "$_iu_dir/$_iu_id"* "$_iu_dir"/.*; do
+    for _iu_file in "$_iu_dir/$_iu_id"*; do
       _iu_name=${_iu_file##*/}
       case "$_iu_name" in .|..|.tmp-*) continue ;; esac
       [ -e "$_iu_file" ] || [ -L "$_iu_file" ] || continue
@@ -767,9 +767,11 @@ _dm_failed_count() { # <lane>
   _fc_dir="$BRAIN/dm/$1/failed"; _fc_count=0
   [ -e "$_fc_dir" ] || [ -L "$_fc_dir" ] || { printf '0\n'; return 0; }
   _dm_dir_ok "$_fc_dir" || return 1
-  # Display-only count — the dir was just validated; a per-entry _dm_dir_ok walk moves nothing
-  # through the filesystem and any odd entry still belongs in the "inspect failed/" total.
-  for _fc_file in "$_fc_dir"/*; do
+  # Display-only count — the dir was just validated; every visible or dot-named artifact in
+  # failed/ belongs in the operator's "inspect failed/" total.
+  for _fc_file in "$_fc_dir"/* "$_fc_dir"/.*; do
+    _fc_name=${_fc_file##*/}
+    case "$_fc_name" in .|..) continue ;; esac
     [ -e "$_fc_file" ] || [ -L "$_fc_file" ] || continue
     _fc_count=$((_fc_count + 1))
   done
@@ -1433,8 +1435,10 @@ _hook_session_start() {
 }${_digest_line}"
         set -- "$@" "$_pending_name"
       done
-      if [ "$_ib_exhausted" = 1 ] && ! _dm_dir_ok "$_ib"; then
-        # No archive may rest on an enumeration whose state could not be re-established.
+      if [ "${_DM_JQ_SYSTEMIC_FAILURE:-0}" = 1 ] ||
+         { [ "$_ib_exhausted" = 1 ] && ! _dm_dir_ok "$_ib"; }; then
+        # No archive may rest on an unsafe operation or an enumeration that could not be
+        # re-established. Both invalidate the complete batch staged above.
         _digest=""; _more_dm=0
         set --
       fi
