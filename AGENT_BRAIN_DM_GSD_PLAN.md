@@ -483,12 +483,21 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
       prints; (d) only then declare DM live and tell lanes to start using it. A lane that cannot
       restart is NOT reachable by DM — say so rather than assuming.
 - `[ ]` 5.6 **Rollback runbook — drain before downgrading** (ultrareview UR-5). The new engine is
-      the only consumer of `dm/<lane>/pending|claimed`; rolling `bin/brain` back to a pre-DM build
+      the only consumer of `dm/<lane>/pending`; rolling `bin/brain` back to a pre-DM build
       strands every queued message permanently (the old engine has no queue reader, and a broadcast
-      call-log line names only `@all`, which matches no recipient's journal filter). **Before any
-      engine rollback:** (a) confirm every lane's `pending/` and `claimed/` are empty
-      (`brain dm take` on each, or inspect the dirs) — a non-empty queue means STOP or accept
-      documented loss; (b) keep `dm/` in `.brain/.gitignore` **permanently** — it is a
+      call-log line names only `@all`, which matches no recipient's journal filter).
+      **⚠ Rolling back to a v1.1-era engine is WORSE than stranding: it QUARANTINES.** v1.2 mints
+      bare `<id>` filenames; v1.1's `_dm_claim_all` requires an `.a<k>` attempt suffix, so it
+      rejects every v1.2 name as "invalid pending dm name" on first contact and routes it to
+      `failed/`. A non-zero `failed/` count after such a rollback is therefore most likely
+      **false-positive grammar rejection, not genuine poison** — check that before treating those
+      messages as bad. (Collision-bumped names in `read/`/`failed/` are NOT a hazard: both engines
+      mint identical suffix grammar and neither consume glob scans those directories.)
+      **Before any engine rollback:** (a) confirm every lane's `pending/` is empty
+      (`brain dm take` on each, or inspect the dir) — a non-empty queue means STOP or accept
+      documented loss. `claimed/` no longer exists (v1.2 deleted the claim layer); if one is
+      present, an engine older than v1.2 has run since deploy — stop and reconcile.
+      (b) keep `dm/` in `.brain/.gitignore` **permanently** — it is a
       forward-compatible invariant, and restoring an older `.gitignore` alongside an older engine
       re-opens the path where DM bodies get staged and the line-anchored secret scan cannot see
       them; (c) note that `read/` and `failed/` archives are inert under the old engine — they are

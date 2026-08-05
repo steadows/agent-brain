@@ -134,6 +134,15 @@ temp-sweep coupling (`find -mmin` no longer exists) · lease ergonomics.
   preflight now probes for it at runtime, so an old jq fails safe to everything-pending, but
   the dependency floor is still not written down)
 - `_atomic_place` succeeds when the destination is a directory
+- the digest's `id` field is injected outside `bounded()`'s truncation recursion, so the per-line
+  byte bound rests on `_dm_id_ok`'s length cap upstream rather than on the serializer;
+  `DM_DIGEST_ENVELOPE`'s reserve was sized for a four-field envelope (v1.2.1 ruling 5 — the
+  dependency is now stated at both sites, but the reserve was never re-derived)
+- **deferred to its own arc:** watch-then-drain. `_more_dm` reflects the glob snapshot, so a send
+  arriving after expansion — or a transient failure among ≤40 entries — leaves mail pending with no
+  continuation signal, and the lane's watcher arms only after the hook context is emitted. The fix
+  (arm the watcher, drain to empty, then react to events) changes every lane's boot protocol and is
+  too broad to fold into a fix round
 
 - **`whoami` worktree-path fallback for detached HEAD — NOT building.**
   When a feature merges and `/wrap` deletes the branch, the worktree parks at a detached `origin/main`
