@@ -465,3 +465,105 @@ idempotent or checked against durable state; `CHANGELOG.md` — v1.2 entry.
 claim but **no attempt counter and no dead-letter**; Postfix bounds poison by age not retries; SQS's
 visibility timeout is documented as a *multi-consumer* mechanism) ·
 `docs/prompts/lane-dm-simplification-consult.md` (the consult: simplify, 87% confidence).
+
+---
+
+# v1.2.1 — CONTRACT ADDENDUM from the pre-PR code review (2026-08-04)
+
+**Status: proposed by @pm, authorized by Steve ("do your recommended fixes"). Map lands as a
+standalone commit BEFORE any implementation, per the architecture-first hard lock.** Source:
+`docs/reviews/lane-dm-v12-pre-pr-code-review.md` (5 HIGH / 9 MEDIUM; two HIGHs reproduced by the
+orchestrator, three found by the single-agent Codex sweep). Amends § v1.2's `## Poison, without a
+counter` and `## Must survive` items 3 and 6. Everything not named here is unchanged.
+
+## 1. Quarantine widens: "unusable queue entry", not only "invalid wire content"
+
+§ v1.2 said quarantine only a file **proven structurally invalid against the wire contract**. That
+wording assumed every `pending/` entry is a regular file whose *content* is the only thing that can
+be wrong. It is not: a symlink, directory, FIFO, socket, or device node is a **structurally
+unusable queue entry** — provably not a message, decidable with no dependency on jq, content, or
+version.
+
+**Ruling: a non-regular direct child of `pending/` is quarantinable on the same footing as invalid
+content.** It is renamed — as a directory entry, **never dereferenced** — into `failed/` via the
+existing collision-safe helper. Parent-component validation is unchanged and still applies.
+
+**Why the old wording was load-bearing and wrong:** because such an entry consumed a batch slot but
+was classified *transient*, it was retried forever and 40 of them permanently starved every message
+behind them (measured: zero emitted, still starved on rerun). The narrower rule turned a hostile
+file into an unbounded denial of delivery. Symlink *refusal* (must-survive #6) is preserved — the
+entry is still never followed, opened, or read; refusal now has somewhere to put the thing.
+
+**Invariant that must not be lost:** quarantine still requires PROOF, never suspicion. The two
+proofs are now (a) not a regular file, (b) content that fails the wire contract as judged by a
+mechanism whose verdict does not depend on the jq build (see 2).
+
+## 2. A dependency's failure mode must be measured, never assumed
+
+The v1.2 classifier decided "invalid" from jq's exit code `5`. Measured: **jq 1.6 (Debian bookworm,
+Ubuntu 22.04) exits `4` for a parse error; jq 1.7.1 exits `5`.** So on current stable distros a
+corrupt message was never quarantined and retried forever, compounding 1's starvation.
+
+**Ruling:** the engine may not hard-code a dependency's incidental exit code. `_dm_jq_preflight`
+is the single place where jq's behavior is established, and it must **probe** every contract the
+consume path relies on — including the parse-error code and the `error()` code — recording or
+verifying them. A jq whose behavior cannot be established fails safe to *everything stays pending*,
+exactly as a missing `utf8bytelength` already does. **Fail-safe is leave-pending; it is never
+quarantine.**
+
+## 3. A filename is one opaque token, and the grammar is digits-only
+
+Two independent defects compounded into an emit-before-move violation (a message archived to
+`read/` whose body was never emitted — UR-1's silent loss through a new door):
+
+- `_dm_id_ok` admitted **whitespace** inside the PID/bump fields (`[0-9]*` is a shell glob, not a
+  regex). Glob metacharacters were correctly rejected; whitespace was not.
+- SessionStart round-tripped accepted names through a **space-delimited string** re-split by an
+  unquoted `set --`.
+
+**Ruling, and both halves are required — neither alone is sufficient:** (a) the producer grammar is
+enforced with explicit digit-only checks, and (b) collected filenames are **never** joined into a
+delimited string. A filename crosses any boundary as exactly one element (quoted positional
+parameters). A grammar fix alone leaves the delimiter round-trip as a live hazard for the next
+name-shaped value; the round-trip fix alone leaves a malformed name in the queue.
+
+## 4. Identity inputs are not trusted from the environment
+
+`_dm_new_id` honored an inherited `_DM_ID_TS`, and `_dm_send` composed a path from the result
+without validating it — so a caller's environment could place a "sent" message directly into
+terminal `read/`, or outside `.brain/dm` entirely. **Pre-existing since v1.1 (`503519b`), not
+introduced by v1.2** — recorded here because the fix ships in this arc.
+
+**Ruling:** minted identity is derived, never inherited — the engine clears/ignores an inherited
+`_DM_ID_TS`, requires its clock helper to actually succeed (a masked failure must not yield a
+malformed id), validates the final id against the grammar **before** composing any path, and
+asserts the destination's literal parent is the intended `pending/` directory.
+
+## 5. Bounds and uniqueness must survive the collision path
+
+- `_dm_id_in_use` exact-matches `<state>/<id>`, but the archive path now mints **bumped** names
+  (`<id>.collision-…`). A bumped id therefore reads as free and can be re-minted, defeating the
+  id's role in replay recognition (must-survive #8). **Ruling:** the uniqueness scan must match the
+  id and any bumped variant.
+- The digest's `id` is injected outside `bounded()`'s truncation recursion, so the per-line byte
+  bound now rests on `_dm_id_ok`'s length cap upstream rather than on the serializer. **Ruling:**
+  permissible, but the dependency is stated at both sites; `DM_DIGEST_ENVELOPE`'s reserve was sized
+  for a four-field envelope and its comment must say so.
+
+## 6. Diagnostics are required where an anomaly is silently absorbed
+
+v1.1 refused an occupied archive destination **loudly**; v1.2 bumps it silently, and
+`_dm_collision_dest`'s internal failures return without a word. **Ruling:** every path that
+absorbs an anomaly (bump taken, bump-construction failure) emits a `brain: `-prefixed diagnostic.
+The batch cap on the `dm take` path warns when entries remain — as **operator visibility**, and
+explicitly NOT as must-survive #4's continuation contract, which stays scoped to the SessionStart
+emitted context (adjudicated: "the emitted context" is that payload's term of art).
+
+## Not adopted
+
+- **A retry/attempt counter, in any form.** Every finding above is fixed by deciding correctly, not
+  by bounding how often we retry a decision we got wrong. § v1.2's deletion stands.
+- **Age-based expiry.** Still rejected, for the original reason (a dormant lane may receive an old
+  broadcast at next boot).
+- **Watch-then-drain** (the sweep's M9 fix for the stale `_more_dm` snapshot): a protocol change
+  touching every lane's boot behavior, deferred to its own arc rather than folded into a fix round.
