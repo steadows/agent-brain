@@ -2362,6 +2362,19 @@ sc_bounded_backlog_instructs_continuation() {
   continuation_signal "$ctx" \
     || fail "must-survive #4: $(count_files "$pd") entr(y|ies) are still queued, and the emitted context does not instruct the lane to continue — the design explicitly forbids relying on a new directory event firing"
 
+  continuation_has_absolute_engine=0
+  while IFS= read -r continuation_line; do
+    if continuation_signal "$continuation_line" &&
+       str_has "$continuation_line" "\"$fx/.brain/bin/brain\" dm take"; then
+      continuation_has_absolute_engine=1
+      break
+    fi
+  done <<EOF
+$ctx
+EOF
+  [ "$continuation_has_absolute_engine" = 1 ] \
+    || fail "must-survive #7: the continuation instruction does not carry the exact receiving-vault engine invocation (\"$fx/.brain/bin/brain\" dm take)"
+
   # NEGATIVE CONTROL: a backlog that fits in one batch must NOT carry the continuation phrase.
   fx2=$(make_vault alpha bravo) || fatal "control fixture build failed"
   seed2=$(plant_message "$fx2" bravo "control-seed-v12") \

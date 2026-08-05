@@ -126,7 +126,8 @@ instrument_selfcheck() {
 # indent, and BSD grep treats a mid-pattern `$` as an anchor, so a BRE check silently reports 0
 # for lines that are really present. Both traps were hit while writing this file.
 # Format: one anchor per line. The two `g`-flag mutants (utf8bytelength, $BRAIN/bin/brain) are
-# multi-line by design and are bounded by their declared changed-line counts instead.
+# multi-line by design; every matched line is listed here, so those selectors are bounded by
+# their declared counts AND their exact line sets.
 #
 # ONE ENTRY IS NOT A MUTATION TARGET: `set -- "$@" "$_pending_name"` is ruling 3(b)'s quoted
 # positional accumulation, and test/dm.sh declares at [Q3] that it CANNOT pin that mechanism —
@@ -149,6 +150,8 @@ anchors_ok() {
   _JM_PARSE_RC=$?
   _JM_ERROR_RC=$?
       bounded($field_max) | tojson
+  "$_DM_JQ_BIN" -e -n '"x" | (utf8bytelength == 1 and ((tojson | type) == "string"))' \
+        | if (($record | tojson | utf8bytelength) <= $line_max) or $limit <= 1
           id: $id
       \{*'"id":"'"$_pd_name"'"'*\})
     case "$_esc_payload" in *'\"id\":\"'"$1"'\"'*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
@@ -161,7 +164,11 @@ _dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
   _dm_digits_ok "$_io_pid"
         set -- "$@" "$_pending_name"
   _announce_as "$_from" "dm → @$_to (transcripts: .brain/dm/$_to/)" \
+        _emit_session_ctx "Agent Brain: branch '$_br' has no presence note. If this is a tracked feature, register it once: \"$BRAIN/bin/brain\" new-feature $_slug"
+More DMs remain pending after this bounded batch. Continue by running: \"$BRAIN/bin/brain\" dm take
 On activity, consume it by running: \"$BRAIN/bin/brain\" dm take
+  jq --arg ss "$1" --arg pt "$2" --arg dir "$BRAIN" --arg allow "Bash($BRAIN/bin/brain:*)" '
+  jq --arg dir "$BRAIN" --arg allow "Bash($BRAIN/bin/brain:*)" "$_JQ_PERMISSIONS_MERGE"
 ANCHORS
   [ "$_bad" = 0 ]
 }
@@ -428,8 +435,9 @@ probe "M9  journal-b64-leak     " "V.S/8" "" 1 \
 
 # ── deployment resolution (must-survive #7) ──────────────────────────────────────────────
 # A relative engine path resolves against the RECEIVING lane's worktree, which may carry a
-# tracked engine predating `dm take` — the live failure this fix exists for.
-probe "M10 relative-engine-path " "V.C/24" "" 5 \
+# tracked engine predating `dm take` — the live failure this fix exists for. V.C/24 pins the
+# always-emitted activity instruction; V.N/50 pins the bounded-backlog continuation instruction.
+probe "M10 relative-engine-path " "V.C/24 V.N/50" "" 5 \
   's@\$BRAIN/bin/brain@.brain/bin/brain@g'
 
 # The emitted line must be an INSTRUCTION, not a bare path: a lane watching its pending/ dir has
