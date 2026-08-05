@@ -12,6 +12,8 @@
 - **presence/** — one note per *feature*: where each agent is (status, phase, branch, touches).
 - **connections/** — the cross-feature blackboard: `clash` · `shared-file` · `waiting-on` · `shared-rule`.
 - **journal/** — append-only daily comms timeline (`brain announce` writes here).
+- **dm/** — per-lane DM inboxes + `read/` archives (`brain dm` writes here). **Per-machine and
+  gitignored** — unlike every folder above it, this is transient and never committed.
 - **research/** — shared, self-sufficient findings (the durable home for research).
 - **CHANGES.md** — structural-change log (governance gauntlet).
 

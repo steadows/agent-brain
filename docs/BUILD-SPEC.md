@@ -27,6 +27,7 @@
   connections/                      seeded: the 6 real cross-feature edges
   journal/<today>.md                seeded init line
   research/                         empty (grown live)
+  dm/                               per-lane DM inboxes + read/ archives — GITIGNORED, per-machine
   INDEX.md                          static map + pointer to `brain status`
   CHANGES.md                        the governance changelog (structural changes)
   .indexignore                      reserved for Phase 2 (templates/ + bin/); empty-effect in v1
@@ -80,6 +81,29 @@ Portable POSIX sh, no Claude-specific deps. Subcommands:
   `owns_branches` (precise rule + the four real features in **§2a**); (3) on multi-match, disambiguate
   by `current_worktree`; (4) still ambiguous → **print nothing + exit non-zero** (refuse to guess).
   Empty result = not a brain branch.
+- **`brain dm @<feature>|@all "<msg>"`** — the **fast tier**: write one jq-encoded JSON message
+  (`from`/`to`/`ts`/`content`) as its own file into `dm/<feature>/pending/` (maildir-style:
+  dot-temp + same-directory rename, visible only when complete), reaching a running lane in
+  seconds; `@all` fans into every registered queue but the sender's (never gated on apparent
+  liveness). **No lock** on the send or consume path — rename arbitration is the only
+  concurrency control; a lock with no staleness break would let one killed sender wedge a queue
+  forever. The body is length-capped to bound storage and digest work. The journal gets a
+  **call-log line only, never the body** — `journal/` is committed and the secret scan is
+  line-anchored, so a mid-line body would be invisible to it. (Queue design authority:
+  `.context/seams/dm-v1.1-queue.md`.)
+- **`brain dm take`** — print and ack this lane's pending DMs (the live consumption path).
+  A bounded batch (up to 40) is read straight from `pending/`; each message is validated
+  independently (jq's exit-code contract is probed at preflight and the resolved binary is
+  pinned for the whole operation), emitted, and **moved to `read/` only after its own emit
+  succeeded**. Structurally invalid entries — bad names, non-regular files, dot-prefixed
+  strays outside the `.tmp-*` send-staging namespace, proven-invalid JSON — quarantine to
+  `failed/`; anything unprovable (system errors, a changed jq, a queue directory whose state
+  cannot be established) **leaves messages pending with a diagnostic**. There is no claim
+  step, no lease, and no attempt counter (deleted in v1.2 — one active session per lane is
+  the operating model). Delivery is **at-least-once** and **process-crash-safe** (POSIX sh
+  cannot fsync; power loss is out of scope).
+- **`brain inbox [<feature>]`** — print (and create) the `pending/` queue directory an agent
+  arms its watch on.
 - **`brain announce "<msg>"`** — atomic-append `- <ISO-time> <feature> — <msg>` to today's journal
   (auto-creates the daily file). The single canonical journal writer (agents + hooks).
 - **`brain status`** — print the text dashboard: active features (status active/blocked, or idle with
@@ -215,6 +239,18 @@ Both are thin wrappers calling `brain hook <event>`; both **fail-open** (drop a 
      (slug from branch; harmless if ignored on a non-brain worktree — an optional committed
      `templates/non-brain-globs` suppresses it). Keeps M9 (agent onboards itself; human never runs it).
    - **(b)** cache `BRAIN_FEATURE` for the session.
+   - **(b2) validate → digest → emit → ack (DM).** Read up to 40 messages straight from
+     `pending/` (no claim step — deleted in v1.2), validate each independently, stage the
+     bounded digests (four wire fields plus the stable message `id`, so a replay is
+     recognizable), then make **one pinned, verified-non-empty emit** of the whole startup
+     payload and **ack (move to `read/`) only the messages that payload carried, only after
+     that emit succeeded**. Order is load-bearing: an interrupted boot leaves every message
+     pending and replayable, so delivery is **at-least-once** (a crash window duplicates,
+     never loses), and per-message pending files mean a DM to a *down* lane queues instead of
+     vanishing. A systemic failure mid-batch — jq's probed contract no longer holding, or
+     queue state that cannot be re-established — **discards the staged batch rather than
+     archive on it**; everything stays pending with a diagnostic. The injected context also
+     arms the live path: it names `dm/<me>/pending/` and the `brain dm take` consume command.
    - **(c)** run `brain reconcile` (cheap auto-fixes — robust to never-wraps).
    - **(d)** inject "run the `navigation-standards` skill" + `brain status` (incl. relevant **recent
      journal lines** since `updated`, the agents+connections summary, and the `CHANGES`/error banners).

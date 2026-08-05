@@ -13,13 +13,23 @@ v1 is filesystem-only and deliberately small; this is the backlog for "further d
    **own** worktree (`git rev-parse --show-toplevel`). Low impact today because agents set their own
    `touches` during `/wrap`, but the auto-refresh can write main's diff into a sibling's note.
    **Fix:** diff the local worktree (`show-toplevel`), not `$ROOT`.
+   **Observed live 2026-08-03 — impact is worse than "low":** `presence/pm.md` had `updated:` bumped
+   to the freshest of all 13 lanes and `touches[]` set to *another lane's* uncommitted files
+   (@observatory's, attributed to @pm), while `phase:`/`current_ticket:` stayed two weeks stale. Two
+   knock-ons: **(a)** `_detect_collisions` reads that same `touches[]`, so collision warnings can fire
+   against a lane that never touched the file — and miss real collisions; **(b)** `updated:` is
+   thereby useless as a liveness/staleness signal (`brain status` renders `phase`, so a lane can look
+   maximally fresh while reporting two-week-old work). Do not build anything that keys on `updated:`
+   until this is fixed.
 
 2. **`announce` attribution follows the running shell, not the intended author.**
    `brain announce` stamps the line with `whoami` of the shell it runs in. An agent that runs it from
    the *main* worktree (e.g. while doing cross-worktree work) gets stamped `langgraph-runtime` (or
    whatever owns `main`). The live agents already hit this and worked around it with a manual
    `[attribution corrected: …]` note. **Workaround:** `BRAIN_FEATURE=<feature> brain announce …`.
-   **Enhancement:** a `brain announce --as <feature>` flag.
+   **Enhancement:** a `brain announce --as <feature>` flag. **Half-built:** the DM work added an
+   internal `_announce_as <feat> <msg>` seam (the journal writer with identity supplied by the
+   caller) — exposing the flag is now just arg-parsing on `cmd_announce`, not new plumbing.
 
 3. **Research notes drift from the template schema.**
    `research/` is the most free-form note type, and agents have written valid-but-off-template
@@ -29,7 +39,110 @@ v1 is filesystem-only and deliberately small; this is the backlog for "further d
 
 ---
 
+## Known issue — `brain commit` wedges for one class of legacy vault (open, 2026-08-04)
+
+Found by the UR-4a RED audit; **pre-existing, not introduced by v1.1**, and NOT closed by the
+UR-4a fix. If a vault has `dm/` un-ignored, an inbox that is **tracked and unmodified**, and that
+inbox's body contains a line matching the commit secret scan's `^[A-Z][A-Z0-9_]*=.+`, then
+`brain commit` aborts on the scan — and because the pre-purge's staged deletion persists, it
+aborts again on every rerun. Permanent, same as the UR-4a wedge it otherwise fixes.
+
+Exposure is bounded: a real `inbox.jsonl` line starts with `{` and cannot match the anchored
+pattern, so the trigger requires a truncated write, a hand-edit, or a pre-v1 body format.
+No scenario covers it (the RED suite's fixtures use JSON bodies deliberately, to keep the scan
+out of the way of the UR-4a assertions). Mechanism and full measurement in
+`.context/seams/dm-v1.1-queue.md` under the UR-4a ruling. **Do not "simplify" either purge in
+`cmd_commit` without reading it** — the pre-purge looks like dead code on the fixed engine and
+is not.
+
+## v1.1 — DM per-message queue (⚠ PROMOTED TO SHIP-BLOCKING, Steve 2026-08-03 evening)
+
+> **Status changed the same day it was written.** The 7.4 ultrareview (report:
+> `docs/lane-dm-ultrareview-findings.md`, verdict NOT READY) found a crash-consistency defect
+> that needs **no concurrency at all**: SessionStart moves the inbox to the terminal `read/`
+> archive *before* digesting or emitting it, and nothing ever scans `read/` again — an
+> interrupted boot loses those messages permanently. That is qualitatively worse than the three
+> races below, which only *delay* a message. **Steve ruled: this rewrite lands BEFORE any deploy
+> — v1 does not ship with a window that silently loses mail.** It also absorbs ultrareview
+> findings UR-1, UR-3 and UR-4a; full disposition of all 10 in `AGENT_BRAIN_DM_GSD_PLAN.md` §7.5.
+>
+> **v1.2 (2026-08-04): the rewrite landed, then lost its claim tier.** Three further gates
+> (pre-PR review, final ultrareview, ultra round 2) each put their HIGH findings inside the
+> claim/lease/recovery/budget subsystem; Steve ruled **delete it** (seam map § v1.2 — one active
+> session per lane; parallel work is a second lane). Suite rewritten and frozen first (54
+> scenarios), engine GREEN at `6d9199a`: 54/54 + 15/15 under `sh` AND real dash. Contract stated
+> honestly as at-least-once; quarantine only on structural proof. See `CHANGELOG.md` v1.2.0.
+
+The three findings below (full report: `docs/lane-dm-adversarial-review-findings.md`) are the
+**known limits of v1's one-shared-JSONL-inbox design** that motivated the rewrite:
+
+- **#1 (HIGH)** a send racing boot-time rotation is permanently stranded in the `read/` archive
+  (never surfaced at any boot) — the old "delayed, not lost" acceptance was wrong and is withdrawn;
+- **#6 (MEDIUM)** the no-lock append's atomicity premise is false (`PIPE_BUF` governs pipes, not
+  regular-file appends; the body cap counts chars, not encoded bytes);
+- **#11 (MEDIUM)** two live sessions of one lane both consume every message (no receiver claim).
+
+**The one fix for all three:** one file per message — write to a temp name, atomic `rename` into
+`dm/<lane>/pending/`, atomic claim at delivery. Removes the interleaving surface entirely, makes
+the size cap irrelevant to atomicity, gives claim/ack a natural home. **Cost:** changes the
+storage contract the frozen `test/dm.sh` pins → the suite reopens through the `test-writer` +
+`spec-watchdog` pair. Roughly one session of work.
+
+**Added acceptance criteria from the ultrareview** (these are what make the rewrite ship-blocking,
+not optional polish):
+
+- **Delivery must be recoverable, never terminal-before-success** (UR-1). A message stays
+  replayable until handoff to the session actually succeeded; stale claims are recovered on a
+  later boot. **Prefer duplicate delivery over silent loss.** Test kill-after-claim and
+  digest/emit failure.
+- **A live-observed message must be claimed, not just seen** (UR-3). Today the watcher observes an
+  append and mutates nothing, so the next boot rotates and re-injects a message the lane already
+  acted on. Stable IDs + atomic claim/ack. Test live-read → reboot.
+- **The commit guard's cleanup must not wedge** (UR-4a). Once an inbox is already tracked,
+  `git rm --cached` stages a deletion that the guard's own final check reads as failure — and no
+  retry can clear it. Build and scan a sanitized temporary index; commit that, without pathspec
+  semantics. Test legacy-tracked inbox and repeated `brain commit`.
+- **A poison message must not loop forever** (added 2026-08-03 from the prior-art research —
+  at-least-once + automatic stale-claim recovery is an infinite redelivery loop for any message
+  whose processing kills its consumer). Delivery-attempt counter in the filename grammar; after
+  3 failed deliveries the message routes to a terminal `failed/` directory, surfaced in
+  `brain status`, never auto-deleted. Adopted now because it changes the name grammar the
+  reopened suite pins.
+- **Durability claims stay honest**: the queue is robust against process death (the realistic
+  failure mode), NOT against power loss — `sh` cannot `fsync`. Docs say "process-crash-safe."
+
+**Design authority:** the full seam map — layout, name grammar, lifecycle contracts, prior-art
+citations (maildir/dirq/SQS), and the discarded alternatives — is at
+`.context/seams/dm-v1.1-queue.md` (local, per-worktree). RED tests pin THAT contract.
+
 ## Decisions recorded (won't-do / deferred-by-design)
+
+### v1.2 re-triage of the deferred review MEDIUMs (2026-08-04)
+
+The three review rounds left 12 deferred MEDIUMs. Re-triaged against the v1.2 engine:
+
+**Evaporated with the claim layer** (verified gone from `bin/brain`): poison-cap visibility ·
+temp-sweep coupling (`find -mmin` no longer exists) · lease ergonomics.
+
+**Carry — pre-existing, none ship-blocking, file as PR follow-ups:**
+- `cmd_commit`'s `commit-tree` → index-reset race, and the unborn-HEAD CAS (commit path
+  untouched by v1.2)
+- `_feat_ok` / body-cap locale divergence (byte-count sites pin `LC_ALL=C` at 3 places; the
+  flagged validation-path divergence is unaddressed)
+- `brain inbox` `@`-prefix + unregistered-lane inconsistencies
+- jq **≥ 1.6** requirement undeclared in docs (`utf8bytelength`, 2 live sites — the take
+  preflight now probes for it at runtime, so an old jq fails safe to everything-pending, but
+  the dependency floor is still not written down)
+- `_atomic_place` succeeds when the destination is a directory
+- the digest's `id` field is injected outside `bounded()`'s truncation recursion, so the per-line
+  byte bound rests on `_dm_id_ok`'s length cap upstream rather than on the serializer;
+  `DM_DIGEST_ENVELOPE`'s reserve was sized for a four-field envelope (v1.2.1 ruling 5 — the
+  dependency is now stated at both sites, but the reserve was never re-derived)
+- **deferred to its own arc:** watch-then-drain. `_more_dm` reflects the glob snapshot, so a send
+  arriving after expansion — or a transient failure among ≤40 entries — leaves mail pending with no
+  continuation signal, and the lane's watcher arms only after the hook context is emitted. The fix
+  (arm the watcher, drain to empty, then react to events) changes every lane's boot protocol and is
+  too broad to fold into a fix round
 
 - **`whoami` worktree-path fallback for detached HEAD — NOT building.**
   When a feature merges and `/wrap` deletes the branch, the worktree parks at a detached `origin/main`
@@ -73,16 +186,22 @@ self-tests, so an overnight run can evolve the engine without ever hanging on it
 
 ## Smaller enhancements (nice-to-have)
 
-- **A real test suite.** v1 was proven by running (the BUILD-SPEC §10 scenarios). Capture those as a
+- **A real test suite.** _Partly delivered:_ `test/dm.sh` (53 scenarios) now exists, built exactly
+  this way — temp-repo fixtures via the `BRAIN_TEST_BRANCH` / `BRAIN_SKILLS_DIR` /
+  `BRAIN_GLOBAL_SETTINGS` seams — but it covers the **DM slice only**. The pre-existing surface
+  below is still uncovered; extend the same harness rather than starting a second one.
+  v1 was proven by running (the BUILD-SPEC §10 scenarios). Capture those as a
   `test/` script (temp-repo init → new-feature → whoami edge cases → reconcile resolve/downgrade →
   governance → hooks) so regressions are caught mechanically. The `BRAIN_TEST_BRANCH` env override and
   `BRAIN_SKILLS_DIR` / `BRAIN_GLOBAL_SETTINGS` redirects already exist for exactly this.
 - **`brain connect <a> <b> <kind>`** helper to scaffold a connection from the template (connections
   are free-to-create today, so a template suffices, but a helper would enforce the deterministic slug).
 - **`brain research <topic>`** helper to scaffold a research note.
-- **Re-add the PostToolUse fast-awareness hook** (shell-only, mtime-gated, @mention-only) if
-  between-actions latency on `@mentions` ever bites — currently a mention lands at the next session
-  start or the next pre-tool gate.
+- ~~**Re-add the PostToolUse fast-awareness hook**~~ — **superseded** by `brain dm` (lane-to-lane
+  DM). The latency this item existed to fix ("a mention lands at the next session start") is now
+  addressed by a different mechanism: an inbox file the receiving agent watches, delivering in
+  seconds without a third hook firing on every tool call. Revisit only if watching proves
+  unreliable in practice.
 - **An Obsidian workspace preset** (`.obsidian/` is gitignored, but a shipped, opt-in graph-view
   config could make the human dashboard nicer out of the box).
 
