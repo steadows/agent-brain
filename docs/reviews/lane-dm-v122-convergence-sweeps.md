@@ -47,7 +47,16 @@ fully-byzantine forged-payload adversary out of the threat model (code-execution
 equivalent). Ruling 14 covers finding 3. Fix round r4 (`docs/prompts/dm-v122-fix4.md`)
 implements W1–W4.
 
-## Round 3 — on `3774640` (r4) — IN FLIGHT
+## Round 3 — on `3774640` (r4) → NOT READY, 3 HIGH / 2 MEDIUM → fix round r5
 
-r4 landed W1-W4 (V.U/76-79, RED-proven; full orchestrator regate green: 79/79 sh+dash,
+Brief: `docs/prompts/dm-v122-final-sweep-r3.md` · Job: task-msg25kca-pxuhdi
+Findings: truncated rc-0 payloads passed the {-prefix witnesses (falsified ruling 13's own
+coverage claim -> erratum 13a, `aa34b98`); send witness matched quoted words not key syntax;
+envelope bare-id substring satisfiable by status text; status banner bypassed when failed/
+is a non-directory; CHANGELOG/probe-header drift. All mechanical; Steve approved r5
+explicitly (first decision after waking).
+
+## Round 4 — on r5 — IN FLIGHT
+
+r5 landed X1-X4 (V.V/80-85, RED-proven; full orchestrator regate green: 85/85 sh+dash,
 15/15 both, shellcheck 11 = baseline, probe 16/16 byte-restored).
