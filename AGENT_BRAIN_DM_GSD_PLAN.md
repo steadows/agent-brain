@@ -1,7 +1,7 @@
 # Agent-Brain Lane DM — GSD Plan
 
-**Status:** `[~]` P0–P4 ✅ + gates 7.1/7.2 + 7.4 ultrareview ✅; **v1.2.2 hardening arc GREEN; convergence gate: sweep 5 = 0 HIGH, no boundary objection; r7 landed — sweep-6-or-done is Steve's open call** — v1.2 (claim layer deleted) → v1.2.1 (rulings 1–6+1a) → v1.2.2 (rulings
-7–9) → v1.2.2-r2/r3/r4/r5 (rulings 10–14 + erratum 13a + all /simplify + pre-PR review + sweep findings) → r6 (ruling 14 ancestor walk) → r7 (fork-free authoritative count + probe address-cardinality self-check; erratum **13b** = the Steve-signed witness ceiling), every ruling a
+**Status:** `[~]` P0–P4 ✅ + gates 7.1/7.2 + 7.4 ultrareview ✅; **v1.2.2 hardening arc GREEN; convergence gate: sweep 6 (Steve's call) = 0 HIGH / 1 MED instrument-only → r8 landed (V.N/50 absolute-invocation assertion + exact line sets for the multi-count selectors) — sweep-7-or-close is Steve's open call** — v1.2 (claim layer deleted) → v1.2.1 (rulings 1–6+1a) → v1.2.2 (rulings
+7–9) → v1.2.2-r2/r3/r4/r5 (rulings 10–14 + erratum 13a + all /simplify + pre-PR review + sweep findings) → r6 (ruling 14 ancestor walk) → r7 (fork-free authoritative count + probe address-cardinality self-check; erratum **13b** = the Steve-signed witness ceiling) → r8 (sweep-6's composed drift gap; executor suggestion declined per proportionality brake), every ruling a
 standalone map commit in `.context/seams/dm-v1.1-queue.md`. Suite at **91 scenarios** (91/91 DM + 15/15 commit/install under `sh` AND **real
 dash**; mutation probe 16/16, tree byte-restored; each fix round RED-proven by A/B against
 the pre-fix engine. Gates this arc: /simplify (4-angle) → /steadows-code-review (5-agent +

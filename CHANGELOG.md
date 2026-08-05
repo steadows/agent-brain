@@ -55,8 +55,12 @@ seam map; its entry was never added here.)
   permission flip cannot render zero), and returns via `_DM_FAILED_COUNT` — no `$( )` on
   either the empty or positive status path. The probe gained an address-cardinality
   self-check: every sed selector (21 across 16 mutants) is asserted against its declared
-  engine match count, closing the class where an ambiguous address hits the right line by
-  ordering luck (M6 matched 3 lines; re-addressed to 1).
+  engine match count (M6 matched 3 lines; re-addressed to 1). Sweep 6 then showed count
+  alone still admits a selector drifting to a DIFFERENT set of N lines (r8): the
+  multi-count selectors' line sets (M7 ×2, M10 ×5) now sit in the exact-line manifest —
+  bounded by count AND exact lines — and V.N/50 asserts the bounded-backlog continuation
+  instruction carries the exact absolute receiving-vault engine invocation (must-survive
+  #7), so that regression is caught behaviorally, not just structurally.
 - **Suite: 91 scenarios** (V.R/67-75, V.U/76-79, V.V/80-85, V.Y/86-89, V.Z/90-91 added;
   each fix round RED-proven by A/B against its pre-fix engine),
   declared gaps [Q6] (scanner-internal TOCTOU witnesses) and [Q7] (fork-free/revalidation

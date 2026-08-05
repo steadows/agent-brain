@@ -115,3 +115,39 @@ Z4 → orchestrator (this reconciliation). Orchestrator regate on the delivered 
 A/B vs `d30c736` confirms V.Z/90-91 are guards (pass both engines — the engine change is
 a refactor + a declared-non-drivable defense; the discriminating gain is the probe's own
 RED: old M6 address = 3 matches, re-addressed = 1, measured independently).
+
+## Round 6 — on `1249b99` (r7) + docs `2cb0021` → NOT READY, 0 HIGH / 1 MEDIUM → fix round r8
+
+Brief: `docs/prompts/dm-v122-final-sweep-r6.md` · Job: task-msgeseja-af0b2i
+Steve's explicit call after r7 (offered "declare convergence" as the alternative; he chose
+the sweep). Zero product findings; zero witness-layer findings; no 13b boundary objection.
+The one finding is in the INSTRUMENT:
+
+1. **MEDIUM — the r7 cardinality check bounds multi-count selectors by COUNT only.** M7
+   (×2) and M10 (×5) were deliberately excluded from the exact-line anchor manifest, so a
+   selector can drift to a DIFFERENT set of N lines with every integrity check green.
+   Composed counterexample (orchestrator-CONFIRMED by measurement — the Codex sandbox
+   denied `mktemp`, so all evidence was re-established locally): break the engine's
+   backlog-continuation instruction (absolute → relative path, a real must-survive #7
+   regression) + plant a compensating comment → M10 cardinality still 5, changed-line
+   count still 5, no anchor breaks, `continuation_signal()` matches broad wording only,
+   probe still reports `M10 killed exactly [V.C/24]`.
+
+**Disposition:** fix round r8 (`docs/prompts/dm-v122-fix8.md`, job task-msgfl286-mz10tn) —
+**W1** V.N/50 additionally asserts the continuation instruction carries the exact expanded
+receiving-vault engine invocation (rung-1 behavioral assertion; the broad #4 alternation
+and its negative control unchanged); **W2** M7's 2 + M10's 5 lines join the exact-line
+manifest (bounded by count AND exact lines), M10's required kill set gains V.N/50. The
+sweep's suggested ">40-message sibling-worktree test that extracts and executes the
+continuation command" was **DECLINED per the proportionality brake** (new harness
+machinery; a review finding is evidence, not authorization; W1+W2 discriminate the named
+fault at strictly lower cost). Zero new mutants, zero new helpers. Orchestrator regate:
+91/91 + 15/15 under sh AND dash, syntax clean, shellcheck 11 = baseline, probe 16/16 with
+`M10 killed exactly [V.C/24 V.N/50]`, and the counterexample A/B now discriminates both
+ways — the drifted engine fails EXACTLY V.N/50 (90/91) and its continuation anchor is
+absent from the manifest (0 matches vs 1 on the real engine).
+
+**Round-landing split, on the record (per the proportionality convention):** sweeps 5 and
+6 combined — 0 product defects, 5 instrument/record defects. Production code has not
+changed since `1249b99`; the engine has not changed since `d30c736` except r7's fork-free
+refactor. The loop's findings have moved fully off the shipping surface.
