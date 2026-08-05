@@ -2,6 +2,13 @@
 # test/dm.sh — RED-phase suite for the Agent-Brain lane-DM feature, v1.2 (claim layer DELETED).
 #
 # AUTHORITY (in precedence order):
+#   0. .context/seams/dm-v1.1-queue.md, the `# v1.2.1 — CONTRACT ADDENDUM` section — the LATEST
+#      ruling (committed 33efc2d, authorized by Steve). It AMENDS the `# v1.2` section's
+#      "Poison, without a counter" ruling and must-survive items 3 and 6; its six numbered
+#      rulings are section V.Q's spec. Everything it does not name is unchanged, so items 1-3
+#      below still govern the rest of this file.
+#      docs/reviews/lane-dm-v12-pre-pr-code-review.md supplies the reproduced fixture shapes
+#      (H1's 41-entry wall, H4's crafted name) — it is EVIDENCE, never authority.
 #   1. .context/seams/dm-v1.1-queue.md, the `# v1.2` section (lines 335-467) — THE design
 #      authority, DECIDED by Steve 2026-08-04. It supersedes decisions 4, 6, 6b and 6c for the
 #      consume path; send-side atomicity (decisions 2 + 3) is explicitly UNCHANGED. Its "Delete"
@@ -61,6 +68,54 @@
 #     reader and never delivered. Nothing here observes the rename itself: there is no CLI-drivable
 #     interruption point inside `_atomic_place`, and manufacturing one would cost a bespoke
 #     harness for a property the reader-side assertions already bound. Declared, not claimed. [L8]
+#   · v1.2.1 ruling 1 names "a symlink, directory, FIFO, socket, or device node" as the unusable
+#     class. V.Q/55 covers SYMLINK and DIRECTORY only. A FIFO was planted and then removed:
+#     measured, it turns a dereferencing implementation's clean FAIL into an unbounded HANG (see
+#     V.Q/55's own note). One predicate decides the whole class, and both hazards it names are
+#     still exercised — but FIFO/socket/device-node handling is not claimed. [Q4]
+#   · v1.2.1 ruling 6's bump-CONSTRUCTION-failure diagnostic is UNCOVERED. `_dm_collision_dest`
+#     is reachable only THROUGH an already-occupied destination, so an engine that warns about
+#     the occupancy before attempting the bump emits an indistinguishable `brain: ` line whether
+#     or not the construction then fails silently. MEASURED against exactly that engine (a single
+#     `_warn` added ahead of the `_dm_collision_dest` call, nothing else changed): V.Q/62 PASSED.
+#     Separating the two anomalies needs the WORDING pinned, which this suite refuses to do
+#     everywhere else (V.C/24's standing precedent). Reachability is NOT the obstacle — V.Q/62
+#     limb B drives the failure today and is red on it; indistinguishability is. Dispatcher
+#     ruling 2026-08-04: honest gap over hollow assertion. The "bump TAKEN" half of ruling 6 is
+#     still pinned (V.Q/62 limb A) and V.Q/62 limb B is retained for the must-survive #2 property
+#     it proves uniquely. NON-BLOCKING. [Q5]
+#   · v1.2.1 ruling 5, first bullet (`_dm_id_in_use` must match the id AND any bumped variant)
+#     has NO scenario. It is not drivable through the CLI: to observe it the engine must MINT an
+#     id whose plain slot is free while a bumped variant exists, and the only mint inputs are
+#     `_now_compact` and `$$`. Ruling 4 closes `_DM_ID_TS`, and `$$` differs on every invocation,
+#     so a name matching a FUTURE mint cannot be pre-planted, and `dm @all` mints per-lane (no
+#     intra-lane collision). Planting a bumped variant of a PAST id proves nothing — no later
+#     send can reuse that base. Reaching the fault requires same-second PID REUSE to occur
+#     naturally, which is not deterministically drivable. DISPATCHER RULING 2026-08-04: declare
+#     the gap, build no structural witness, and land the fix in GREEN regardless — changing
+#     `_dm_id_in_use` from exact-match to a `<id>*` glob is a STRICT WIDENING of a safety check
+#     (it can report "in use" more often, never less), so it cannot introduce a new failure mode
+#     even unproven by a scenario. An untested strict-widening is acceptable here; an untested
+#     behaviour CHANGE would not be. NON-BLOCKING. [Q1]
+#   · v1.2.1 ruling 5, second bullet (the digest `id` sits outside `bounded()`, permissible but
+#     the dependency must be STATED at both sites, and DM_DIGEST_ENVELOPE's comment must say it
+#     was sized for a four-field envelope) has no scenario: it is a COMMENT requirement on
+#     `bin/brain`, with no observable behaviour to assert. The byte bound it rests on is already
+#     pinned by V.W/27 and V.W/28. Deliberate omission. [Q2]
+#   · V.Q/59 (ruling 3(b), the delimited-name round trip) is RED today for the right reason, but
+#     it goes VACUOUSLY green once ruling 3(a)'s grammar lands: `_valid_names` is built only from
+#     names that already passed `_dm_id_ok`, so with digit-only fields no whitespace-bearing name
+#     can reach the collected set and the round-trip becomes unreachable from outside. Glob
+#     metacharacters are already rejected in that position today, so they are not a second door.
+#     The ruling itself calls the round trip "a live hazard for the NEXT name-shaped value" —
+#     so once 3(a) lands, (b) is DEFENCE IN DEPTH against a future name-shaped value, NOT a
+#     currently-reachable second bug. DISPATCHER RULING 2026-08-04: keep this behavioural, build
+#     NO structural witness (a source-text grep prescribes a spelling and would need a bin/brain
+#     mutation for its own negative control), and pin the discrimination at gate time with a
+#     TEMPORARY probe mutant in test/mutation-probe.sh — grammar relaxed to accept whitespace,
+#     after which this scenario must fire and only it. That mutant is owed by the probe rewrite,
+#     which the dispatcher owns; it is NOT part of this file. Declared so the vacuity is never
+#     mistaken for coverage. [Q3]
 #   · The per-invocation batch size K is NOT pinned — only that a bound exists (V.N/50 caps
 #     delivery at DM_INJECT_MAX_LINES over a 45-entry backlog), that bounding destroys nothing,
 #     and that successive invocations drain the remainder without starvation. The map says "one
@@ -2388,8 +2443,847 @@ sc_failed_dest_collision_preserves_record() {
   need_not_lost "$fx" bravo "invalid-colliding-quarantine-v12" "the colliding quarantine arrival"
 }
 
+# ═════════════════════ V.Q — v1.2.1 contract addendum (RED) ══════════════════════════════
+#
+# Authority: the seam map's `# v1.2.1 — CONTRACT ADDENDUM` section, rulings 1-6. Each scenario
+# names the ruling it pins. The pre-PR review's transcripts supply fixture SHAPES only.
+#
+# SHIM DISCIPLINE (rulings 2, 4 and 6 all need one): every PATH shim below follows V.N/53's
+# rules exactly — PATH saved in the parent shell, restored BEFORE any assertion can return
+# early, and a post-restore leak check that the shim directory is no longer what `command -v`
+# resolves. A leaked shim would silently poison every later scenario in this file.
+
+# V.Q/55 — ruling 1: "a non-regular direct child of `pending/` is quarantinable on the same
+# footing as invalid content ... renamed — as a directory entry, NEVER dereferenced — into
+# `failed/`", because "such an entry consumed a batch slot but was classified transient, [so] it
+# was retried forever and 40 of them permanently starved every message behind them".
+#   FIXTURE    40 symlinks + one directory, all lexically AHEAD of one valid message. Their names
+#              are given in the v1.2 grammar ON PURPOSE: a grammar-invalid spelling would let the
+#              NAME check shadow the limb under test — the same trap V.X/36 documents.
+#   ⚠ NO FIFO, and the reason is measured, not squeamish. A FIFO was planted first and then
+#              REMOVED: against a mutant that quarantines by DEREFERENCING (`cp -L` instead of
+#              renaming the directory entry) the symlink limbs fail cleanly, but `cp` opens the
+#              FIFO for reading and BLOCKS FOREVER — turning a detected defect into a wedged
+#              suite with no output. A fixture that converts a FAIL into a hang is worse than no
+#              fixture. Ruling 1's predicate is "not a regular file", one decision for the whole
+#              class, and the two members kept exercise both hazards it names: a symlink (the
+#              dereference door) and a directory (the not-a-file door). FIFO/socket/device-node
+#              handling is therefore NOT claimed by this suite. Declared gap. [Q4]
+#   PROVES     the valid message behind the wall is delivered, ONE invocation makes progress,
+#              every unusable entry reaches failed/ AS A DIRECTORY ENTRY (still a symlink, still
+#              a directory, still a FIFO — a dereferencing copy would be a regular file), the
+#              symlink target's bytes are untouched, and its content never reaches read/.
+#   REJECTS    today's engine exactly: `_dm_dir_ok` refuses the entry and `_dm_pending_digest`
+#              calls that TRANSIENT, so the entry keeps its batch slot forever (measured by the
+#              orchestrator: 0 emitted, still 0 on the second run).
+sc_nonregular_entries_quarantined_not_starving() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+
+  ext="$base/outside-nonregular"
+  mkdir -p "$ext" || { fail "fixture: could not create the external target"; return 0; }
+  printf '{"from":"mallory","to":"bravo","ts":"x","content":"XDEREF-nonregular-v121"}\n' \
+    > "$ext/target.json" || { fail "fixture: could not write the external target"; return 0; }
+  before_target=$(byte_size "$ext/target.json")
+
+  # the valid message goes in FIRST: nothing may grep pending/ once the FIFO exists.
+  run_brain "$fx" alpha dm @bravo "nonregular-survivor-v121"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: the one valid message" || return 0
+  need_count "$pd" 1 "prerequisite: exactly the valid message is queued" || return 0
+
+  i=1
+  while [ "$i" -le 40 ]; do
+    ln -s "$ext/target.json" "$pd/$(printf '00000000T0000%02dZ-%s' "$i" "$i")" \
+      || { fail "fixture: could not plant symlink #$i"; return 0; }
+    i=$((i + 1))
+  done
+  mkdir "$pd/00000000T000090Z-90" \
+    || { fail "fixture: could not plant the directory entry"; return 0; }
+  unusable=41
+  need_count "$pd" "$((unusable + 1))" "prerequisite: the wall plus one valid message" || return 0
+
+  # ONE invocation must make progress. This is H1's exact measurement.
+  before_pending=$(count_files "$pd")
+  run_brain "$fx" bravo dm take
+  after_pending=$(count_files "$pd")
+  need_file_lacks "$OUT" "XDEREF-nonregular-v121" \
+    "a symlinked queue entry was DEREFERENCED and its target's content emitted as a message"
+  [ "$after_pending" -lt "$before_pending" ] \
+    || fail "ruling 1: one 'dm take' over $before_pending queued entries moved NOTHING out of pending/ — a non-regular entry consumes a batch slot and is classified transient, so it is retried forever and starves every message behind it"
+
+  used=$(drain_takes "$fx" bravo 12)
+  need_count "$pd" 0 \
+    "pending/ after $used follow-up take(s) — the wall must DRAIN, not be re-examined on every invocation"
+  need_count "$rd" 1 "read/ after the drain — the one valid message is delivered and archived"
+  need_tree_has "$rd" "nonregular-survivor-v121" \
+    "the valid message behind the wall must actually be delivered (H1: measured 0 emitted)"
+  need_count "$fd" "$unusable" \
+    "failed/ after the drain — every structurally unusable queue entry is quarantined on the same footing as invalid content"
+
+  # NEVER DEREFERENCED: quarantine renames the DIRECTORY ENTRY. A follow-and-copy would land
+  # regular-file bytes in failed/ and would have opened the target.
+  qlinks=0; qdirs=0; qother=0
+  for qf in "$fd"/*; do
+    [ -e "$qf" ] || [ -L "$qf" ] || continue
+    if [ -L "$qf" ]; then qlinks=$((qlinks + 1))
+    elif [ -d "$qf" ]; then qdirs=$((qdirs + 1))
+    else qother=$((qother + 1)); fi
+  done
+  need_eq "$qlinks" 40 \
+    "symlinks quarantined AS symlinks — ruling 1 renames the directory entry and never dereferences it, so a regular file here means the target was followed and its bytes copied into the queue"
+  need_eq "$qdirs" 1 "the directory entry quarantined as a directory"
+  need_eq "$qother" 0 "failed/ must hold no entry that was materialised as a regular file"
+
+  need_eq "$(byte_size "$ext/target.json")" "$before_target" \
+    "the symlink target's bytes must be untouched — the entry is never opened"
+  need_file_has "$ext/target.json" "XDEREF-nonregular-v121" \
+    "the external target must survive intact (positive control that it was readable at all)"
+  need_tree_lacks "$rd" "XDEREF-nonregular-v121" \
+    "the symlink target's CONTENT must never reach read/ — a dereferenced link is arbitrary external content entering the transcript archive"
+}
+
+# V.Q/56 — ruling 2: "the engine may not hard-code a dependency's incidental exit code ...
+# `_dm_jq_preflight` ... must PROBE every contract the consume path relies on — including the
+# parse-error code and the `error()` code". Measured in the review: jq 1.6 (Debian bookworm,
+# Ubuntu 22.04) exits 4 for a parse error; jq 1.7.1 exits 5.
+#   INSTRUMENT a jq-1.6-emulating PATH shim: the REAL jq runs, and only a PARSE error's exit
+#              code is remapped 5 → 4 (discriminated on jq's own "parse error" stderr line).
+#              `error()` still exits 5, so this fixture is neutral between the two spellings the
+#              ruling permits — "recording" the probed codes and "verifying" them both classify
+#              this jq correctly, and neither is forced.
+#   CONTROLS   engagement is measured directly (a parse error must exit 4 while the shim is on
+#              PATH), and the restore is checked by resolving `jq` again afterwards.
+#   REJECTS    today's engine: `_dm_digest` exits 4, `_dm_pending_digest`'s `case` sends anything
+#              but 5 to the TRANSIENT branch, so a corrupt message is never quarantined and
+#              retries on every boot forever.
+sc_probed_parse_error_code_still_quarantines() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  planted=$(plant_message "$fx" bravo "jq16-victim-seed-v121") \
+    || { fail "prerequisite: could not queue the victim"; return 0; }
+  run_brain "$fx" alpha dm @bravo "jq16-peer-v121"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: the healthy peer" || return 0
+  printf '%s\n' '{jq16-structurally-invalid-v121' > "$planted" \
+    || { fail "fixture: could not corrupt the victim"; return 0; }
+  need_count "$pd" 2 "prerequisite: one corrupt entry and one healthy peer" || return 0
+
+  shim_dir="$base/jq16-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the shim directory"; return 0; }
+  # SC2016 is the POINT here: these single-quoted formats are the shim's SOURCE TEXT, and $@ /
+  # $? / $$ must reach the generated script unexpanded. Only "$real_jq" and "$base" interpolate.
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf '# jq 1.6 emulation: a PARSE error exits 4; error() still exits 5; everything else\n'
+    printf '# is the real jq, byte for byte.\n'
+    printf '_e="%s/jq16-err.$$"\n' "$base"
+    printf '"%s" "$@" 2>"$_e"\n' "$real_jq"
+    printf '_rc=$?\n'
+    printf 'cat "$_e" >&2 2>/dev/null\n'
+    printf 'if [ "$_rc" = 5 ] && grep -q "parse error" "$_e" 2>/dev/null; then _rc=4; fi\n'
+    printf 'rm -f "$_e" 2>/dev/null\n'
+    printf 'exit "$_rc"\n'
+  } > "$shim_dir/jq" || { fail "fixture: could not write the jq shim"; return 0; }
+  chmod +x "$shim_dir/jq" || { fail "fixture: could not make the jq shim executable"; return 0; }
+
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  jq -e . "$planted" >/dev/null 2>&1
+  probe_rc=$?
+  run_brain "$fx" bravo dm take
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*) fail "instrument leak: the jq shim is STILL what PATH resolves after the restore"; return 0 ;;
+  esac
+
+  need_eq "$probe_rc" 4 \
+    "instrument check: with the shim on PATH a JSON parse error must exit 4 (the jq 1.6 code) — otherwise this scenario proves nothing about a version-dependent exit code" || return 0
+
+  need_count "$fd" 1 \
+    "ruling 2: a jq that reports a parse error with a code OTHER than 5 must still quarantine — deriving invalidity from a hard-coded 5 leaves a corrupt message retrying forever on current stable distros"
+  need_tree_has "$fd" "jq16-structurally-invalid-v121" \
+    "the quarantined file must carry the offending bytes"
+  need_file_has "$OUT" "jq16-peer-v121" "the healthy peer must deliver in the same invocation"
+  need_count "$rd" 1 "read/ — exactly the healthy peer is archived"
+  need_count "$pd" 0 "pending/ — neither entry may be left cycling"
+}
+
+# V.Q/57 — ruling 2's fail-safe half: "A jq whose behavior cannot be established fails safe to
+# *everything stays pending* ... Fail-safe is leave-pending; it is never quarantine."
+#   INSTRUMENT a shim whose parse-error exit code COLLIDES WITH SUCCESS (0, with jq's own empty
+#              stdout). Invalidity is then genuinely undecidable from the exit code, so no
+#              engine may claim proof — while `utf8bytelength`/`tojson` still work, which is
+#              exactly what distinguishes this from V.N/53's wholly-broken jq: the OLD preflight
+#              passes here, so only a preflight that PROBES the parse-error code can notice.
+#   PROVES     nothing is quarantined, nothing is archived, BOTH messages (the corrupt one and
+#              its healthy peer) stay pending, and everything is deliverable once the dependency
+#              is trustworthy again.
+#   REJECTS    today's engine: the digest returns 0 with empty output, so a blank line is emitted
+#              as a message and the corrupt file is archived into read/ — worse than quarantine.
+sc_unestablishable_jq_leaves_everything_pending() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  planted=$(plant_message "$fx" bravo "jqamb-victim-seed-v121") \
+    || { fail "prerequisite: could not queue the victim"; return 0; }
+  run_brain "$fx" alpha dm @bravo "jqamb-peer-v121"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: the healthy peer" || return 0
+  printf '%s\n' '{jqamb-structurally-invalid-v121' > "$planted" \
+    || { fail "fixture: could not corrupt the victim"; return 0; }
+  need_count "$pd" 2 "prerequisite: one corrupt entry and one healthy peer" || return 0
+
+  shim_dir="$base/jqamb-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the shim directory"; return 0; }
+  # SC2016 is the POINT here — see V.Q/56's identical note.
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf '# A jq whose PARSE-error exit code is indistinguishable from success. Invalidity\n'
+    printf '# cannot be established from an exit code on this build.\n'
+    printf '_e="%s/jqamb-err.$$"\n' "$base"
+    printf '"%s" "$@" 2>"$_e"\n' "$real_jq"
+    printf '_rc=$?\n'
+    printf 'cat "$_e" >&2 2>/dev/null\n'
+    printf 'if [ "$_rc" = 5 ] && grep -q "parse error" "$_e" 2>/dev/null; then _rc=0; fi\n'
+    printf 'rm -f "$_e" 2>/dev/null\n'
+    printf 'exit "$_rc"\n'
+  } > "$shim_dir/jq" || { fail "fixture: could not write the jq shim"; return 0; }
+  chmod +x "$shim_dir/jq" || { fail "fixture: could not make the jq shim executable"; return 0; }
+
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  jq -e . "$planted" >/dev/null 2>&1
+  probe_rc=$?
+  jq -e -n '"x" | (utf8bytelength == 1 and ((tojson | type) == "string"))' >/dev/null 2>&1
+  preflight_rc=$?
+  run_brain "$fx" bravo dm take
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*) fail "instrument leak: the jq shim is STILL what PATH resolves after the restore"; return 0 ;;
+  esac
+
+  need_eq "$probe_rc" 0 \
+    "instrument check: with the shim on PATH a parse error must exit 0, colliding with success" || return 0
+  need_eq "$preflight_rc" 0 \
+    "instrument check: the OLD utf8bytelength/tojson preflight must still PASS on this jq — otherwise this scenario is just V.N/53 again and says nothing about probing the exit-code contract" || return 0
+
+  need_count "$fd" 0 \
+    "ruling 2: fail-safe is LEAVE-PENDING, never quarantine — a jq whose parse-error verdict cannot be established is not proof that any message is structurally invalid"
+  need_count "$rd" 0 \
+    "read/ after an unestablishable jq — nothing was validly digested, so nothing may be archived (an empty digest emitted as a message is not a delivery)"
+  need_count "$pd" 2 \
+    "pending/ after an unestablishable jq — the ruling requires EVERYTHING to stay pending, the healthy peer included"
+  need_tree_has "$pd" "jqamb-structurally-invalid-v121" "the corrupt entry must still be queued"
+  need_tree_has "$pd" "jqamb-peer-v121" "the healthy peer must still be queued"
+
+  # retryable: once the dependency is trustworthy, the ordinary verdicts apply.
+  run_brain "$fx" bravo dm take
+  need_file_has "$OUT" "jqamb-peer-v121" "the healthy peer must deliver once jq is trustworthy again"
+  need_count "$rd" 1 "read/ after the retry"
+  need_count "$fd" 1 "failed/ after the retry — NOW the corrupt file is proven invalid"
+  need_count "$pd" 0 "pending/ after the retry"
+}
+
+# V.Q/58 — ruling 3(a): "the producer grammar is enforced with explicit digit-only checks".
+# `_dm_id_ok`'s `[0-9]*` is a shell GLOB, not a regex, so it admits whitespace inside the PID
+# field. The crafted name is the review's own reproduction.
+#   REJECTS    an engine that accepts a whitespace-bearing queue filename, digests it and
+#              archives it under that name — which is what happens today.
+#   NOTE       glob metacharacters in the same position are already refused (`…Z-1*` fails
+#              `_dm_id_ok`'s `[1-9][0-9]*` case), so whitespace is the live hole, not a class.
+#   NAME       the review's literal spelling is kept here because nothing in this scenario
+#              depends on where the crafted entry sorts. V.Q/59's shape DOES depend on that, and
+#              says why it uses different tokens.
+sc_whitespace_queue_name_rejected() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+
+  run_brain "$fx" alpha dm @bravo "whitespace-peer-v121"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: the healthy peer" || return 0
+
+  crafted='20260803T000000Z-12 20260805T000000Z-123'
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"whitespace-name-body-v121"}' \
+    > "$pd/$crafted" || { fail "fixture: could not plant the whitespace-named entry"; return 0; }
+  need_count "$pd" 2 "prerequisite: the crafted entry plus one healthy peer" || return 0
+
+  run_brain "$fx" bravo dm take
+
+  need_file_lacks "$OUT" "whitespace-name-body-v121" \
+    "ruling 3(a): a queue filename carrying embedded WHITESPACE must be rejected by the producer grammar — a [0-9]* case-glob is not a digit-only check, and it admits a space"
+  need_file_has "$OUT" "whitespace-peer-v121" \
+    "the healthy peer must still deliver (must-survive #3)"
+  need_tree_lacks "$rd" "whitespace-name-body-v121" \
+    "a grammar-rejected entry must never reach the transcript archive"
+  need_count "$rd" 1 "read/ — exactly the healthy peer is archived"
+  need_count "$fd" 1 \
+    "failed/ — a name the grammar rejects is a proven-unusable queue entry and is quarantined (ruling 1's footing), not left cycling"
+  need_tree_has "$fd" "whitespace-name-body-v121" "the quarantined entry must carry the offending bytes"
+  need_count "$pd" 0 "pending/ after the consume"
+}
+
+# V.Q/59 — ruling 3(b): "collected filenames are NEVER joined into a delimited string. A filename
+# crosses any boundary as exactly one element (quoted positional parameters)."
+#   FIXTURE    the review's shape — crafted whitespace name FIRST, ordinary entries, and a real
+#              file named exactly the crafted name's SECOND token LAST — but with MARGIN.
+#              ⚠ MARGIN IS LOAD-BEARING [F2]. The review's literal 41-entry count leaves ZERO
+#              slack against the 40-entry cap, and the map deliberately does not pin whether a
+#              REJECTED entry consumes a batch slot ([L9]). Both policies are permitted, and at
+#              41 entries they disagree about whether the trailing file is inside the batch:
+#                · rejected entry CONSUMES a slot → batch = crafted + 39 ordinary, trailing is
+#                  #41, outside. Fixture reproduces.
+#                · rejected entry does NOT consume a slot (exactly what ruling 1's fix does) →
+#                  batch = 39 ordinary + trailing = 40, trailing is INSIDE, nothing stays
+#                  pending, and this scenario fails its own instrument check against a COMPLIANT
+#                  engine. A false red is worse than a missing test: it sends the implementer
+#                  to fix code that is already right.
+#              So: 50 ordinary valid entries, not 39. Under the tighter policy the 40-entry cap
+#              is exceeded by 10 valid entries before the trailing file is even reached, and the
+#              cap can only be ≤ DM_INJECT_MAX_LINES (V.N/50 pins delivery at or under it), so
+#              the trailing file is outside the batch under BOTH policies with margin to spare.
+#              ⚠ The review's literal spelling (`20260803T000000Z-12 20260805T000000Z-123`) is
+#              CLOCK-DEPENDENT — engine-minted names carry today's date, so which side of the
+#              ordinary entries those tokens land on changes with the wall clock, and the shape
+#              silently stops reproducing. Measured: at 2026-08-05T00:42Z the trailing entry
+#              sorted SECOND, not last, and this scenario went green for the wrong reason. The
+#              tokens below are the lexical extremes of the 8-digit date field, so the ordering
+#              is fixed for the suite's lifetime. Only the spelling changed; the shape is the
+#              review's.
+#   PROVES     the invariant ruling 3 exists to protect — no message is archived that was not
+#              emitted (must-survive #2 / UR-1). Today `set -- $_valid_names` re-splits the
+#              crafted name and promotes the LAST file, never digested, straight into read/.
+#   ASSERTION  stated as a UNIVERSAL over read/ — every archived entry's body must appear in the
+#              emitted context — so it depends on NO batch arithmetic, no cap value, and no
+#              slot-accounting policy. It also catches an archived-but-unemitted entry of ANY
+#              name, not just the trailing one this fixture happens to construct. [F2]
+#   ⚠ VACUITY, DECLARED [Q3]: the premise "a whitespace-bearing name reaches the collected set"
+#              becomes unreachable once ruling 3(a) lands — `_valid_names` is built only from
+#              names that already passed `_dm_id_ok`. So AFTER (a), ruling 3(b) is DEFENCE IN
+#              DEPTH against a future name-shaped value, NOT a currently-reachable second bug,
+#              and this scenario stops discriminating the round trip on its own. It is written
+#              as an invariant (guarded on whether the body was actually emitted) so it can
+#              never FALSELY fail a compliant engine.
+#              Dispatcher ruling 2026-08-04: behavioural only, NO structural witness here. The
+#              discrimination is pinned at gate time by a TEMPORARY mutant in
+#              test/mutation-probe.sh (grammar relaxed to accept whitespace ⇒ this scenario must
+#              fire, and only it), owed by the probe rewrite the dispatcher owns. See [Q3].
+sc_no_message_archived_that_was_not_emitted() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
+
+  seed=$(plant_message "$fx" bravo "h4b-seed-v121") \
+    || { fail "prerequisite: could not queue the seed"; return 0; }
+  clone_queued "$seed" 49 "h4b-" || { fail "fixture: could not mint the ordinary entries"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"h4b-00-marker"}' > "$seed" \
+    || { fail "fixture: could not rewrite the seed body"; return 0; }
+
+  crafted='00000001T000000Z-12 99991231T235959Z-123'
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"h4b-crafted-body-v121"}' \
+    > "$pd/$crafted" || { fail "fixture: could not plant the crafted entry"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"h4b-last-body-v121"}' \
+    > "$pd/99991231T235959Z-123" || { fail "fixture: could not plant the trailing entry"; return 0; }
+  need_count "$pd" 52 "prerequisite: 1 crafted + 50 ordinary + 1 trailing entry are queued" || return 0
+
+  ctx=$(hook_context "$fx" bravo)
+  hrc=$?
+  need_rc "$hrc" 0 "SessionStart with the crafted-name backlog" || return 0
+
+  # non-vacuity: something really was delivered AND something really was archived, so the
+  # universal below is quantified over a non-empty set rather than satisfied by an empty read/.
+  need_str_has "$ctx" "h4b-00-marker" \
+    "instrument check: the boot delivered none of the ordinary entries, so the invariant below would be vacuous"
+  [ "$(count_files "$rd")" -gt 0 ] \
+    || { fail "instrument check: read/ is empty after the boot, so 'nothing was archived without being emitted' is vacuously true and proves nothing"; return 0; }
+
+  # THE INVARIANT — universal over read/, independent of the cap and of slot accounting.
+  unemitted=0; unemitted_name=""
+  for af in "$rd"/*; do
+    [ -e "$af" ] || [ -L "$af" ] || continue
+    abody=$(jq -r 'if type == "object" and (.content | type) == "string" then .content else empty end' \
+      "$af" 2>/dev/null)
+    if [ -z "$abody" ]; then
+      fail "instrument check: archived entry ${af##*/} carries no readable .content, so this scenario cannot judge whether it was emitted"
+      continue
+    fi
+    if ! str_has "$ctx" "$abody"; then
+      unemitted=$((unemitted + 1)); unemitted_name=${af##*/}
+    fi
+  done
+  need_eq "$unemitted" 0 \
+    "ruling 3(b): $unemitted archived entr(y|ies) — e.g. '$unemitted_name' — carry a body that NEVER appeared in the emitted context. The collected names round-tripped through a delimited string that an unquoted re-split tore apart, promoting an un-digested file into the archive list. That is an emit-before-move violation: UR-1's silent loss through a new door"
+  need_str_lacks "$ctx" "h4b-crafted-body-v121" \
+    "ruling 3(a) on the boot path: the crafted whitespace name must not be digested"
+}
+
+# V.Q/60 — ruling 4: "minted identity is derived, never inherited — the engine clears/ignores an
+# inherited `_DM_ID_TS` ... validates the final id against the grammar BEFORE composing any path,
+# and asserts the destination's literal parent is the intended `pending/` directory."
+#   INSTRUMENT the environment itself. `_brain_exec` runs `env` WITHOUT `-i`, so an exported
+#              variable in this shell reaches the engine — no helper change needed. It is unset
+#              in the parent immediately after each run, before any assertion can return early.
+#   LIMB 1     `../read/<ts>` places a "sent" message straight into terminal read/, which no
+#              consumer ever emits — `brain dm` reports success and the message is simply gone.
+#   LIMB 2     more `../` escapes `.brain/dm` entirely.
+#   PROVES     both destinations are refused AND the send still lands normally in pending/ under
+#              a grammar-valid name — "ignores" means the send proceeds with a DERIVED id, so
+#              refusing the send outright would not satisfy the ruling either.
+sc_inherited_id_ts_cannot_escape_pending() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
+
+  _DM_ID_TS='../read/20260804T000000Z'; export _DM_ID_TS
+  run_brain "$fx" alpha dm @bravo "id-ts-into-read-v121"
+  rc1=$?
+  unset _DM_ID_TS
+
+  _DM_ID_TS='../../../../escapeprobe'; export _DM_ID_TS
+  run_brain "$fx" alpha dm @bravo "id-ts-escape-v121"
+  rc2=$?
+  unset _DM_ID_TS
+
+  need_rc "$rc1" 0 "a send with an inherited _DM_ID_TS must still succeed — the ruling says the value is CLEARED/IGNORED, not that the send fails"
+  need_rc "$rc2" 0 "a send with a path-bearing inherited _DM_ID_TS must still succeed"
+  need_count "$rd" 0 \
+    "ruling 4: an inherited _DM_ID_TS placed a 'sent' message directly into TERMINAL read/ — no consumer ever emits it, so cmd_dm reports success over a message that is silently gone"
+
+  escaped=0
+  for ef in "$fx"/escapeprobe* "$fx/.brain"/escapeprobe* "$base"/escapeprobe*; do
+    [ -e "$ef" ] || [ -L "$ef" ] || continue
+    escaped=$((escaped + 1))
+  done
+  need_eq "$escaped" 0 \
+    "ruling 4: an inherited _DM_ID_TS composed a destination OUTSIDE .brain/dm — the minted id must be validated against the grammar BEFORE any path is composed, and the destination's literal parent asserted to be pending/"
+
+  need_count "$pd" 2 \
+    "pending/ after two sends with a hostile inherited _DM_ID_TS — identity is DERIVED, so both messages belong in the recipient's pending/ under engine-minted ids"
+  for qf in "$pd"/*; do
+    [ -e "$qf" ] || [ -L "$qf" ] || continue
+    need_v12_queue_name "$qf" "the id minted while _DM_ID_TS was inherited"
+  done
+}
+
+# V.Q/61 — ruling 4, second half: the engine "requires its clock helper to actually succeed (a
+# masked failure must not yield a malformed id)". `_dm_new_id` takes `$(_now_compact)` without
+# checking it, so a failing `date` yields the id `-<pid>` — which `_dm_send` then uses, and which
+# every consumer must later reject.
+#   INSTRUMENT a `date` PATH shim that always fails. Same save/restore/leak discipline as V.N/53.
+#   POSITIVE   a send made BEFORE the shim is installed proves the vault and the grammar checker
+#   CONTROL    are both live, so "no malformed name found" is a result rather than an empty queue.
+#   NOT PINNED the exit status of the failed send: the ruling requires that no malformed id is
+#              PRODUCED, and both "refuse the send" and "fail before writing" satisfy that.
+sc_failed_clock_mints_no_malformed_id() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+
+  run_brain "$fx" alpha dm @bravo "clock-ok-control-v121"
+  rc=$?
+  need_rc "$rc" 0 "positive control: a send with a working clock" || return 0
+  need_count "$pd" 1 "positive control: the control message is queued" || return 0
+
+  shim_dir="$base/broken-date-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the shim directory"; return 0; }
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'printf "date: simulated clock failure\\n" >&2\n'
+    printf 'exit 1\n'
+  } > "$shim_dir/date" || { fail "fixture: could not write the date shim"; return 0; }
+  chmod +x "$shim_dir/date" || { fail "fixture: could not make the date shim executable"; return 0; }
+
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  run_brain "$fx" alpha dm @bravo "clock-failure-v121"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v date)" in
+    "$shim_dir"/*) fail "instrument leak: the date shim is STILL what PATH resolves after the restore"; return 0 ;;
+  esac
+  date -u +%Y%m%dT%H%M%SZ >/dev/null 2>&1 \
+    || { fail "instrument leak: date is still broken after the restore — every later scenario would be poisoned"; return 0; }
+
+  for st in pending read failed; do
+    for qf in "$(q_dir "$fx" bravo "$st")"/*; do
+      [ -e "$qf" ] || [ -L "$qf" ] || continue
+      need_v12_queue_name "$qf" \
+        "a queue entry minted while the clock helper FAILED (ruling 4: a masked _now_compact failure must not yield a malformed id)"
+    done
+  done
+  need_count "$rd" 0 "read/ after a failed-clock send — nothing terminal may be produced"
+  need_count "$fd" 0 "failed/ after a failed-clock send — no message may need quarantining because the SENDER minted a bad name"
+  # [F6] The name-grammar limbs above are satisfied by an engine that SILENTLY SUBSTITUTES a
+  # synthetic timestamp when the clock fails: it mints a grammar-valid id and queues the message.
+  # Ruling 4 requires the clock helper to ACTUALLY SUCCEED, so a failed clock must queue nothing —
+  # only the positive control may be here.
+  need_count "$pd" 1 \
+    "pending/ after a failed-clock send — ruling 4 requires the clock helper to actually succeed, so no message may be queued at all; a synthetic-timestamp fallback mints a valid-LOOKING id and passes every grammar check while violating the ruling"
+}
+
+# V.Q/62 — ruling 6: "every path that absorbs an anomaly (bump taken, bump-construction failure)
+# emits a `brain: `-prefixed diagnostic". v1.1 refused an occupied archive destination LOUDLY;
+# v1.2 bumps silently, and `_dm_collision_dest`'s internal failures return without a word.
+#   FIXTURE A  a real send really consumed, then a second message queued under the archive's own
+#              basename — the same genuine collision V.N/51 builds, so no filename grammar is
+#              encoded here either.
+#   FIXTURE B  the same collision with a failing `date`, so `_dm_collision_dest` cannot mint the
+#              `.collision-<epoch>-<pid>` suffix and returns 1. Today that failure is completely
+#              invisible: `_dm_archive` returns without a warn and `cmd_dm_take` only sets rc.
+#   ANCHOR     both limbs assert the colliding message was EMITTED first — proof the run actually
+#              reached the archive step, so silence is silence and not a short circuit.
+#   NOT PINNED the wording, and not the outcome: V.N/51 already rules that bumping and retaining
+#              are both legal. Only the `brain: ` diagnostic is asserted, and only in limb A.
+#
+#   ⚠ LIMB B ASSERTS NO DIAGNOSTIC, and the reason is measured, not assumed [F1 / Q5].
+#              An earlier draft asserted a `brain: ` line here too. That was a FALSE GREEN:
+#              `_dm_collision_dest` is reachable ONLY through an already-occupied destination, so
+#              an engine that warns about the OCCUPANCY before attempting the bump emits an
+#              indistinguishable `brain: ` line in both limbs while leaving the construction
+#              failure completely traceless. Measured against exactly that engine (one `_warn`
+#              added ahead of the `_dm_collision_dest` call, nothing else): the whole scenario
+#              PASSED. Separating the two diagnostics needs the WORDING pinned, which this suite
+#              refuses to do everywhere else (V.C/24 is the standing precedent). Reachability was
+#              never the problem — this limb reaches the path today and is red on it; the problem
+#              is that no wording-free observation can tell the two anomalies apart.
+#              Dispatcher ruling 2026-08-04: an honest gap over a hollow assertion. Limb B is
+#              retained for what it DOES prove cheaply and uniquely — that a post-emit archive
+#              abandonment under a failing clock does not destroy the message (must-survive #2,
+#              under a fault no other scenario drives). Ruling 6's bump-CONSTRUCTION-failure
+#              diagnostic is UNCOVERED; see [Q5].
+sc_collision_anomalies_are_diagnosed() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
+
+  # ── A: the bump is taken ──
+  run_brain "$fx" alpha dm @bravo "m3a-earlier-v121"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: first send" || return 0
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: first consume" || return 0
+  need_count "$rd" 1 "prerequisite: the earlier transcript is archived" || return 0
+  archived=$(first_file "$rd") || { fail "read/ is empty after the first consume"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"m3a-colliding-v121"}' \
+    > "$pd/${archived##*/}" || { fail "fixture: could not queue the colliding arrival"; return 0; }
+
+  run_brain "$fx" bravo dm take
+  need_file_has "$OUT" "m3a-colliding-v121" \
+    "anchor: the colliding message must be emitted, so the run really reached the archive step" || return 0
+  if [ -s "$ERR" ]; then
+    need_file_has "$ERR" "brain:" \
+      "ruling 6: an occupied archive destination that is silently BUMPED must emit a 'brain: '-prefixed diagnostic (stderr carried output, but none of it was an engine diagnostic — a bare tool error is a leak, not a report)"
+  else
+    fail "ruling 6: an occupied archive destination was bumped with NO diagnostic at all — v1.1 refused it loudly, and an anomaly absorbed in silence is exactly what the ruling forbids"
+  fi
+
+  # ── B: the bump cannot be constructed ──
+  fx2=$(make_vault alpha bravo) || fatal "second fixture build failed"
+  base2=$(dirname "$fx2")
+  pd2=$(q_dir "$fx2" bravo pending); rd2=$(q_dir "$fx2" bravo read)
+
+  run_brain "$fx2" alpha dm @bravo "m3b-earlier-v121"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: second-fixture send" || return 0
+  run_brain "$fx2" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: second-fixture consume" || return 0
+  archived2=$(first_file "$rd2") || { fail "read/ is empty in the second fixture"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"m3b-colliding-v121"}' \
+    > "$pd2/${archived2##*/}" || { fail "fixture: could not queue the second colliding arrival"; return 0; }
+
+  shim_dir="$base2/nodate-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the shim directory"; return 0; }
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'printf "date: simulated clock failure\\n" >&2\n'
+    printf 'exit 1\n'
+  } > "$shim_dir/date" || { fail "fixture: could not write the date shim"; return 0; }
+  chmod +x "$shim_dir/date" || { fail "fixture: could not make the date shim executable"; return 0; }
+
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  run_brain "$fx2" bravo dm take
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v date)" in
+    "$shim_dir"/*) fail "instrument leak: the date shim is STILL what PATH resolves after the restore"; return 0 ;;
+  esac
+
+  need_file_has "$OUT" "m3b-colliding-v121" \
+    "anchor: the colliding message must be emitted, so the run really reached the collision-bump step" || return 0
+  # NO diagnostic assertion here — see the LIMB B note above [F1 / Q5]. What IS asserted is
+  # must-survive #2 under a fault nothing else in this suite drives: the archive could not even
+  # construct a destination name, and the message must survive that intact and replayable.
+  need_not_lost "$fx2" bravo "m3b-colliding-v121" \
+    "the message whose archive bump could not be constructed"
+  need_count "$pd2" 1 \
+    "pending/ after an archive that could not construct a collision name — an emitted-but-unarchived message stays pending and replays (must-survive #2)"
+  need_count "$rd2" 1 \
+    "read/ is unchanged — the earlier transcript is still there and the colliding arrival did not overwrite it"
+}
+
+# V.Q/63 — ruling 6, final clause: "The batch cap on the `dm take` path warns when entries remain
+# — as OPERATOR VISIBILITY, and explicitly NOT as must-survive #4's continuation contract, which
+# stays scoped to the SessionStart emitted context."
+#   SO         this asserts a stderr diagnostic on the TAKE path only. Nothing here says anything
+#              about the emitted context; V.N/50 owns that and is untouched.
+#   CONTROL    a second vault whose backlog drains in one invocation must NOT carry the warn —
+#              without it the alternation could be satisfied by something the take always prints.
+#   REJECTS    today's `cmd_dm_take`, which breaks out of the loop at DM_INJECT_MAX_LINES and
+#              says nothing, so an operator cannot distinguish "drained" from "capped, N left".
+sc_take_batch_cap_warns_when_entries_remain() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending)
+
+  seed=$(plant_message "$fx" bravo "capwarn-seed-v121") \
+    || { fail "prerequisite: could not queue the seed"; return 0; }
+  clone_queued "$seed" 44 "capwarn-" || { fail "fixture: could not mint the backlog"; return 0; }
+  jq -cn '{from:"alpha",to:"bravo",ts:"2026-08-04T12:00:00Z",content:"capwarn-00-marker"}' > "$seed" \
+    || { fail "fixture: could not rewrite the seed body"; return 0; }
+  need_count "$pd" 45 "prerequisite: 45 entries queued" || return 0
+
+  run_brain "$fx" bravo dm take
+  [ "$(count_files "$pd")" -gt 0 ] \
+    || fail "instrument check: the whole 45-entry backlog drained in one take, so there is nothing for the cap to warn about — raise the fixture above the engine's batch cap" || return 0
+  if grep -E '^brain: ' "$ERR" 2>/dev/null | grep -qiE 'remain|more|still'; then
+    : # operator can tell the batch was capped
+  else
+    fail "ruling 6: 'dm take' capped the batch with $(count_files "$pd") entr(y|ies) still queued and emitted no 'brain: ' diagnostic saying so — an operator cannot distinguish 'drained' from 'capped, N left'"
+  fi
+
+  # NEGATIVE CONTROL: a take that drains everything must NOT claim entries remain.
+  fx2=$(make_vault alpha bravo) || fatal "control fixture build failed"
+  seed2=$(plant_message "$fx2" bravo "capctl-seed-v121") \
+    || { fail "control: could not queue the seed"; return 0; }
+  clone_queued "$seed2" 2 "capctl-" || { fail "control: could not mint the small backlog"; return 0; }
+  run_brain "$fx2" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "control: a 3-entry take" || return 0
+  need_count "$(q_dir "$fx2" bravo pending)" 0 "control: a 3-entry backlog drains in one take" || return 0
+  if grep -E '^brain: ' "$ERR" 2>/dev/null | grep -qiE 'remain|more|still'; then
+    fail "instrument check: the 'entries remain' warn fired on a take that drained EVERYTHING — it is matching something the take always prints, so the positive limb above proves nothing"
+  fi
+}
+
+# V.Q/66 — ruling 2, the SECOND undeclared jq dependency (review H3): the preflight "must probe
+# every contract the consume path relies on — including the parse-error code AND the `error()`
+# code". V.Q/56 covers the parse-error code; without this one, an engine that probes only that
+# and hard-codes `error()==5` passes the whole suite while carrying the same class of defect.
+#   INSTRUMENT a shim that remaps ONLY `error()`'s exit code 5 → 7, discriminated on jq's own
+#              stderr (a parse error says "parse error"; `error()` says "error (at …)"), so the
+#              parse-error code stays 5 and this scenario is orthogonal to V.Q/56's.
+#   FIXTURE    a file that is VALID JSON but violates the wire contract (no `content`), so
+#              `_dm_digest`'s own `error("invalid dm object")` fires — the exact call whose exit
+#              convention the classifier depends on — plus a healthy peer.
+#   ⚠ BOTH SPELLINGS ARE PERMITTED, so the OUTCOME is asserted as a disjunction rather than
+#              pinned. The map says "recording OR verifying", and the two diverge here:
+#                · RECORD the probed error() code (7) and classify against it ⇒ the contract
+#                  violator is quarantined and the peer delivers: failed/=1 read/=1 pending/=0.
+#                · VERIFY error()==5, fail to establish it, and fail safe ⇒ EVERYTHING stays
+#                  pending, nothing quarantined: failed/=0 read/=0 pending/=2.
+#              Asserting either one alone would reject an implementation the map allows.
+#   REJECTS    today's third outcome, which is neither: the engine proceeds as if nothing were
+#              wrong — delivers the peer and leaves the contract violator cycling in pending/ as
+#              a TRANSIENT failure, forever, exactly the H2/H3 shape one exit code over.
+sc_probed_error_code_classifies_or_fails_safe() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  planted=$(plant_message "$fx" bravo "errcode-victim-seed-v121") \
+    || { fail "prerequisite: could not queue the victim"; return 0; }
+  run_brain "$fx" alpha dm @bravo "errcode-peer-v121"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: the healthy peer" || return 0
+  # valid JSON, invalid wire object — this is what makes _dm_digest call error(), not parse-fail.
+  jq -cn '{from:"alpha",to:"bravo",ts:"errcode-victim-v121"}' > "$planted" \
+    || { fail "fixture: could not write the contract-violating entry"; return 0; }
+  need_count "$pd" 2 "prerequisite: one contract violator and one healthy peer" || return 0
+
+  shim_dir="$base/jqerr-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the shim directory"; return 0; }
+  # SC2016 is the POINT here — see V.Q/56's identical note.
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf '# A jq whose error() exits 7 while a PARSE error still exits 5. Orthogonal to the\n'
+    printf '# V.Q/56 shim, which moves the parse code and leaves error() alone.\n'
+    printf '_e="%s/jqerr-err.$$"\n' "$base"
+    printf '"%s" "$@" 2>"$_e"\n' "$real_jq"
+    printf '_rc=$?\n'
+    printf 'cat "$_e" >&2 2>/dev/null\n'
+    printf 'if [ "$_rc" = 5 ] && ! grep -q "parse error" "$_e" 2>/dev/null; then _rc=7; fi\n'
+    printf 'rm -f "$_e" 2>/dev/null\n'
+    printf 'exit "$_rc"\n'
+  } > "$shim_dir/jq" || { fail "fixture: could not write the jq shim"; return 0; }
+  chmod +x "$shim_dir/jq" || { fail "fixture: could not make the jq shim executable"; return 0; }
+
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  jq -n 'error("probe")' >/dev/null 2>&1
+  err_rc=$?
+  printf '{' > "$base/parse-probe.json" 2>/dev/null
+  jq -e . "$base/parse-probe.json" >/dev/null 2>&1
+  parse_rc=$?
+  run_brain "$fx" bravo dm take
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*) fail "instrument leak: the jq shim is STILL what PATH resolves after the restore"; return 0 ;;
+  esac
+
+  need_eq "$err_rc" 7 \
+    "instrument check: with the shim on PATH jq's error() must exit 7 — otherwise this scenario says nothing about the error() contract" || return 0
+  need_eq "$parse_rc" 5 \
+    "instrument check: the PARSE-error code must be untouched at 5 — otherwise this is V.Q/56 again, not an independent error()-code scenario" || return 0
+
+  q=$(count_files "$fd"); a=$(count_files "$rd"); p=$(count_files "$pd")
+  if [ "$q" = 1 ] && [ "$a" = 1 ] && [ "$p" = 0 ]; then
+    # RECORDED the probed error() code and classified against it.
+    need_tree_has "$fd" "errcode-victim-v121" "the quarantined file must carry the offending bytes"
+    need_file_has "$OUT" "errcode-peer-v121" "the healthy peer must deliver in the same invocation"
+  elif [ "$q" = 0 ] && [ "$a" = 0 ] && [ "$p" = 2 ]; then
+    # VERIFIED error()==5, could not establish it, failed safe to leave-everything-pending.
+    need_tree_has "$pd" "errcode-victim-v121" "the contract violator must still be queued"
+    need_tree_has "$pd" "errcode-peer-v121" "the healthy peer must still be queued"
+  else
+    fail "ruling 2: with a jq whose error() exits 7, the consume ended at failed/=$q read/=$a pending/=$p, which is NEITHER permitted outcome. The engine proceeded as if nothing were wrong — it delivered the healthy peer and left the contract-violating file cycling in pending/ as a TRANSIENT failure, forever. The map permits RECORDING the probed error() code (quarantine the violator, deliver the peer: failed/=1 read/=1 pending/=0) or VERIFYING it and failing safe (leave everything pending: failed/=0 read/=0 pending/=2) — never silently retrying a verdict it never established"
+  fi
+}
+
+# V.Q/64 — the review's routed coverage gap: `_dm_pending_digest`'s rc 3 — structurally invalid
+# AND the quarantine itself failed. Authority: ruling 1's invariant that quarantine requires
+# PROOF plus v1.2's "leave valid messages retryable indefinitely"; a message that cannot be
+# quarantined must stay in pending/, be diagnosed, and quarantine later once failed/ is writable.
+#   INSTRUMENT `make_readonly_dir` — the existing helper, which carries its own root/blind control.
+#              The mode is restored BEFORE any assertion can return early.
+#   ⚠ BASELINE this is a GUARD, not a RED: today's engine already routes rc 3 correctly. It is
+#              added because the pre-PR review routed the limb as UNCOVERED, and the v1.2.1
+#              quarantine widening (ruling 1) sends far more traffic down it.
+sc_unwritable_failed_leaves_invalid_pending() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+
+  planted=$(plant_message "$fx" bravo "rc3-victim-seed-v121") \
+    || { fail "prerequisite: could not queue the victim"; return 0; }
+  run_brain "$fx" alpha dm @bravo "rc3-peer-v121"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: the healthy peer" || return 0
+  printf '%s\n' '{rc3-structurally-invalid-v121' > "$planted" \
+    || { fail "fixture: could not corrupt the victim"; return 0; }
+  need_count "$pd" 2 "prerequisite: one corrupt entry and one healthy peer" || return 0
+
+  make_readonly_dir "$fd"
+  mrc=$?
+  case "$mrc" in
+    0) ;;
+    2) fail "instrument blind: a rename into a 0500 failed/ still succeeds (running as root?)"; return 0 ;;
+    *) fail "fixture: could not make failed/ read-only (rc=$mrc)"; return 0 ;;
+  esac
+  run_brain "$fx" bravo dm take
+  chmod 755 "$fd" 2>/dev/null || true       # restore BEFORE any early return
+  # The unwritable run's stderr must be kept: the retry below overwrites $ERR. [F5]
+  blocked_err="$(dirname "$fx")/rc3-blocked.err"
+  cp "$ERR" "$blocked_err" 2>/dev/null || : > "$blocked_err"
+  blocked_diags=$(grep -E '^brain: ' "$blocked_err" 2>/dev/null | sort -u | wc -l | tr -d ' \n')
+
+  need_tree_has "$pd" "rc3-structurally-invalid-v121" \
+    "a message that could not be quarantined must stay in pending/ — an unwritable failed/ is a system fault, not a licence to destroy the evidence"
+  need_count "$fd" 0 "failed/ while it was unwritable — nothing can have been routed there"
+  need_file_has "$OUT" "rc3-peer-v121" \
+    "the healthy peer must still deliver alongside a message that could not be quarantined (must-survive #3)"
+  # [F5] A bare `stderr contains "brain: "` assertion does NOT pin the quarantine-FAILURE
+  # diagnostic: `_dm_pending_digest` already warns "invalid dm object in <file>" BEFORE any
+  # quarantine is attempted, so deleting the routing failure's own warn would still satisfy it.
+  # Counting DISTINCT `^brain: ` lines separates them without pinning any wording — the
+  # pre-quarantine warn is one line, and the failure must add at least one more.
+  #   LIMITATION, declared: an engine that MERGES both reports into a single line would be
+  #   rejected here. Every existing diagnostic in the engine is a one-line `_warn` per event, so
+  #   that shape is not the house style — but if a GREEN legitimately merges them, challenge this
+  #   assertion rather than contorting the engine.
+  [ "$blocked_diags" -ge 2 ] \
+    || fail "ruling 1's quarantine-requires-proof invariant is unreported: the run that could NOT quarantine emitted $blocked_diags distinct 'brain: ' diagnostic(s), which is only the pre-quarantine 'invalid dm object' warn. The routing FAILURE itself must be reported too, or a message sits in pending/ forever with nothing saying why"
+
+  # retryable: once failed/ is writable the ordinary quarantine happens.
+  run_brain "$fx" bravo dm take
+  # CONTROL for the counter above: a run where quarantine SUCCEEDS still emits at least one
+  # diagnostic, so ">= 2 on the blocked run" is "the failure added a report", not "the engine is
+  # noisy". A zero here would mean the counter is measuring nothing.
+  ok_diags=$(grep -E '^brain: ' "$ERR" 2>/dev/null | sort -u | wc -l | tr -d ' \n')
+  [ "$ok_diags" -ge 1 ] \
+    || fail "instrument check: a run whose quarantine SUCCEEDED emitted no 'brain: ' diagnostic at all, so the distinct-line counter above is not measuring the engine's reporting"
+  need_count "$fd" 1 "failed/ after failed/ became writable again — the quarantine must be retried, not abandoned"
+  need_tree_has "$fd" "rc3-structurally-invalid-v121" "the retried quarantine must carry the offending bytes"
+  need_count "$pd" 0 "pending/ after the retry"
+  need_count "$rd" 1 "read/ — exactly the one healthy peer, archived on the first pass"
+}
+
+# V.Q/65 — M1 (the fork-free empty-queue path). v1.1 paid ZERO DM jq forks on an empty-queue boot
+# (`[ -n "$_dt_claims" ] || return 0` at 503519b); v1.2 runs `_dm_jq_preflight` BEFORE any
+# emptiness check, so with a broken jq the warn fires on every boot with nothing to digest —
+# permanently polluting .hook-errors.log and tripping cmd_status's banner — and `dm take` on an
+# empty queue returns 1 where v1.1 returned 0.
+#   INSTRUMENT the same wholly-broken jq shim shape as V.N/53. It is OBSERVABLE evidence of the
+#              fork: if the empty path never consults jq, a broken jq cannot be noticed.
+#   PRECISION  the engine has exactly TWO warnings mentioning jq (bin/brain:528 and :1189), both
+#              of them this preflight, so "no jq in the diagnostics" is an exact test.
+#   COVERS     both consume paths: `dm take` (stderr + rc contract) and SessionStart (the hook's
+#              stderr lands in .brain/.hook-errors.log, which is what cmd_status's banner reads).
+sc_empty_queue_does_not_consult_jq() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  run_brain "$fx" bravo inbox
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: brain inbox ensures the queue tree" || return 0
+  need_count "$(q_dir "$fx" bravo pending)" 0 "prerequisite: the queue is empty" || return 0
+  before_loglines=$(line_count "$hooklog")
+
+  shim_dir="$base/absent-jq-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the shim directory"; return 0; }
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'printf "jq: simulated incompatible build\\n" >&2\n'
+    printf 'exit 3\n'
+  } > "$shim_dir/jq" || { fail "fixture: could not write the jq shim"; return 0; }
+  chmod +x "$shim_dir/jq" || { fail "fixture: could not make the jq shim executable"; return 0; }
+
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  run_brain "$fx" bravo dm take
+  take_rc=$?
+  take_err="$base/m1-take.err"
+  cp "$ERR" "$take_err" 2>/dev/null || : > "$take_err"
+  take_out_bytes=$(byte_size "$OUT")
+  run_brain "$fx" bravo hook session-start
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*) fail "instrument leak: the jq shim is STILL what PATH resolves after the restore"; return 0 ;;
+  esac
+  jq -e -n '1' >/dev/null 2>&1 \
+    || { fail "instrument leak: the broken-jq shim survived the restore — every later scenario would be poisoned"; return 0; }
+
+  need_rc "$take_rc" 0 \
+    "M1: 'dm take' on an EMPTY queue must return 0 as it did in v1.1 — the rc contract of a no-op must not change with a dependency the no-op never needs"
+  need_eq "$take_out_bytes" 0 "stdout bytes from an empty take"
+  need_file_lacks "$take_err" "jq" \
+    "M1: an empty queue must not consult jq at all — the preflight runs BEFORE any emptiness check, so a broken jq warns on every no-op"
+  added=$(( $(line_count "$hooklog") - before_loglines ))
+  if [ "$added" -gt 0 ]; then
+    need_file_lacks "$hooklog" "jq" \
+      "M1 on the boot path: an empty-queue SessionStart logged a jq diagnostic into .brain/.hook-errors.log — that pollutes the log permanently and trips cmd_status's banner on a lane with no mail"
+  fi
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
-printf 'brain lane-DM v1.2 RED suite (claim layer deleted)\n'
+printf 'brain lane-DM v1.2 RED suite (claim layer deleted) + v1.2.1 contract addendum\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
 printf '  scratch: %s\n\n' "$SUITE_TMP"
 
@@ -2452,6 +3346,19 @@ scenario guard "V.N/51  occupied-read-dest-preserved"        sc_occupied_read_de
 scenario red   "V.N/52  message-id-exposed-in-digest"        sc_message_id_exposed_in_digest
 scenario red   "V.N/53  global-dep-failure-leaves-pending"   sc_global_dependency_failure_leaves_everything_pending
 scenario red   "V.N/54  failed-dest-collision-preserves"     sc_failed_dest_collision_preserves_record
+
+scenario red   "V.Q/55  nonregular-entries-quarantined"      sc_nonregular_entries_quarantined_not_starving
+scenario red   "V.Q/56  probed-parse-error-quarantines"      sc_probed_parse_error_code_still_quarantines
+scenario red   "V.Q/57  unestablishable-jq-leaves-pending"   sc_unestablishable_jq_leaves_everything_pending
+scenario red   "V.Q/58  whitespace-queue-name-rejected"      sc_whitespace_queue_name_rejected
+scenario red   "V.Q/59  no-archive-without-emit"             sc_no_message_archived_that_was_not_emitted
+scenario red   "V.Q/60  inherited-id-ts-cannot-escape"       sc_inherited_id_ts_cannot_escape_pending
+scenario red   "V.Q/61  failed-clock-mints-no-bad-id"        sc_failed_clock_mints_no_malformed_id
+scenario red   "V.Q/62  collision-anomalies-diagnosed"       sc_collision_anomalies_are_diagnosed
+scenario red   "V.Q/63  take-batch-cap-warns"                sc_take_batch_cap_warns_when_entries_remain
+scenario guard "V.Q/64  unwritable-failed-leaves-pending"    sc_unwritable_failed_leaves_invalid_pending
+scenario red   "V.Q/65  empty-queue-does-not-consult-jq"     sc_empty_queue_does_not_consult_jq
+scenario red   "V.Q/66  probed-error-code-or-fail-safe"      sc_probed_error_code_classifies_or_fails_safe
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'
