@@ -39,8 +39,8 @@ seam map; its entry was never added here.)
 - **`.tmp-*` is the only sanctioned hidden namespace (ruling 12).** Any other dot-prefixed
   child of `pending/` (`.poison`, `.DS_Store`, hostile symlinks) is enumerated and classified
   via the ruling-1 path (grammar-invalid → quarantine) instead of being invisible forever.
-- **Suite: 79 scenarios** (V.R/67-75 + V.U/76-79 added; each fix round RED-proven by A/B
-  against its pre-fix engine),
+- **Suite: 85 scenarios** (V.R/67-75, V.U/76-79, V.V/80-85 added; each fix round RED-proven
+  by A/B against its pre-fix engine),
   declared gap [Q6] for the scanner-internal TOCTOU witnesses, and the jq re-probe is now
   genuinely driven (an in-place-overwriting PATH shim; stub-flip verified). Mutation probe
   re-anchored; M8/MQ1 kill sets strengthened.

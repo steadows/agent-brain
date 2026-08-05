@@ -6,7 +6,7 @@ standalone map commit in `.context/seams/dm-v1.1-queue.md`. Suite at **85 scenar
 dash**; mutation probe 16/16, tree byte-restored; each fix round RED-proven by A/B against
 the pre-fix engine. Gates this arc: /simplify (4-angle) → /steadows-code-review (5-agent +
 verified-claims filter) → single-agent Codex adversarial sweeps at max (one per round; final
-convergence sweep on `fe1a329` recorded in `docs/reviews/`).
+convergence sweeps recorded in `docs/reviews/lane-dm-v122-convergence-sweeps.md`).
 **Next: Phase 5 deploy** (Steve's explicit go, separate from any plan approval), then P6
 live e2e → 7.3 PR (Steve clicks) → 7.G.
 **Owner:** @pm · **Repo:** `~/agent-brain` (branch `fix/pretool-collision-warning`) → deployed to `<main-worktree>/.brain/`
