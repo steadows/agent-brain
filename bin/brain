@@ -442,8 +442,18 @@ _dm_new_id() { # <lane>
 _dm_write_json() { # <from> <to> <msg> <ts>
   _dm_resolve_jq || return 1
   # shellcheck disable=SC2016  # jq source; $f/$t/$ts/$c are jq variables
-  "$_DM_JQ_BIN" -cn --arg f "$1" --arg t "$2" --arg c "$3" --arg ts "$4" \
-    '{from:$f,to:$t,ts:$ts,content:$c}' 2>/dev/null
+  _wj_payload=$("$_DM_JQ_BIN" -cn --arg f "$1" --arg t "$2" --arg c "$3" --arg ts "$4" \
+    '{from:$f,to:$t,ts:$ts,content:$c}' 2>/dev/null) || return 1
+  _wj_valid=1
+  case "$_wj_payload" in \{*) ;; *) _wj_valid=0 ;; esac
+  for _wj_key in '"from"' '"to"' '"ts"' '"content"'; do
+    case "$_wj_payload" in *"$_wj_key"*) ;; *) _wj_valid=0 ;; esac
+  done
+  if [ "$_wj_valid" != 1 ]; then
+    _warn "jq produced an invalid dm send payload ($_DM_JQ_BIN); nothing sent"
+    return 1
+  fi
+  printf '%s\n' "$_wj_payload"
 }
 
 # One message is one JSON object, made visible only by the final same-directory rename.
@@ -674,8 +684,15 @@ _dm_pending_digest() { # <lane> <message-file>
   _pd_digest=$(_dm_digest "$_pd_file" "$_pd_name")
   _pd_digest_rc=$?
   if [ "$_pd_digest_rc" = 0 ]; then
-    _DM_PENDING_DIGEST=$_pd_digest
-    return 0
+    case "$_pd_digest" in
+      \{*'"id":"'"$_pd_name"'"'*)
+        _DM_PENDING_DIGEST=$_pd_digest
+        return 0
+        ;;
+    esac
+    _DM_JQ_SYSTEMIC_FAILURE=1
+    _warn "jq produced an invalid dm digest for @$_pd_lane ($_DM_JQ_BIN); leaving all messages pending"
+    return 1
   fi
   if { [ -n "${_DM_JQ_PARSE_RC:-}" ] && [ "$_pd_digest_rc" = "$_DM_JQ_PARSE_RC" ]; } \
      || { [ -n "${_DM_JQ_ERROR_RC:-}" ] && [ "$_pd_digest_rc" = "$_DM_JQ_ERROR_RC" ]; }; then
@@ -914,10 +931,14 @@ cmd_status() {
   # Structurally invalid messages are quarantined but never silent or auto-deleted. The -d gate
   # keeps the common no-failures boot from paying a subshell fork just to hear "0".
   if [ -n "$_me" ] && [ -d "$BRAIN/dm/$_me/failed" ]; then
-    _failed_count=$(_dm_failed_count "$_me" 2>/dev/null) || _failed_count=0
-    [ "$_failed_count" -gt 0 ] 2>/dev/null && \
-      printf '\n⚠ %s DM message(s) failed structural validation — inspect .brain/dm/%s/failed/\n' \
-        "$_failed_count" "$_me"
+    if _failed_count=$(_dm_failed_count "$_me" 2>/dev/null); then
+      [ "$_failed_count" -gt 0 ] 2>/dev/null && \
+        printf '\n⚠ %s DM message(s) failed structural validation — inspect .brain/dm/%s/failed/\n' \
+          "$_failed_count" "$_me"
+    else
+      printf '\n⚠ DM failed/ state cannot be inspected for @%s — check .brain/dm/%s/failed/\n' \
+        "$_me" "$_me"
+    fi
   fi
 
   # recent journal lines relevant to me
@@ -1355,13 +1376,17 @@ _emit_session_ctx() {
     '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}' 2>/dev/null \
     || printf '%s\n' "$1"
 }
-_emit_session_ctx_pinned() {
+_emit_session_ctx_pinned() { # <context> [staged-message-name...]
   [ -n "${_DM_JQ_BIN:-}" ] || return 1
+  _ep_context=$1; shift
   # shellcheck disable=SC2016  # jq source; $c is a jq variable
-  _esc_payload=$("$_DM_JQ_BIN" -n --arg c "$1" \
+  _esc_payload=$("$_DM_JQ_BIN" -n --arg c "$_ep_context" \
     '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}' 2>/dev/null) \
     || return 1
-  [ -n "$_esc_payload" ] || return 1
+  case "$_esc_payload" in \{*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
+  if [ "$#" -gt 0 ]; then
+    case "$_esc_payload" in *"$1"*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
+  fi
   printf '%s\n' "$_esc_payload"
 }
 _emit_pretool() { # <decision: allow|ask> <text>
@@ -1468,7 +1493,7 @@ ${_continue_dm}
 
 $_st"
   if [ "$#" -gt 0 ]; then
-    _emit_session_ctx_pinned "$_session_ctx"
+    _emit_session_ctx_pinned "$_session_ctx" "$@"
     _emit_rc=$?
   else
     _emit_session_ctx "$_session_ctx"
@@ -1484,7 +1509,7 @@ $_st"
         || _warn "one or more DMs were emitted but could not be archived; they remain pending and may replay"
     fi
   else
-    _warn "could not emit SessionStart context; DMs remain pending and replayable"
+    _warn "could not emit SessionStart context with ${_DM_JQ_BIN:-<unresolved>}; DMs remain pending and replayable"
   fi
   exit 0
 }

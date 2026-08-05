@@ -146,6 +146,8 @@ anchors_ok() {
   _JM_ERROR_RC=$?
       bounded($field_max) | tojson
           id: $id
+      \{*'"id":"'"$_pd_name"'"'*)
+    case "$_esc_payload" in *"$1"*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
 _dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
     _dm_route_failed "$_pd_lane" "$_pd_file" "structurally unusable dm queue entry" || return 3
   _warn "dm $_cd_state destination is occupied for $_cd_name; using a collision-safe name"
@@ -281,23 +283,32 @@ probe "M2  emit-before-move     " "V.N/47" "" 2 \
 /could not emit pending dm messages/{n;s@^      return 1$@      _dt_rc=1@;}'
 
 # v1.2.1 ruling 2: the parse-error exit code must be MEASURED on the deployed jq, never assumed.
-# Hard-coding 5 is exactly the H2 defect (jq 1.6 exits 4) and also defeats the fail-safe, since
-# an unestablishable build then looks establishable.
-probe "M3  jq-parse-rc-hardcoded" "V.Q/56 V.Q/57" "" 1 \
-  's@^  _JM_PARSE_RC=\$?$@  _JM_PARSE_RC=5@'
+# Hard-coding 5 is exactly the H2 defect (jq 1.6 exits 4). Ruling 13's digest witness now catches
+# V.Q/57's empty rc-0 digest independently, so this mutant also admits ONLY an empty digest; `{}`
+# still fails and V.U/76 remains the witness's own discrimination. Both defences must fall for the
+# original unestablishable-jq failure to remain observable, just as M2 drops both emit defences.
+probe "M3  jq-parse-rc-hardcoded" "V.Q/56 V.Q/57" "" 2 \
+  's@^  _JM_PARSE_RC=\$?$@  _JM_PARSE_RC=5@
+/^    case "\$_pd_digest" in$/{n;s@^      @      ""|@;}'
 
 # v1.2.1 ruling 2, second contract (review H3): the error() code is a separate undeclared
 # dependency. Hard-coding it leaves the parse-error probe intact, so this is orthogonal to M3.
 probe "M4  jq-error-rc-hardcoded" "V.Q/66" "" 1 \
   's@^  _JM_ERROR_RC=\$?$@  _JM_ERROR_RC=5@'
 
-# Must-survive #8 + the digest JSON pinning: the record must serialize as a JSON object.
+# Must-survive #8 + the digest JSON pinning: retain a real object and exact id so ruling 13's
+# cheap witness passes, but move the four wire fields under prose. Only the three structural
+# digest scenarios should notice; the old bare-prose mutant now fails systemically everywhere.
 probe "M5  prose-digest         " "V.W/26 V.W/27 V.W/28" "" 1 \
-  's@^      bounded(\$field_max) | tojson$@      bounded($field_max) | "from=\\(.from) to=\\(.to) ts=\\(.ts) content=\\(.content) id=\\(.id)"@'
+  's@^      bounded(\$field_max) | tojson$@      bounded($field_max) | {id: .id, text: "from=\\(.from) to=\\(.to) ts=\\(.ts) content=\\(.content)"} | tojson@'
 
-# Must-survive #8: drop the stable ID from the rebuilt record.
-probe "M6  digest-drops-id      " "V.N/52" "" 1 \
-  's@^          id: \$id$@          id: ""@'
+# Must-survive #8: drop the stable ID from the rebuilt record. The digest and envelope witnesses
+# are relaxed only to require some `id` text so `{}` still dies in V.U/76 and V.U/77; this keeps
+# the legacy mutant focused on V.N/52 without weakening either new witness declaration.
+probe "M6  digest-drops-id      " "V.N/52" "" 3 \
+  's@^          id: \$id$@          id: ""@
+/^    case "\$_pd_digest" in$/{n;s@^      .*@      [{]*id*)@;}
+/^  if \[ "\$#" -gt 0 \]; then$/{n;s@^    case .*@    case "$_esc_payload" in *id*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac@;}'
 
 # Must-survive #6: the wire caps are BYTE caps (utf8bytelength), not code-point counts. Both
 # source sites move together — the shared measurement used by preflight/re-probe, plus digest —
