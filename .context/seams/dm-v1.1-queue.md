@@ -567,3 +567,26 @@ emitted context (adjudicated: "the emitted context" is that payload's term of ar
   broadcast at next boot).
 - **Watch-then-drain** (the sweep's M9 fix for the stale `_more_dm` snapshot): a protocol change
   touching every lane's boot behavior, deferred to its own arc rather than folded into a fix round.
+
+## 1a. Clarification — the batch cap bounds ENTRIES EXAMINED, not lines emitted
+
+Ruling 1's phrasing ("consumed a batch slot but was classified transient") was read during the RED
+audit as an argument that a rejected entry should *not* consume a slot. That was never the intent,
+and the ambiguity is closed here rather than left for an implementer to resolve by taste.
+
+**`DM_INJECT_MAX_LINES` bounds the number of `pending/` entries a single invocation EXAMINES.**
+Quarantining is work; an entry that is inspected and rejected has consumed its slot. Both consume
+paths already behave this way — this is a clarification, not a behaviour change, and an
+implementation that switches the counter to increment only on successful digest is **out of
+contract**.
+
+Rationale: must-survive #4 says "process at most K entries," and the aggregate output bound is a
+*separate* cap. Making the counter track emitted lines would let a queue full of rejected entries
+drive unbounded inspection work in one invocation — reintroducing, in a new shape, exactly the
+denial-of-delivery that ruling 1 exists to close. The starvation bug was never that bad entries
+consumed slots; it was that they were never *removed*.
+
+Corollary for the suite: a scenario whose outcome depends on this accounting is contingent, not
+robust. Fixtures that need "entries remain past the cap" must carry a margin that holds under
+either policy (measured during the v1.2.1 RED audit: a zero-margin fixture false-reds under the
+non-consuming policy).
