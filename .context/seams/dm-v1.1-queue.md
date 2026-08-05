@@ -711,3 +711,44 @@ structurally invalid names). `.tmp-*` stays excluded everywhere by name. Accepte
 queue holding only a foreign dot entry is NOT empty — it pays one classification pass (including
 the jq preflight fork cost) exactly once, then the queue is genuinely empty again; macOS
 `.DS_Store` churn is bounded, visible in `failed/`, and preferable to an invisible resident.
+
+# v1.2.4 — ADDENDUM: success status is necessary, not sufficient — and the trust boundary, stated
+
+**Status: proposed by @pm from final-sweep round 2 (`docs/prompts/dm-v122-final-sweep-r2.md`,
+single-agent Codex at max; all findings verified against the code by the orchestrator).**
+Standalone map commit ahead of implementation.
+
+## 13. Payload-bearing dependency calls gate on cheap structural witnesses — and full output
+## verification is DECLARED OUT
+
+A jq that answers every probe correctly and then returns `{}` with status 0 on payload calls
+defeats rulings 9/10 as shipped: rc-0 digests are accepted unvalidated (a healthy message is
+archived after emitting `{}`), and the send path publishes-and-journals an empty wire object.
+
+**Ruling:** a zero exit status on a payload-bearing call is provisional until a cheap
+structural witness holds — witnesses chosen to be POSIX-`case` checkable, byte-safe, and
+derived from values the ENGINE already knows are glob-safe:
+- a digest must be non-empty, `{`-prefixed, and contain `"id":"<message-name>"` (the name is
+  grammar-checked digits/stamp — safe in a `case` pattern);
+- the SessionStart envelope must be non-empty and object-shaped, and when DMs are staged it
+  must contain the staged digest block's first message id;
+- the send encoder's output must be non-empty, object-shaped, and contain all four field
+  keys (`"from"`,`"to"`,`"ts"`,`"content"`), else the send FAILS with no delivery journal line.
+A failed witness is treated exactly like a systemic dependency failure: leave pending /
+fail the send, warn once naming the binary.
+
+**Trust boundary, stated for the record:** these witnesses close the named rc-0/`{}` attacks
+and every accidental-breakage shape (truncated output, empty output, wrong-object output).
+A binary that passes the probed contract AND forges well-shaped payloads (correct id, four
+keys, plausible values) is indistinguishable from jq by any check short of re-implementing
+JSON in shell — and an attacker who can install such a binary on PATH already executes code
+as this user. That adversary is OUT of this subsystem's threat model, by decision, here.
+Findings that require it are answered by this paragraph, not by new apparatus.
+
+## 14. An uninspectable failed/ is a banner, never a zero
+
+`cmd_status` maps every `_dm_failed_count` failure to 0 and discards its diagnostics — the
+quarantine becomes invisible exactly when `failed/` is unreadable or malformed (the same
+fail-open shape ruling 7 banned on the consume path). **Ruling:** enumeration/validation
+failure on the status path surfaces an explicit "DM failed/ state cannot be inspected"
+banner; zero is reserved for a PROVEN-empty failed/.
