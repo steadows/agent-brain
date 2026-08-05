@@ -665,3 +665,49 @@ has code execution as that user, so this is not the sharpest threat in the model
 anyway because the *fail-safe direction* is what makes it cheap: pinning costs one resolution and
 converts a silent misclassification into a leave-pending, and quarantine is the one irreversible
 transition in the queue.
+
+# v1.2.3 — ADDENDUM: the emit is part of the operation, and the queue has exactly one hidden namespace
+
+**Status: proposed by @pm from the v1.2.2 pre-PR adversarial sweep
+(`docs/prompts/dm-v122-adversarial-review.md`, single-agent Codex at max, sandbox-blocked from
+runtime verification — all three findings verified against the code by the orchestrator before
+acceptance).** Standalone map commit ahead of implementation, per the architecture-first lock.
+
+## 10. Ruling 9 extends to the emit: archive only follows a verified, pinned delivery
+
+`_emit_session_ctx` re-resolves bare `jq` after digestion, and its raw-text fallback makes the
+emit gate nearly always "succeed" — so a jq that exits 0 while emitting nothing gets every
+collected message archived without having been delivered. That is UR-1's loss class through the
+emit door, and it violates both ruling 9 (the binary that emits is not provably the binary that
+was probed) and the emit-before-move invariant the v1.1 rewrite exists to protect.
+
+**Ruling:** the SessionStart serialization uses the operation-pinned `$_DM_JQ_BIN`; the payload
+is staged and verified NON-EMPTY before a single checked write; archive happens only after that
+write succeeds. A zero-byte or failed emit leaves every message pending and warns once. The
+raw-text fallback remains only for the no-DM nudge path, where nothing is archived on its
+strength.
+
+## 11. A collision candidate is re-checked against the byte cap at every suffix
+
+`_dm_collision_dest` checks the first candidate's length once, then appends `-<n>` unchecked; a
+candidate at the cap becomes overlong on its first bump, the existence probe reads the overlong
+path as free, and the quarantine `mv` fails — a proven-invalid entry stays pending. **Ruling:**
+every candidate variant, including counter suffixes, is validated against
+`DM_FILENAME_MAX_BYTES` before use; when the next suffix would exceed the cap, switch to the
+compact checksum form with headroom reserved for the counter. The final destination basename is
+always within the cap by construction.
+
+## 12. Dot-prefixed entries: `.tmp-*` is the ONLY sanctioned hidden namespace
+
+Every queue scan uses `dir/*`, which POSIX-hides dot entries. `.tmp-*` hiding is LOAD-BEARING —
+it is the atomic-send staging namespace, and a concurrent consumer that classified a mid-write
+temp would break send atomicity. But any OTHER dot entry (`.poison`, `.DS_Store`, a hostile
+symlink) is today invisible forever: never delivered, never quarantined, no diagnostic, and the
+queue reads "empty" around it — ruling 1's classification promise silently does not apply to it.
+
+**Ruling:** hidden children other than `.` / `..` / `.tmp-*` are enumerated and routed through
+ruling 1's existing classification (they can never satisfy the id grammar, so they quarantine as
+structurally invalid names). `.tmp-*` stays excluded everywhere by name. Accepted consequence: a
+queue holding only a foreign dot entry is NOT empty — it pays one classification pass (including
+the jq preflight fork cost) exactly once, then the queue is genuinely empty again; macOS
+`.DS_Store` churn is bounded, visible in `failed/`, and preferable to an invisible resident.
