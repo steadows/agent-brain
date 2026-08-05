@@ -578,6 +578,34 @@ make_readonly_dir() {
   return 0
 }
 
+# make_unreadable_dir <dir> — chmod 0300 (write+search, no read) plus both sides of the
+# permission instrument: an exact child path must still resolve while the ordinary glob must
+# not enumerate it. The probe is removed by exact path before returning, while search is live.
+# Returns 0 (instrument live), 1 (fixture error), 2 (instrument blind, e.g. running as root).
+make_unreadable_dir() {
+  _mu_d=$1
+  mkdir -p "$_mu_d" || return 1
+  _mu_probe="$_mu_d/permission-probe-$$"
+  : > "$_mu_probe" || return 1
+  chmod 300 "$_mu_d" || { rm -f "$_mu_probe" 2>/dev/null; return 1; }
+  if [ ! -e "$_mu_probe" ]; then
+    chmod 755 "$_mu_d" 2>/dev/null
+    return 2
+  fi
+  _mu_seen=0
+  for _mu_f in "$_mu_d"/*; do
+    [ -e "$_mu_f" ] || [ -L "$_mu_f" ] || continue
+    _mu_seen=1
+    break
+  done
+  rm -f "$_mu_probe" 2>/dev/null || { chmod 755 "$_mu_d" 2>/dev/null; return 1; }
+  if [ "$_mu_seen" = 1 ]; then
+    chmod 755 "$_mu_d" 2>/dev/null
+    return 2
+  fi
+  return 0
+}
+
 # plant_message <repo> <lane> <marker> — send a REAL message from alpha carrying <marker>, then
 # print the path of the file the engine queued for it.
 #
@@ -3282,6 +3310,283 @@ sc_empty_queue_does_not_consult_jq() {
   fi
 }
 
+# V.R/67 — v1.2.2 ruling 7: enumeration failure is operation-fatal, never "empty" or "free".
+# A 0300 state directory is searchable by exact path but cannot be enumerated. Each state is
+# exercised against all three queue operations: mint, live take, and SessionStart consumption.
+# The helper's positive control proves this is the ruling's exact permission shape, not a generic
+# access failure. Permissions are restored before any assertion can return early.
+sc_unreadable_state_is_operation_fatal() {
+  for state in pending read failed; do
+    fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+    base=$(dirname "$fx")
+    pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+    state_dir=$(q_dir "$fx" bravo "$state")
+    hooklog="$fx/.brain/.hook-errors.log"
+    marker="unreadable-$state-survivor-v122"
+
+    run_brain "$fx" alpha dm @bravo "$marker"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue the $state-state survivor" || return 0
+    need_count "$pd" 1 "prerequisite: exactly one survivor is pending" || return 0
+    before_hook=$(line_count "$hooklog")
+
+    make_unreadable_dir "$state_dir"
+    mrc=$?
+    case "$mrc" in
+      0) ;;
+      2) fail "instrument blind: a 0300 $state/ directory is still enumerable (running as root?)"; return 0 ;;
+      *) fail "fixture: could not make $state/ unreadable-but-searchable (rc=$mrc)"; return 0 ;;
+    esac
+
+    run_brain "$fx" alpha dm @bravo "must-not-mint-through-unreadable-$state-v122"
+    send_rc=$?
+    send_err="$base/unreadable-$state-send.err"
+    cp "$ERR" "$send_err" 2>/dev/null || : > "$send_err"
+
+    run_brain "$fx" bravo dm take
+    take_rc=$?
+    take_err="$base/unreadable-$state-take.err"
+    cp "$ERR" "$take_err" 2>/dev/null || : > "$take_err"
+
+    run_brain "$fx" bravo hook session-start
+    hook_out="$base/unreadable-$state-hook.out"
+    cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+
+    chmod 755 "$state_dir" 2>/dev/null \
+      || fatal "could not restore permissions on disposable $state/ fixture"
+    hook_added="$base/unreadable-$state-hook-added.err"
+    tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+    need_rc_nonzero "$send_rc" \
+      "ruling 7 mint with unreadable $state/ — an unenumerable id state must never be reported free"
+    need_file_has "$send_err" "brain:" \
+      "ruling 7 mint with unreadable $state/ must diagnose the unestablishable queue state"
+    need_rc_nonzero "$take_rc" \
+      "ruling 7 dm take with unreadable $state/ — the operation must abort, not report success or empty"
+    need_file_has "$take_err" "brain:" \
+      "ruling 7 dm take with unreadable $state/ must emit a diagnostic"
+    need_file_has "$hook_added" "brain:" \
+      "ruling 7 SessionStart with unreadable $state/ must log a diagnostic instead of treating the queue as empty"
+    need_file_lacks "$hook_out" "$marker" \
+      "SessionStart must not consume while any queue state is unestablishable"
+    need_count "$pd" 1 \
+      "pending/ after mint, take, and SessionStart encountered unreadable $state/ — only the original survivor may remain"
+    need_tree_has "$pd" "$marker" \
+      "the original message must stay pending while $state/ cannot be enumerated"
+    need_tree_lacks "$pd" "must-not-mint-through-unreadable-$state-v122" \
+      "the mint attempted through unreadable $state/ must not create a queue entry"
+    need_count "$rd" 0 "read/ while $state/ was unestablishable"
+    need_count "$fd" 0 "failed/ while $state/ was unestablishable"
+  done
+}
+
+# V.R/68 — v1.2.2 ruling 8: a path is an opaque byte string and never crosses `$( )`.
+# The non-regular pending basename ends in a literal newline while failed/ contains its truncated
+# twin. Command substitution strips that newline, making today's caller re-check the wrong,
+# occupied path and retain the unusable entry forever. The compliant destination is the exact
+# newline-bearing name, which is free and must arrive as the same directory entry.
+sc_trailing_newline_path_reaches_quarantine() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+
+  run_brain "$fx" alpha dm @bravo "newline-path-peer-v122"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: queue the healthy peer" || return 0
+
+  truncated_name='00000001T000000Z-68'
+  newline_name="$truncated_name
+"
+  mkdir "$pd/$newline_name" \
+    || { fail "fixture: could not plant the trailing-newline directory entry"; return 0; }
+  printf 'EARLIER-TRUNCATED-TWIN-v122\n' > "$fd/$truncated_name" \
+    || { fail "fixture: could not occupy the truncated failed/ twin"; return 0; }
+  before_twin=$(byte_size "$fd/$truncated_name")
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+
+  need_rc "$rc" 0 \
+    "ruling 8 take — quarantining a trailing-newline pathname must not fail on its occupied truncated twin"
+  need_file_has "$OUT" "newline-path-peer-v122" \
+    "the healthy peer behind the non-regular entry must deliver in the same invocation"
+  need_file "$fd/$truncated_name" "the occupied truncated failed/ twin"
+  need_file_has "$fd/$truncated_name" "EARLIER-TRUNCATED-TWIN-v122" \
+    "the occupied truncated twin must remain byte-intact"
+  need_eq "$(byte_size "$fd/$truncated_name")" "$before_twin" \
+    "the occupied truncated twin's byte size"
+  need_real_dir "$fd/$newline_name" \
+    "the quarantined directory entry under its byte-exact trailing-newline basename"
+  need_file_absent "$pd/$newline_name" \
+    "the trailing-newline entry must not remain pending forever"
+  need_count "$fd" 2 "failed/ — the old twin plus the byte-distinct quarantined entry"
+  need_count "$pd" 0 "pending/ after the peer and unusable entry are processed"
+  need_count "$rd" 1 "read/ — exactly the healthy peer is archived"
+}
+
+# V.R/69 — v1.2.2 ruling 9: resolve jq once per consume operation and invoke that exact path
+# throughout. The first PATH entry passes every probe, then removes itself during the final
+# preflight call; an unpinned engine re-resolves the next PATH entry, whose digest failure copies
+# the measured parse-error status and falsely quarantines a healthy message. No counter or
+# cross-process coordination is used: the preflight's own distinctive argument triggers the swap.
+sc_jq_identity_is_pinned_for_operation() {
+  for mode in take hook; do
+    fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+    base=$(dirname "$fx")
+    pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+    marker="jq-swap-$mode-healthy-v122"
+    hooklog="$fx/.brain/.hook-errors.log"
+
+    run_brain "$fx" alpha dm @bravo "$marker"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue the $mode jq-swap victim" || return 0
+    need_count "$pd" 1 "prerequisite: one healthy jq-swap victim" || return 0
+
+    real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+    printf '{' | "$real_jq" -e . >/dev/null 2>&1
+    measured_parse_rc=$?
+    [ "$measured_parse_rc" != 0 ] \
+      || { fail "instrument: real jq parse failure unexpectedly returned success"; return 0; }
+
+    first_dir="$base/jq-first-$mode-bin"
+    next_dir="$base/jq-next-$mode-bin"
+    mkdir -p "$first_dir" "$next_dir" \
+      || { fail "fixture: could not create jq swap directories"; return 0; }
+    # shellcheck disable=SC2016
+    {
+      printf '#!/usr/bin/env sh\n'
+      printf 'case "$*" in *"dm preflight"*) rm -f -- "$0" || exit 97 ;; esac\n'
+      printf 'exec "%s" "$@"\n' "$real_jq"
+    } > "$first_dir/jq" || { fail "fixture: could not write the probed jq shim"; return 0; }
+    {
+      printf '#!/usr/bin/env sh\n'
+      printf 'printf "jq: simulated post-preflight replacement\\n" >&2\n'
+      printf 'exit %s\n' "$measured_parse_rc"
+    } > "$next_dir/jq" || { fail "fixture: could not write the replacement jq shim"; return 0; }
+    chmod +x "$first_dir/jq" "$next_dir/jq" \
+      || { fail "fixture: could not make jq swap shims executable"; return 0; }
+
+    before_hook=$(line_count "$hooklog")
+    saved_path=$PATH
+    PATH="$first_dir:$next_dir:$PATH"; export PATH
+    if [ "$mode" = take ]; then
+      run_brain "$fx" bravo dm take
+      op_rc=$?
+      op_err="$base/jq-swap-take.err"
+      cp "$ERR" "$op_err" 2>/dev/null || : > "$op_err"
+    else
+      run_brain "$fx" bravo hook session-start
+      op_rc=$?
+      op_err="$base/jq-swap-hook.err"
+      tail -n "+$((before_hook + 1))" "$hooklog" > "$op_err" 2>/dev/null || : > "$op_err"
+    fi
+    resolved_after=$(command -v jq)
+    jq -e -n '1' >/dev/null 2>&1
+    replacement_rc=$?
+    PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+    case "$(command -v jq)" in
+      "$first_dir"/*|"$next_dir"/*)
+        fail "instrument leak: a jq swap shim is STILL what PATH resolves after the restore"; return 0 ;;
+    esac
+
+    need_file_absent "$first_dir/jq" \
+      "instrument: the probed jq must remove itself on the final preflight call" || return 0
+    need_eq "$resolved_after" "$next_dir/jq" \
+      "instrument: an unpinned post-preflight jq lookup must resolve the hostile replacement" || return 0
+    need_eq "$replacement_rc" "$measured_parse_rc" \
+      "instrument: the replacement must return the probed parse-error status" || return 0
+
+    if [ "$mode" = take ]; then
+      need_rc_nonzero "$op_rc" \
+        "ruling 9 dm take must fail safe when its pinned jq disappears after preflight"
+    else
+      need_rc "$op_rc" 0 "SessionStart hook wrapper status contract"
+    fi
+    need_file_has "$op_err" "brain:" \
+      "ruling 9 $mode path must diagnose the post-preflight dependency mismatch"
+    need_count "$fd" 0 \
+      "failed/ after the PATH-resolved jq changed — a mismatch is never proof that this healthy message is invalid"
+    need_count "$rd" 0 \
+      "read/ after the pinned jq disappeared before digest"
+    need_count "$pd" 1 \
+      "pending/ after the jq identity changed — fail-safe is leave-pending"
+    need_tree_has "$pd" "$marker" "the healthy message must remain retryable after the jq swap"
+
+    run_brain "$fx" bravo dm take
+    retry_rc=$?
+    need_rc "$retry_rc" 0 "retry with the ordinary jq restored" || return 0
+    need_file_has "$OUT" "$marker" "the healthy message must deliver once jq is stable again"
+    need_count "$pd" 0 "pending/ after the stable-jq retry"
+    need_count "$rd" 1 "read/ after the stable-jq retry"
+    need_count "$fd" 0 "failed/ after the stable-jq retry"
+  done
+}
+
+# V.R/70 — ruling 8's DM-surface sweep: lane identities and recipient slugs become path
+# components, so they also must not cross command substitution. A trailing newline in inherited
+# BRAIN_FEATURE must remain invalid instead of truncating to another lane; likewise a hostile
+# presence basename must not truncate into a valid broadcast destination. Literal multiline
+# assignments preserve the byte under test without using `$( )` in the fixture itself.
+sc_lane_components_never_cross_command_substitution() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  run_brain "$fx" alpha dm @bravo "identity-newline-survivor-v122"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: queue the identity victim" || return 0
+  before_hook=$(line_count "$hooklog")
+
+  bad_identity="bravo
+"
+  run_brain "$fx" "$bad_identity" dm take
+  take_rc=$?
+  take_err="$base/newline-identity-take.err"
+  cp "$ERR" "$take_err" 2>/dev/null || : > "$take_err"
+  run_brain "$fx" "$bad_identity" hook session-start
+  hook_out="$base/newline-identity-hook.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  hook_added="$base/newline-identity-hook.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc_nonzero "$take_rc" \
+    "ruling 8: a trailing-newline BRAIN_FEATURE must remain invalid, not truncate to @bravo"
+  need_file_has "$take_err" "brain:" \
+    "the invalid trailing-newline take identity must be diagnosed"
+  need_file_has "$hook_added" "brain:" \
+    "the invalid trailing-newline SessionStart identity must be diagnosed"
+  need_file_lacks "$hook_out" "identity-newline-survivor-v122" \
+    "SessionStart under a byte-distinct identity must not consume @bravo's message"
+  need_count "$pd" 1 \
+    "@bravo pending/ after take and SessionStart under the byte-distinct identity"
+  need_tree_has "$pd" "identity-newline-survivor-v122" \
+    "@bravo's message must remain pending after the invalid identity attempts"
+  need_count "$rd" 0 "@bravo read/ after the invalid identity attempts"
+
+  run_brain "$fx" bravo dm take
+  rc=$?
+  need_rc "$rc" 0 "retry under the byte-exact @bravo identity" || return 0
+  need_file_has "$OUT" "identity-newline-survivor-v122" \
+    "the intended recipient must still be able to consume the retained message"
+
+  bad_recipient="charlie
+"
+  write_presence "$fx" "$bad_recipient" active \
+    || { fail "fixture: could not plant the trailing-newline presence basename"; return 0; }
+  run_brain "$fx" alpha dm @all "broadcast-newline-recipient-v122"
+  broadcast_rc=$?
+
+  need_rc_nonzero "$broadcast_rc" \
+    "ruling 8: broadcast must report the byte-invalid presence recipient instead of truncating it to @charlie"
+  need_file_absent "$fx/.brain/dm/charlie" \
+    "a trailing-newline presence basename must not create the truncated @charlie queue"
+  need_file_absent "$fx/.brain/dm/$bad_recipient" \
+    "the invalid trailing-newline recipient must not create a queue either"
+  need_count "$pd" 1 "the one valid broadcast recipient must still receive the message"
+  need_tree_has "$pd" "broadcast-newline-recipient-v122" \
+    "the valid peer must receive the partial broadcast"
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
 printf 'brain lane-DM v1.2 RED suite (claim layer deleted) + v1.2.1 contract addendum\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
@@ -3359,6 +3664,10 @@ scenario red   "V.Q/63  take-batch-cap-warns"                sc_take_batch_cap_w
 scenario guard "V.Q/64  unwritable-failed-leaves-pending"    sc_unwritable_failed_leaves_invalid_pending
 scenario red   "V.Q/65  empty-queue-does-not-consult-jq"     sc_empty_queue_does_not_consult_jq
 scenario red   "V.Q/66  probed-error-code-or-fail-safe"      sc_probed_error_code_classifies_or_fails_safe
+scenario red   "V.R/67  unreadable-state-operation-fatal"    sc_unreadable_state_is_operation_fatal
+scenario red   "V.R/68  trailing-newline-path-quarantined"   sc_trailing_newline_path_reaches_quarantine
+scenario red   "V.R/69  jq-identity-pinned-per-operation"    sc_jq_identity_is_pinned_for_operation
+scenario red   "V.R/70  lane-components-byte-opaque"         sc_lane_components_never_cross_command_substitution
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'

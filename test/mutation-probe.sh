@@ -151,9 +151,9 @@ _dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
   _warn "dm $_cd_state destination is occupied for $_cd_name; using a collision-safe name"
   _ni_ts=$(_now_compact) || return 1
   _dm_id_ok "$_ni_id" || return 1
-  _dm_dir_has_entries "$_dt_pending" || return 0
+  case $? in 0) ;; 1) return 0 ;; *) return 1 ;; esac
   _dm_digits_ok "$_io_pid"
-        set -- "$@" "$_pending_name"
+          set -- "$@" "$_pending_name"
   _announce_as "$_from" "dm → @$_to (transcripts: .brain/dm/$_to/)" \
 On activity, consume it by running: \"$BRAIN/bin/brain\" dm take
 ANCHORS
@@ -259,18 +259,18 @@ fi
 #   MEASURED BOTH WAYS: 4 consecutive runs here killed all 7; re-ordering V.Q/56's two sends so
 #   the peer is queued first makes V.Q/56 survive while the other six still die. So these three
 #   are genuine but CONDITIONAL kills.
-#   RESOLVED by the REQUIRED/PERMITTED split (dispatcher-approved 2026-08-04). The four kills
+#   RESOLVED by the REQUIRED/PERMITTED split (dispatcher-approved 2026-08-04). The five kills
 #   that hold BY CONSTRUCTION are required; the three that hinge on pid layout are permitted:
 #     · V.W/30 and V.N/49 corrupt whatever `first_file` returns, so the poison IS the head entry
 #       whatever it is named;
-#     · V.Q/55's wall is named `00000000T…` and V.Q/58's crafted entry `20260803T…`, both of
-#       which sort ahead of any engine-minted `<today>T…` name for the life of this suite.
+#     · V.Q/55's wall, V.R/68's trailing-newline directory, and V.Q/58's crafted entry have fixed
+#       names that sort ahead of any engine-minted `<today>T…` name for the life of this suite.
 #   The three permitted ones instead corrupt a SPECIFIC planted entry and depend on it sorting
 #   ahead of a peer minted moments later — true here, not guaranteed anywhere.
 #   ⚠ NOTE FOR CI: the inversion is rare on macOS (5-digit pids, wrap at 99999) but much more
 #   likely on Linux with a small pid_max (32768 default), where the counter crosses digit-length
 #   boundaries and wraps often. Do not read a permitted-set survivor as a regression there.
-probe "M1  batch-abort-on-bad   " "V.W/30 V.N/49 V.Q/55 V.Q/58" "V.Q/56 V.Q/57 V.Q/66" 1 \
+probe "M1  batch-abort-on-bad   " "V.W/30 V.N/49 V.Q/55 V.Q/58 V.R/68" "V.Q/56 V.Q/57 V.Q/66" 1 \
   's@^      2) continue ;;$@      2) break ;;@'
 
 # Must-survive #2 (emit before move). BOTH defences must fall: the closed-stdout preflight and
@@ -300,9 +300,9 @@ probe "M6  digest-drops-id      " "V.N/52" "" 1 \
   's@^          id: \$id$@          id: ""@'
 
 # Must-survive #6: the wire caps are BYTE caps (utf8bytelength), not code-point counts. Both
-# sites move together — the preflight's own probe still holds under `length`, so this stays a
-# digest-bound mutant rather than a preflight one.
-probe "M7  codepoint-not-byte   " "V.W/28" "" 2 \
+# sites move together — preflight, its same-executable re-probe, and digest — so this stays a
+# digest-bound mutant rather than a dependency-contract one.
+probe "M7  codepoint-not-byte   " "V.W/28" "" 3 \
   's@utf8bytelength@length@g'
 
 # Must-survive #5: an occupied read/ or failed/ destination must never be clobbered. Reporting
@@ -314,7 +314,7 @@ probe "M8  collision-bump-gone  " "V.N/51 V.N/54 V.Q/62" "" 1 \
 # Ruling 1: a non-regular direct child of pending/ is quarantinable on the same footing as
 # invalid content. Demoting it back to a TRANSIENT failure restores H1's starvation exactly: the
 # entry keeps its batch slot forever and everything behind it is never reached.
-probe "MQ1 nonregular-transient " "V.Q/55" "" 1 \
+probe "MQ1 nonregular-transient " "V.Q/55 V.R/68" "" 1 \
   's@^    _dm_route_failed "\$_pd_lane" "\$_pd_file" "structurally unusable dm queue entry" || return 3$@    return 1@'
 
 # Ruling 4: minted identity is DERIVED, never inherited. Honouring _DM_ID_TS needs the grammar
@@ -333,7 +333,7 @@ probe "MQ3 clock-synthetic-stamp" "V.Q/61" "" 1 \
 # M1 (review): v1.1 paid ZERO jq forks on an empty-queue boot. Removing the emptiness gate makes
 # a broken jq observable on a no-op and flips `dm take`'s rc contract from 0 to 1.
 probe "MQ4 preflight-on-empty   " "V.Q/65" "" 1 \
-  's@^  _dm_dir_has_entries "\$_dt_pending" || return 0$@  :@'
+  's@^  case \$? in 0) ;; 1) return 0 ;; \*) return 1 ;; esac$@  :@'
 
 # Ruling 3(a): the producer grammar admits whitespace again. THIS IS THE DISCRIMINATION PROOF
 # V.Q/59 was allowed to freeze behavioural-only on, and it is meaningful only now that V.Q/59's
