@@ -445,8 +445,8 @@ _dm_write_json() { # <from> <to> <msg> <ts>
   _wj_payload=$("$_DM_JQ_BIN" -cn --arg f "$1" --arg t "$2" --arg c "$3" --arg ts "$4" \
     '{from:$f,to:$t,ts:$ts,content:$c}' 2>/dev/null) || return 1
   _wj_valid=1
-  case "$_wj_payload" in \{*) ;; *) _wj_valid=0 ;; esac
-  for _wj_key in '"from"' '"to"' '"ts"' '"content"'; do
+  case "$_wj_payload" in \{*\}) ;; *) _wj_valid=0 ;; esac
+  for _wj_key in '"from":' '"to":' '"ts":' '"content":'; do
     case "$_wj_payload" in *"$_wj_key"*) ;; *) _wj_valid=0 ;; esac
   done
   if [ "$_wj_valid" != 1 ]; then
@@ -685,7 +685,7 @@ _dm_pending_digest() { # <lane> <message-file>
   _pd_digest_rc=$?
   if [ "$_pd_digest_rc" = 0 ]; then
     case "$_pd_digest" in
-      \{*'"id":"'"$_pd_name"'"'*)
+      \{*'"id":"'"$_pd_name"'"'*\})
         _DM_PENDING_DIGEST=$_pd_digest
         return 0
         ;;
@@ -928,9 +928,10 @@ cmd_status() {
   [ -s "$BRAIN/.hook-errors.log" ] && \
     printf '\n⚠ hook errors logged — see .brain/.hook-errors.log\n'
 
-  # Structurally invalid messages are quarantined but never silent or auto-deleted. The -d gate
-  # keeps the common no-failures boot from paying a subshell fork just to hear "0".
-  if [ -n "$_me" ] && [ -d "$BRAIN/dm/$_me/failed" ]; then
+  # Structurally invalid messages are quarantined but never silent or auto-deleted. Proven
+  # absence keeps the common no-failures boot from paying a subshell fork just to hear "0".
+  if [ -n "$_me" ] &&
+     { [ -e "$BRAIN/dm/$_me/failed" ] || [ -L "$BRAIN/dm/$_me/failed" ]; }; then
     if _failed_count=$(_dm_failed_count "$_me" 2>/dev/null); then
       [ "$_failed_count" -gt 0 ] 2>/dev/null && \
         printf '\n⚠ %s DM message(s) failed structural validation — inspect .brain/dm/%s/failed/\n' \
@@ -1383,9 +1384,9 @@ _emit_session_ctx_pinned() { # <context> [staged-message-name...]
   _esc_payload=$("$_DM_JQ_BIN" -n --arg c "$_ep_context" \
     '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}' 2>/dev/null) \
     || return 1
-  case "$_esc_payload" in \{*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
+  case "$_esc_payload" in \{*\}) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
   if [ "$#" -gt 0 ]; then
-    case "$_esc_payload" in *"$1"*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
+    case "$_esc_payload" in *'\"id\":\"'"$1"'\"'*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
   fi
   printf '%s\n' "$_esc_payload"
 }

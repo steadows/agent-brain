@@ -4,8 +4,8 @@
 # AUTHORITY (in precedence order):
 #   0. .context/seams/dm-v1.1-queue.md, the `# v1.2.2`, `# v1.2.3`, and `# v1.2.4`
 #      CONTRACT ADDENDA — the latest rulings. Rulings 7/8/9 map to section V.R/67-71;
-#      rulings 10/11/12 map to V.R/72-75; rulings 13/14 map to V.U/76-79. Everything they do
-#      not name is unchanged, so items 1-4 below still govern.
+#      rulings 10/11/12 map to V.R/72-75; rulings 13/14 map to V.U/76-79; ruling 13a maps to
+#      V.V/80-85. Everything they do not name is unchanged, so items 1-4 below still govern.
 #   1. .context/seams/dm-v1.1-queue.md, the `# v1.2.1 — CONTRACT ADDENDUM` section
 #      (committed 33efc2d, authorized by Steve). It AMENDS the `# v1.2` section's
 #      "Poison, without a counter" ruling and must-survive items 3 and 6; its six numbered
@@ -635,6 +635,67 @@ write_rc0_empty_payload_jq() {
     printf 'exec "%s" "$@"\n' "$_we_real"
   } > "$_we_dest" || return 1
   chmod +x "$_we_dest"
+}
+
+# write_rc0_truncated_payload_jq <dest> <real-jq> <payload-arg-name>
+# Delegate the selected payload call to real jq in compact form, then remove its final byte while
+# preserving rc 0. A terminal space keeps the caller's command substitution from exposing the
+# nested envelope's preceding `}` after it removes trailing newlines; the removed byte is still
+# exactly real jq's outer closing delimiter.
+write_rc0_truncated_payload_jq() {
+  _wt_dest=$1; _wt_real=$2; _wt_name=$3
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf '_prev=""; _hit=0\n'
+    printf 'for _arg in "$@"; do\n'
+    printf '  if [ "$_prev" = "--arg" ] && [ "$_arg" = "%s" ]; then _hit=1; break; fi\n' "$_wt_name"
+    printf '  _prev=$_arg\n'
+    printf 'done\n'
+    printf 'if [ "$_hit" = 1 ]; then\n'
+    printf '  _payload=$("%s" -c "$@") || exit $?\n' "$_wt_real"
+    printf '  printf "%%s \\n" "${_payload%%?}"\n'
+    printf '  exit 0\n'
+    printf 'fi\n'
+    printf 'exec "%s" "$@"\n' "$_wt_real"
+  } > "$_wt_dest" || return 1
+  chmod +x "$_wt_dest"
+}
+
+# write_rc0_wrong_send_payload_jq <dest> <real-jq>
+# Delegate ordinary calls, but return a framed wrong object for the send encoder payload call.
+write_rc0_wrong_send_payload_jq() {
+  _ww_dest=$1; _ww_real=$2
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf '_prev=""\n'
+    printf 'for _arg in "$@"; do\n'
+    printf '  if [ "$_prev" = "--arg" ] && [ "$_arg" = "f" ]; then\n'
+    printf '    printf '\''{"values":["from","to","ts","content"]}\\n'\''; exit 0\n'
+    printf '  fi\n'
+    printf '  _prev=$_arg\n'
+    printf 'done\n'
+    printf 'exec "%s" "$@"\n' "$_ww_real"
+  } > "$_ww_dest" || return 1
+  chmod +x "$_ww_dest"
+}
+
+# write_status_only_envelope_jq <dest> <real-jq>
+# For the SessionStart serializer only, retain the status tail of additionalContext and drop the
+# staged digest block. This transforms an engine value, not JSON; real jq still serializes it.
+write_status_only_envelope_jq() {
+  _ws_dest=$1; _ws_real=$2
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'if [ "$#" -eq 5 ] && [ "$1" = "-n" ] && [ "$2" = "--arg" ] && [ "$3" = "c" ]; then\n'
+    printf '  _status=$(printf "%%s\\n" "$4" | sed -n '\''/^Active features:/,$p'\'')\n'
+    printf '  exec "%s" -n --arg c "$_status" "$5"\n' "$_ws_real"
+    printf 'fi\n'
+    printf 'exec "%s" "$@"\n' "$_ws_real"
+  } > "$_ws_dest" || return 1
+  chmod +x "$_ws_dest"
 }
 
 # plant_message <repo> <lane> <marker> — send a REAL message from alpha carrying <marker>, then
@@ -4299,6 +4360,281 @@ sc_status_surfaces_uninspectable_failed_state() {
     "restored failed/ state must render its proven positive count"
 }
 
+# ═════════════════ V.V — v1.2.4 ruling 13a witness tightening (RED) ═════════════════
+
+# V.V/80 — X1 digest framing: an rc-0 digest missing its final byte is systemic. The file stays
+# pending, nothing is emitted or archived, one binary-naming warning fires, and retry delivers.
+sc_rc0_truncated_digest_is_systemic() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  marker="rc0-truncated-digest-survivor-v124"
+
+  run_brain "$fx" alpha dm @bravo "$marker"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: queue the truncated-digest victim" || return 0
+
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-truncated-digest-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the digest shim directory"; return 0; }
+  write_rc0_truncated_payload_jq "$shim_dir/jq" "$real_jq" id \
+    || { fail "fixture: could not write the truncated-digest jq shim"; return 0; }
+
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  run_brain "$fx" bravo dm take
+  take_rc=$?
+  take_out="$base/rc0-truncated-digest.out"; take_err="$base/rc0-truncated-digest.err"
+  cp "$OUT" "$take_out" 2>/dev/null || : > "$take_out"
+  cp "$ERR" "$take_err" 2>/dev/null || : > "$take_err"
+  PATH=$saved_path; export PATH
+  case "$(command -v jq)" in
+    "$shim_dir"/*) fail "instrument leak: the digest jq shim is STILL resolved after restore"; return 0 ;;
+  esac
+
+  need_rc_nonzero "$take_rc" "ruling 13a take must fail on a digest lacking its closing delimiter"
+  need_eq "$(byte_size "$take_out")" 0 "stdout from the rejected truncated digest"
+  need_eq "$(grep -c '^brain:' "$take_err" 2>/dev/null)" 1 \
+    "ruling 13a digest framing witness warning count"
+  need_file_has "$take_err" "$shim_dir/jq" "the digest framing warning must name the pinned jq binary"
+  need_count "$pd" 1 "pending/ after the digest framing witness fails"
+  need_tree_has "$pd" "$marker" "the truncated digest victim must remain retryable"
+  need_count "$rd" 0 "read/ after the digest framing witness fails"
+  need_count "$fd" 0 "failed/ after the systemic digest framing failure"
+
+  run_brain "$fx" bravo dm take
+  retry_rc=$?
+  need_rc "$retry_rc" 0 "stable-jq retry after the truncated digest" || return 0
+  need_file_has "$OUT" "$marker" "the retained digest victim must deliver on stable-jq retry"
+  need_count "$pd" 0 "pending/ after the stable-jq digest retry"
+  need_count "$rd" 1 "read/ after the stable-jq digest retry"
+}
+
+# V.V/81 — X1 envelope framing: removing the serializer's final byte cannot authorize emission
+# or archive. The hook stays rc 0, warns once through the hook log, and stable retry delivers.
+sc_rc0_truncated_session_envelope_is_rejected() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+  marker="rc0-truncated-envelope-survivor-v124"
+
+  run_brain "$fx" alpha dm @bravo "$marker"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: queue the truncated-envelope victim" || return 0
+
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-truncated-envelope-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the envelope shim directory"; return 0; }
+  write_rc0_truncated_payload_jq "$shim_dir/jq" "$real_jq" c \
+    || { fail "fixture: could not write the truncated-envelope jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  hook_out="$base/rc0-truncated-envelope.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  PATH=$saved_path; export PATH
+  case "$(command -v jq)" in
+    "$shim_dir"/*) fail "instrument leak: the envelope jq shim is STILL resolved after restore"; return 0 ;;
+  esac
+  hook_added="$base/rc0-truncated-envelope.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with a truncated envelope"
+  need_eq "$(byte_size "$hook_out")" 0 "stdout from the rejected truncated SessionStart envelope"
+  need_eq "$(grep -c '^brain:' "$hook_added" 2>/dev/null)" 1 \
+    "ruling 13a envelope framing witness warning count"
+  need_file_has "$hook_added" "$shim_dir/jq" "the envelope framing warning must name the pinned jq binary"
+  need_count "$pd" 1 "pending/ after the envelope framing witness fails"
+  need_tree_has "$pd" "$marker" "the truncated envelope victim must remain retryable"
+  need_count "$rd" 0 "read/ after the envelope framing witness fails"
+  need_count "$fd" 0 "failed/ after the systemic envelope framing failure"
+
+  run_brain "$fx" bravo hook session-start
+  retry_rc=$?
+  need_rc "$retry_rc" 0 "stable-jq SessionStart retry after the truncated envelope" || return 0
+  need_file_has "$OUT" "$marker" "the retained envelope victim must deliver on stable-jq retry"
+  need_count "$pd" 0 "pending/ after the stable-jq envelope retry"
+  need_count "$rd" 1 "read/ after the stable-jq envelope retry"
+}
+
+# V.V/82 — X1 send framing: direct and @all sends reject a real encoder result with its final
+# byte removed. No queue or journal publication occurs; one warning fires and retry publishes.
+sc_rc0_truncated_send_payload_is_rejected() {
+  for mode in direct broadcast; do
+    fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+    base=$(dirname "$fx")
+    pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+    marker="rc0-truncated-send-$mode-v124"
+    before_journal=$(journal_entry_count "$fx")
+
+    real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+    shim_dir="$base/jq-truncated-send-$mode-bin"
+    mkdir -p "$shim_dir" || { fail "fixture: could not create the $mode send shim directory"; return 0; }
+    write_rc0_truncated_payload_jq "$shim_dir/jq" "$real_jq" f \
+      || { fail "fixture: could not write the truncated $mode send jq shim"; return 0; }
+
+    saved_path=$PATH
+    PATH="$shim_dir:$PATH"; export PATH
+    if [ "$mode" = direct ]; then
+      run_brain "$fx" alpha dm @bravo "$marker"
+    else
+      run_brain "$fx" alpha dm @all "$marker"
+    fi
+    send_rc=$?
+    send_out="$base/rc0-truncated-send-$mode.out"; send_err="$base/rc0-truncated-send-$mode.err"
+    cp "$OUT" "$send_out" 2>/dev/null || : > "$send_out"
+    cp "$ERR" "$send_err" 2>/dev/null || : > "$send_err"
+    PATH=$saved_path; export PATH
+    case "$(command -v jq)" in
+      "$shim_dir"/*) fail "instrument leak: the $mode send jq shim is STILL resolved after restore"; return 0 ;;
+    esac
+
+    need_rc_nonzero "$send_rc" "ruling 13a $mode send must fail without its closing delimiter"
+    need_eq "$(grep -cF "$shim_dir/jq" "$send_err" 2>/dev/null)" 1 \
+      "ruling 13a $mode send framing warning count naming the jq binary"
+    need_file_lacks "$send_out" 'dm →' "the failed $mode send must not claim delivery"
+    need_count "$pd" 0 "pending/ after the rejected truncated $mode send"
+    need_eq "$(count_dotfiles "$pd")" 0 "dot-temp residue after the rejected truncated $mode send"
+    need_count "$rd" 0 "read/ after the rejected truncated $mode send"
+    need_count "$fd" 0 "failed/ after the rejected truncated $mode send"
+    need_eq "$(journal_entry_count "$fx")" "$before_journal" \
+      "journal entry count after the rejected truncated $mode send"
+
+    if [ "$mode" = direct ]; then
+      run_brain "$fx" alpha dm @bravo "$marker"
+    else
+      run_brain "$fx" alpha dm @all "$marker"
+    fi
+    retry_rc=$?
+    need_rc "$retry_rc" 0 "stable-jq retry of the truncated $mode send" || return 0
+    need_count "$pd" 1 "pending/ after the stable-jq $mode send retry"
+    need_tree_has "$pd" "$marker" "the stable-jq $mode send retry must publish the message"
+    need_eq "$(journal_entry_count "$fx")" "$((before_journal + 1))" \
+      "journal entry count after the stable-jq $mode send retry"
+  done
+}
+
+# V.V/83 — X2 key syntax: quoted values are not object keys. Direct and @all both fail before
+# publication and before a delivery journal line when jq returns the framed wrong object.
+sc_send_witness_requires_key_syntax() {
+  for mode in direct broadcast; do
+    fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+    base=$(dirname "$fx")
+    pd=$(q_dir "$fx" bravo pending)
+    marker="wrong-object-send-$mode-v124"
+    before_journal=$(journal_entry_count "$fx")
+
+    real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+    shim_dir="$base/jq-wrong-object-send-$mode-bin"
+    mkdir -p "$shim_dir" || { fail "fixture: could not create the $mode wrong-object shim directory"; return 0; }
+    write_rc0_wrong_send_payload_jq "$shim_dir/jq" "$real_jq" \
+      || { fail "fixture: could not write the $mode wrong-object jq shim"; return 0; }
+
+    saved_path=$PATH
+    PATH="$shim_dir:$PATH"; export PATH
+    if [ "$mode" = direct ]; then
+      run_brain "$fx" alpha dm @bravo "$marker"
+    else
+      run_brain "$fx" alpha dm @all "$marker"
+    fi
+    send_rc=$?
+    send_out="$base/wrong-object-send-$mode.out"; send_err="$base/wrong-object-send-$mode.err"
+    cp "$OUT" "$send_out" 2>/dev/null || : > "$send_out"
+    cp "$ERR" "$send_err" 2>/dev/null || : > "$send_err"
+    PATH=$saved_path; export PATH
+
+    need_rc_nonzero "$send_rc" "ruling 13a $mode send must reject quoted values without key syntax"
+    need_eq "$(grep -cF "$shim_dir/jq" "$send_err" 2>/dev/null)" 1 \
+      "ruling 13a $mode key-syntax warning count naming the jq binary"
+    need_file_lacks "$send_out" 'dm →' "the wrong-object $mode send must not claim delivery"
+    need_count "$pd" 0 "pending/ after the wrong-object $mode send"
+    need_eq "$(count_dotfiles "$pd")" 0 "dot-temp residue after the wrong-object $mode send"
+    need_eq "$(journal_entry_count "$fx")" "$before_journal" \
+      "journal entry count after the wrong-object $mode send"
+  done
+}
+
+# V.V/84 — X3 escaped digest fragment: current_ticket supplies the same bare id in status, but
+# a serializer that drops the DM block must still fail, leave pending intact, and retry cleanly.
+sc_envelope_witness_requires_escaped_digest_id() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+  marker="status-only-envelope-survivor-v124"
+
+  run_brain "$fx" alpha dm @bravo "$marker"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: queue the status-only envelope victim" || return 0
+  pending_file=$(first_file "$pd") \
+    || { fail "fixture: could not resolve the status-only envelope victim"; return 0; }
+  pending_id=${pending_file##*/}
+  presence="$fx/.brain/presence/bravo.md"
+  presence_tmp="$base/bravo-presence.tmp"
+  sed "s/^current_ticket: .*/current_ticket: $pending_id/" "$presence" > "$presence_tmp" \
+    && mv "$presence_tmp" "$presence" \
+    || { fail "fixture: could not set receiver current_ticket to the pending id"; return 0; }
+  run_brain "$fx" bravo status
+  need_file_has "$OUT" "$pending_id" "prerequisite: status text must carry the bare pending id" || return 0
+
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-status-only-envelope-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the status-only shim directory"; return 0; }
+  write_status_only_envelope_jq "$shim_dir/jq" "$real_jq" \
+    || { fail "fixture: could not write the status-only envelope jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  hook_out="$base/status-only-envelope.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  PATH=$saved_path; export PATH
+  hook_added="$base/status-only-envelope.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with the DM block removed"
+  need_eq "$(byte_size "$hook_out")" 0 "stdout from the rejected status-only envelope"
+  need_eq "$(grep -c '^brain:' "$hook_added" 2>/dev/null)" 1 \
+    "ruling 13a escaped-fragment envelope warning count"
+  need_file_has "$hook_added" "$shim_dir/jq" "the escaped-fragment warning must name the pinned jq binary"
+  need_count "$pd" 1 "pending/ after the status-only envelope is rejected"
+  need_tree_has "$pd" "$marker" "the status-only envelope victim must remain retryable"
+  need_count "$rd" 0 "read/ after the status-only envelope is rejected"
+  need_count "$fd" 0 "failed/ after the systemic status-only envelope failure"
+
+  run_brain "$fx" bravo hook session-start
+  retry_rc=$?
+  need_rc "$retry_rc" 0 "stable-jq SessionStart retry after the status-only envelope" || return 0
+  need_file_has "$OUT" "$marker" "the retained status-only envelope victim must deliver on retry"
+  need_count "$pd" 0 "pending/ after the stable-jq status-only retry"
+  need_count "$rd" 1 "read/ after the stable-jq status-only retry"
+}
+
+# V.V/85 — X4 absence-only fast path: an existing failed/ regular file is uninspectable state,
+# not absence, so status must render the explicit cannot-inspect banner.
+sc_status_surfaces_regular_file_failed_state() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  fd=$(q_dir "$fx" bravo failed)
+
+  run_brain "$fx" bravo inbox
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: ensure the failed-state tree" || return 0
+  rmdir "$fd" || { fail "fixture: could not replace failed/ directory"; return 0; }
+  printf 'not-a-directory\n' > "$fd" || { fail "fixture: could not plant failed/ regular file"; return 0; }
+
+  run_brain "$fx" bravo status
+  status_rc=$?
+  need_rc "$status_rc" 0 "brain status with failed/ as a regular file"
+  need_file_has "$OUT" 'DM failed/ state cannot be inspected for @bravo' \
+    "ruling 14 absence-only fast path for an existing failed/ regular file"
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
 printf 'brain lane-DM v1.2 RED suite (claim layer deleted) + v1.2.1-v1.2.4 contract addenda\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
@@ -4389,6 +4725,12 @@ scenario red   "V.U/76  rc0-empty-digest-is-systemic"        sc_rc0_empty_digest
 scenario red   "V.U/77  rc0-empty-envelope-is-rejected"      sc_rc0_empty_session_envelope_is_rejected
 scenario red   "V.U/78  rc0-empty-send-is-rejected"          sc_rc0_empty_send_payload_is_rejected
 scenario red   "V.U/79  uninspectable-failed-status-banner"  sc_status_surfaces_uninspectable_failed_state
+scenario red   "V.V/80  rc0-truncated-digest-is-systemic"    sc_rc0_truncated_digest_is_systemic
+scenario red   "V.V/81  rc0-truncated-envelope-is-rejected" sc_rc0_truncated_session_envelope_is_rejected
+scenario red   "V.V/82  rc0-truncated-send-is-rejected"     sc_rc0_truncated_send_payload_is_rejected
+scenario red   "V.V/83  send-witness-requires-key-syntax"   sc_send_witness_requires_key_syntax
+scenario red   "V.V/84  envelope-needs-escaped-digest-id"   sc_envelope_witness_requires_escaped_digest_id
+scenario red   "V.V/85  regular-file-failed-status-banner"  sc_status_surfaces_regular_file_failed_state
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'

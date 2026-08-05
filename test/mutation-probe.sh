@@ -1,5 +1,5 @@
 #!/bin/sh
-# Mutation probe for the DM v1.2.2 queue engine (including the v1.2.3 contract addendum).
+# Mutation probe for the DM v1.2.2 queue engine (including the v1.2.4 contract addendum).
 #
 # Every mutant breaks ONE load-bearing production mechanism and declares the scenario IDs that
 # must fail. Three properties are load-bearing in the harness itself and are not negotiable:
@@ -146,8 +146,8 @@ anchors_ok() {
   _JM_ERROR_RC=$?
       bounded($field_max) | tojson
           id: $id
-      \{*'"id":"'"$_pd_name"'"'*)
-    case "$_esc_payload" in *"$1"*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
+      \{*'"id":"'"$_pd_name"'"'*\})
+    case "$_esc_payload" in *'\"id\":\"'"$1"'\"'*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
 _dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
     _dm_route_failed "$_pd_lane" "$_pd_file" "structurally unusable dm queue entry" || return 3
   _warn "dm $_cd_state destination is occupied for $_cd_name; using a collision-safe name"
@@ -307,7 +307,7 @@ probe "M5  prose-digest         " "V.W/26 V.W/27 V.W/28" "" 1 \
 # the legacy mutant focused on V.N/52 without weakening either new witness declaration.
 probe "M6  digest-drops-id      " "V.N/52" "" 3 \
   's@^          id: \$id$@          id: ""@
-/^    case "\$_pd_digest" in$/{n;s@^      .*@      [{]*id*)@;}
+/^    case "\$_pd_digest" in$/{n;s@^      .*@      \\{*id*\\})@;}
 /^  if \[ "\$#" -gt 0 \]; then$/{n;s@^    case .*@    case "$_esc_payload" in *id*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac@;}'
 
 # Must-survive #6: the wire caps are BYTE caps (utf8bytelength), not code-point counts. Both
