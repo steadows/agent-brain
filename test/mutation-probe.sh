@@ -1,5 +1,5 @@
 #!/bin/sh
-# Mutation probe for the DM v1.2.1 queue engine.
+# Mutation probe for the DM v1.2.2 queue engine (including the v1.2.3 contract addendum).
 #
 # Every mutant breaks ONE load-bearing production mechanism and declares the scenario IDs that
 # must fail. Three properties are load-bearing in the harness itself and are not negotiable:
@@ -14,7 +14,7 @@
 #      the suite reaches its full summary AND the arithmetic in that summary is self-consistent.
 #   3. ANCHOR MANIFEST. Every line this probe mutates is declared once, up front, and checked
 #      whole-line-exact against the engine BEFORE any mutant runs. The engine has been rewritten
-#      three times since this probe was first written (v1.2 GREEN, /simplify, v1.2.1) and two
+#      four times since this probe was first written (v1.2 GREEN, /simplify, v1.2.1, v1.2.2) and two
 #      anchors had silently died — a probe that cannot apply its mutant is a gate that lies.
 #      Per-mutant, the CHANGED-LINE COUNT is also declared, so an over-broad pattern that happens
 #      to still match is caught as surely as one that matches nothing.
@@ -24,7 +24,7 @@
 #
 # WHAT WAS RETIRED: nothing claim-era survives to retire. The v1.2 ruling deleted claimed/,
 # leases, the .a<k> attempt counter, the poison cap and the sweeper, and the probe was rewritten
-# against v1.2 at that time; this pass re-anchors it to v1.2.1 and adds the new mechanisms.
+# against v1.2 at that time; this pass re-anchors it to v1.2.2 and adds the new mechanisms.
 # Every sed program below is SOURCE TEXT for the engine under mutation: `$field_max`, `$id`,
 # `$_to`, `$@` and friends must survive into the mutant unexpanded, so single quotes are load
 # bearing rather than a mistake. Silenced file-wide because the alternative is one directive per
@@ -142,8 +142,8 @@ anchors_ok() {
       2) continue ;;
   if ! { true >&1; } 2>/dev/null; then
       _warn "could not emit pending dm messages for @$_dt_lane; leaving them pending"
-  _DM_JQ_PARSE_RC=$?
-  _DM_JQ_ERROR_RC=$?
+  _JM_PARSE_RC=$?
+  _JM_ERROR_RC=$?
       bounded($field_max) | tojson
           id: $id
 _dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
@@ -153,7 +153,7 @@ _dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
   _dm_id_ok "$_ni_id" || return 1
   case $? in 0) ;; 1) return 0 ;; *) return 1 ;; esac
   _dm_digits_ok "$_io_pid"
-          set -- "$@" "$_pending_name"
+        set -- "$@" "$_pending_name"
   _announce_as "$_from" "dm → @$_to (transcripts: .brain/dm/$_to/)" \
 On activity, consume it by running: \"$BRAIN/bin/brain\" dm take
 ANCHORS
@@ -284,12 +284,12 @@ probe "M2  emit-before-move     " "V.N/47" "" 2 \
 # Hard-coding 5 is exactly the H2 defect (jq 1.6 exits 4) and also defeats the fail-safe, since
 # an unestablishable build then looks establishable.
 probe "M3  jq-parse-rc-hardcoded" "V.Q/56 V.Q/57" "" 1 \
-  's@^  _DM_JQ_PARSE_RC=\$?$@  _DM_JQ_PARSE_RC=5@'
+  's@^  _JM_PARSE_RC=\$?$@  _JM_PARSE_RC=5@'
 
 # v1.2.1 ruling 2, second contract (review H3): the error() code is a separate undeclared
 # dependency. Hard-coding it leaves the parse-error probe intact, so this is orthogonal to M3.
 probe "M4  jq-error-rc-hardcoded" "V.Q/66" "" 1 \
-  's@^  _DM_JQ_ERROR_RC=\$?$@  _DM_JQ_ERROR_RC=5@'
+  's@^  _JM_ERROR_RC=\$?$@  _JM_ERROR_RC=5@'
 
 # Must-survive #8 + the digest JSON pinning: the record must serialize as a JSON object.
 probe "M5  prose-digest         " "V.W/26 V.W/27 V.W/28" "" 1 \
@@ -300,21 +300,23 @@ probe "M6  digest-drops-id      " "V.N/52" "" 1 \
   's@^          id: \$id$@          id: ""@'
 
 # Must-survive #6: the wire caps are BYTE caps (utf8bytelength), not code-point counts. Both
-# sites move together — preflight, its same-executable re-probe, and digest — so this stays a
-# digest-bound mutant rather than a dependency-contract one.
-probe "M7  codepoint-not-byte   " "V.W/28" "" 3 \
+# source sites move together — the shared measurement used by preflight/re-probe, plus digest —
+# so this stays a digest-bound mutant rather than a dependency-contract one.
+probe "M7  codepoint-not-byte   " "V.W/28" "" 2 \
   's@utf8bytelength@length@g'
 
 # Must-survive #5: an occupied read/ or failed/ destination must never be clobbered. Reporting
 # "never occupied" also silences v1.2.1 ruling 6's bump-taken diagnostic, so V.Q/62 rides along.
-probe "M8  collision-bump-gone  " "V.N/51 V.N/54 V.Q/62" "" 1 \
+# V.R/73 now also requires both occupied witnesses to survive before the compact fallback lands.
+probe "M8  collision-bump-gone  " "V.N/51 V.N/54 V.Q/62 V.R/73" "" 1 \
   's@^_dm_dest_occupied() { \[ -e "\$1" \] || \[ -L "\$1" \]; }$@_dm_dest_occupied() { return 1; }@'
 
 # ── v1.2.1 mechanisms ────────────────────────────────────────────────────────────────────
 # Ruling 1: a non-regular direct child of pending/ is quarantinable on the same footing as
 # invalid content. Demoting it back to a TRANSIENT failure restores H1's starvation exactly: the
 # entry keeps its batch slot forever and everything behind it is never reached.
-probe "MQ1 nonregular-transient " "V.Q/55 V.R/68" "" 1 \
+# V.R/73's near-NAME_MAX directory is the same proven non-regular class and must also be routed.
+probe "MQ1 nonregular-transient " "V.Q/55 V.R/68 V.R/73" "" 1 \
   's@^    _dm_route_failed "\$_pd_lane" "\$_pd_file" "structurally unusable dm queue entry" || return 3$@    return 1@'
 
 # Ruling 4: minted identity is DERIVED, never inherited. Honouring _DM_ID_TS needs the grammar

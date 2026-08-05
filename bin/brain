@@ -8,7 +8,7 @@
 # (the portable equivalent — mkdir is atomic create on POSIX filesystems).
 
 set -u
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 # Clear the vault-resolution sentinel at process entry: it is a marker for "this process ran
 # brain_root()", and an inherited value would let a caller's environment stand in for that.
@@ -132,7 +132,8 @@ _list_field() {
   _fm "$1" "$2" | tr -d '[]' | tr -d '"' | tr -d "'" | tr ',' ' '
 }
 _owns_tokens() { _list_field "$1" owns_branches; }
-_agent_slug()  { _as_b=${1##*/}; printf '%s\n' "${_as_b%.md}"; }   # pure PE — no basename fork
+_agent_slug()  { _as_b=${1##*/}; printf '%s\n' "${_as_b%.md}"; } # display-only; pure PE, no basename fork
+_slug_of()     { _SLUG=${1##*/}; _SLUG=${_SLUG%.md}; }            # variable twin for path identities
 
 # Branch → positional slug (§2a): first token after the "<alpha>-<num>" ticket in feat/…; else
 # the whole branch name. graph⊄langgraph and the cockpit double-match are killed by this + exact
@@ -205,7 +206,14 @@ _require_brain() {
 # Set a caller-visible scalar so DM path components never have to cross command substitution.
 _resolve_whoami() {
   _WHOAMI=""
-  if [ -n "${BRAIN_FEATURE:-}" ]; then _WHOAMI=$BRAIN_FEATURE; return 0; fi
+  if [ -n "${BRAIN_FEATURE:-}" ]; then
+    if _feat_ok "$BRAIN_FEATURE"; then
+      _WHOAMI=$BRAIN_FEATURE
+    else
+      _warn "invalid inherited BRAIN_FEATURE (bare slug only)"
+    fi
+    return 0
+  fi
   ROOT=$(brain_root) || return 0
   BRAIN="$ROOT/.brain"; [ -d "$BRAIN" ] || return 0
   _slug=$(_slug_from_branch "$(_branch)"); [ -z "$_slug" ] && return 0
@@ -215,8 +223,8 @@ _resolve_whoami() {
     [ -e "$_f" ] || continue
     for _tok in $(_owns_tokens "$_f"); do
       if [ "$_tok" = "$_slug" ]; then
-        _match_name=${_f##*/}; _match_slug=${_match_name%.md}
-        _feat_ok "$_match_slug" && _matches="$_matches $_match_slug"
+        _slug_of "$_f"
+        _feat_ok "$_SLUG" && _matches="$_matches $_SLUG"
       fi
     done
   done
@@ -338,15 +346,13 @@ _dm_make_dir() { # <path>
 _dm_ensure_tree() { # <lane>
   _et_lane=$1
   _feat_ok "$_et_lane" || { _warn "invalid feature name '$_et_lane' (bare slug only)"; return 1; }
-  # Creation proves type and symlink safety. The validation pass also proves read+search access;
-  # without it a 0300 state directory makes glob enumeration lie that the queue is empty/free.
+  # Each state is created then validated before advancing; validation also proves read+search
+  # access, without which a 0300 directory makes glob enumeration lie that it is empty/free.
   _et_lane_dir="$BRAIN/dm/$_et_lane"
   _dm_make_dir "$BRAIN/dm" || return 1
   _dm_make_dir "$_et_lane_dir" || return 1
   for _et_state in pending read failed; do
     _dm_make_dir "$_et_lane_dir/$_et_state" || return 1
-  done
-  for _et_state in pending read failed; do
     _dm_dir_ok "$_et_lane_dir/$_et_state" || return 1
   done
 }
@@ -369,12 +375,14 @@ _dm_id_in_use() { # <lane> <id>
     # Keep the exact-path witness: search permission alone can resolve it even when a glob scan
     # cannot enumerate the directory. Bumped variants still require the wider scan below.
     _iu_exact="$_iu_dir/$_iu_id"
-    if [ -e "$_iu_exact" ] || [ -L "$_iu_exact" ]; then return 0; fi
+    _dm_dest_occupied "$_iu_exact" && return 0
     # Collision-bumped transcripts still reserve their original stable id. This is a strict
     # widening of the safety scan: <id> and every <id>* variant count as occupied.
-    for _iu_file in "$_iu_dir/$_iu_id"*; do
+    for _iu_file in "$_iu_dir/$_iu_id"* "$_iu_dir"/.*; do
+      _iu_name=${_iu_file##*/}
+      case "$_iu_name" in .|..|.tmp-*) continue ;; esac
       [ -e "$_iu_file" ] || [ -L "$_iu_file" ] || continue
-      return 0
+      case "$_iu_name" in "$_iu_id"*) return 0 ;; esac
     done
     # A permission change during expansion must not turn "could not enumerate" into "free".
     _dm_dir_ok "$_iu_dir" || return 2
@@ -432,7 +440,9 @@ _dm_new_id() { # <lane>
 }
 
 _dm_write_json() { # <from> <to> <msg> <ts>
-  jq -cn --arg f "$1" --arg t "$2" --arg c "$3" --arg ts "$4" \
+  _dm_resolve_jq || return 1
+  # shellcheck disable=SC2016  # jq source; $f/$t/$ts/$c are jq variables
+  "$_DM_JQ_BIN" -cn --arg f "$1" --arg t "$2" --arg c "$3" --arg ts "$4" \
     '{from:$f,to:$t,ts:$ts,content:$c}' 2>/dev/null
 }
 
@@ -441,7 +451,6 @@ _dm_send() { # <from> <to> <msg> <ts>
   _ds_from=$1; _ds_to=$2; _ds_msg=$3; _ds_ts=$4
   _dm_ensure_tree "$_ds_to" || return 1
   _ds_pending="$BRAIN/dm/$_ds_to/pending"
-  _dm_dir_ok "$_ds_pending" || return 1
   _ds_id=$(_dm_new_id "$_ds_to") || return 1
   _dm_id_ok "$_ds_id" || return 1
   _ds_dest="$_ds_pending/$_ds_id"
@@ -456,7 +465,9 @@ _dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
 # during the scan cannot turn "unreadable" into "empty".
 _dm_dir_has_entries() {
   _dm_dir_ok "$1" || return 2
-  for _dhe_file in "$1"/*; do
+  for _dhe_file in "$1"/* "$1"/.*; do
+    _dhe_name=${_dhe_file##*/}
+    case "$_dhe_name" in .|..|.tmp-*) continue ;; esac
     [ -e "$_dhe_file" ] || [ -L "$_dhe_file" ] || continue
     return 0
   done
@@ -475,6 +486,11 @@ _dm_direct_pending_entry() { # <lane> <entry-path>; type is deliberately not con
 # caller-visible variable, never stdout: command substitution would strip trailing newlines from
 # an opaque filesystem path. Preserve the original name when NAME_MAX allows; a checksum fallback
 # keeps long records distinct.
+_dm_filename_fits() {
+  _ff_bytes=$(LC_ALL=C printf '%s' "$1" | wc -c | tr -d ' \n')
+  [ "$_ff_bytes" -le "$DM_FILENAME_MAX_BYTES" ]
+}
+
 _dm_collision_dest() { # <lane> <read|failed> <name>
   _cd_lane=$1; _cd_state=$2; _cd_name=$3
   _DM_COLLISION_DEST=""
@@ -485,21 +501,43 @@ _dm_collision_dest() { # <lane> <read|failed> <name>
     _warn "could not construct dm collision destination for $_cd_name: clock failed"
     return 1
   }
-  _cd_suffix=".collision-$_cd_stamp-$$"; _cd_candidate="$_cd_name$_cd_suffix"
-  _cd_bytes=$(LC_ALL=C printf '%s' "$_cd_candidate" | wc -c | tr -d ' \n')
-  if [ "$_cd_bytes" -gt "$DM_FILENAME_MAX_BYTES" ]; then
-    _cd_sum=$(printf '%s' "$_cd_name" | cksum) || {
-      _warn "could not construct dm collision destination for $_cd_name: checksum failed"
-      return 1
-    }
-    _cd_sum=${_cd_sum%% *}
-    _cd_candidate="collision-$_cd_sum-$_cd_stamp-$$"
-  fi
-  _cd_n=0; _cd_dest="$_cd_dir/$_cd_candidate"
-  while _dm_dest_occupied "$_cd_dest"; do
-    _cd_n=$((_cd_n + 1)); _cd_dest="$_cd_dir/$_cd_candidate-$_cd_n"
+  _cd_suffix=".collision-$_cd_stamp-$$"
+  _cd_base="$_cd_name$_cd_suffix"
+  _cd_compact=""; _cd_n=0
+  while :; do
+    if [ -n "$_cd_compact" ]; then
+      _cd_candidate=$_cd_compact
+    else
+      _cd_candidate=$_cd_base
+    fi
+    [ "$_cd_n" -eq 0 ] || _cd_candidate="$_cd_candidate-$_cd_n"
+    if ! _dm_filename_fits "$_cd_candidate"; then
+      [ -z "$_cd_compact" ] || {
+        _warn "could not construct dm collision destination for $_cd_name: filename limit exhausted"
+        return 1
+      }
+      # The compact base reserves headroom for the largest portable shell-integer counter; every
+      # concrete suffix is still rechecked below before it is used as a filesystem path.
+      _cd_sum=$(printf '%s' "$_cd_name" | cksum) || {
+        _warn "could not construct dm collision destination for $_cd_name: checksum failed"
+        return 1
+      }
+      _cd_sum=${_cd_sum%% *}
+      _cd_compact="collision-$_cd_sum-$_cd_stamp-$$"
+      _dm_filename_fits "$_cd_compact-9223372036854775807" || {
+        _warn "could not construct dm collision destination for $_cd_name: compact name exceeds filename limit"
+        return 1
+      }
+      _cd_n=0
+      continue
+    fi
+    _cd_dest="$_cd_dir/$_cd_candidate"
+    if ! _dm_dest_occupied "$_cd_dest"; then
+      _DM_COLLISION_DEST=$_cd_dest
+      return 0
+    fi
+    _cd_n=$((_cd_n + 1))
   done
-  _DM_COLLISION_DEST=$_cd_dest
 }
 
 _dm_route_failed() { # <lane> <message-file> <reason>
@@ -539,32 +577,37 @@ _dm_resolve_jq() {
   return 1
 }
 
-# Prove the pinned jq supports the exact consumer primitives and that its measured parse-error
-# and error() exit codes still match. A failure is global, so callers leave every entry pending.
-_dm_jq_contract_holds() {
+# Measure the three jq capabilities used by consumption against the already-pinned executable.
+# Parse/error statuses are variable returns; only inability to run the capability probe is rc 1.
+_dm_jq_measure() {
+  _JM_PARSE_RC=""; _JM_ERROR_RC=""
   [ -n "${_DM_JQ_BIN:-}" ] || return 1
   "$_DM_JQ_BIN" -e -n '"x" | (utf8bytelength == 1 and ((tojson | type) == "string"))' \
     >/dev/null 2>&1 || return 1
   printf '{' | "$_DM_JQ_BIN" -e . >/dev/null 2>&1
-  _jc_parse_rc=$?
-  [ "$_jc_parse_rc" = "$_DM_JQ_PARSE_RC" ] || return 1
+  _JM_PARSE_RC=$?
   "$_DM_JQ_BIN" -n 'error("dm preflight")' >/dev/null 2>&1
-  _jc_error_rc=$?
-  [ "$_jc_error_rc" = "$_DM_JQ_ERROR_RC" ]
+  _JM_ERROR_RC=$?
+}
+
+# Prove the pinned jq's measured parse-error and error() statuses still match the preflight pair.
+# A failure is global, so callers leave every entry pending. PATH is deliberately not re-resolved.
+_dm_jq_contract_holds() {
+  _dm_jq_measure || return 1
+  [ "$_JM_PARSE_RC" = "$_DM_JQ_PARSE_RC" ] || return 1
+  [ "$_JM_ERROR_RC" = "$_DM_JQ_ERROR_RC" ]
 }
 
 # Resolve jq once per consume operation, then establish the contract on that exact executable.
 _dm_jq_preflight() {
   _DM_JQ_BIN=""; _DM_JQ_PARSE_RC=""; _DM_JQ_ERROR_RC=""
+  _DM_JQ_SYSTEMIC_FAILURE=0
   _dm_resolve_jq || return 1
-  "$_DM_JQ_BIN" -e -n '"x" | (utf8bytelength == 1 and ((tojson | type) == "string"))' \
-    >/dev/null 2>&1 || return 1
-  printf '{' | "$_DM_JQ_BIN" -e . >/dev/null 2>&1
-  _DM_JQ_PARSE_RC=$?
-  [ "$_DM_JQ_PARSE_RC" != 0 ] || return 1
-  "$_DM_JQ_BIN" -n 'error("dm preflight")' >/dev/null 2>&1
-  _DM_JQ_ERROR_RC=$?
-  [ "$_DM_JQ_ERROR_RC" != 0 ] || return 1
+  _dm_jq_measure || return 1
+  [ "$_JM_PARSE_RC" != 0 ] || return 1
+  [ "$_JM_ERROR_RC" != 0 ] || return 1
+  _DM_JQ_PARSE_RC=$_JM_PARSE_RC
+  _DM_JQ_ERROR_RC=$_JM_ERROR_RC
 }
 
 # Rebuild one validated pending object from only the bounded wire fields plus its stable ID. The
@@ -610,12 +653,12 @@ _dm_digest() { # <message-file> <message-id>
 
 # Digest one pending message — the shared per-message step of BOTH consume paths (take and
 # SessionStart), owning validation, quarantine, and the warn for every outcome so callers never
-# duplicate policy. rc 0: digest line on stdout, file left pending for the caller's emit→archive
-# sequence. rc 2: structurally invalid — quarantined into failed/ HERE. rc 3: structurally
-# invalid AND the quarantine itself failed (file left pending). rc 1: transient failure — file
-# left pending (a system error is not proof; only this jq build's probed invalidity codes are).
+# duplicate policy. The digest is a caller-visible scalar so systemic flags survive this call.
+# rc 0: digest available, file left pending for emit→archive. rc 2: structurally invalid and
+# quarantined. rc 3: invalid but quarantine failed. rc 1: transient/systemic, file left pending.
 _dm_pending_digest() { # <lane> <message-file>
   _pd_lane=$1; _pd_file=$2; _pd_name=${_pd_file##*/}
+  _DM_PENDING_DIGEST=""
   _dm_direct_pending_entry "$_pd_lane" "$_pd_file" || return 1
   if [ -L "$_pd_file" ] || [ ! -f "$_pd_file" ]; then
     _warn "structurally unusable non-regular dm queue entry for @$_pd_lane: $_pd_name"
@@ -628,13 +671,17 @@ _dm_pending_digest() { # <lane> <message-file>
     _dm_route_failed "$_pd_lane" "$_pd_file" "structurally invalid dm message" || return 3
     return 2
   fi
-  _dm_digest "$_pd_file" "$_pd_name"
+  _pd_digest=$(_dm_digest "$_pd_file" "$_pd_name")
   _pd_digest_rc=$?
-  [ "$_pd_digest_rc" = 0 ] && return 0
+  if [ "$_pd_digest_rc" = 0 ]; then
+    _DM_PENDING_DIGEST=$_pd_digest
+    return 0
+  fi
   if { [ -n "${_DM_JQ_PARSE_RC:-}" ] && [ "$_pd_digest_rc" = "$_DM_JQ_PARSE_RC" ]; } \
      || { [ -n "${_DM_JQ_ERROR_RC:-}" ] && [ "$_pd_digest_rc" = "$_DM_JQ_ERROR_RC" ]; }; then
     if ! _dm_jq_contract_holds; then
-      _warn "jq contract changed during dm consume for @$_pd_lane; leaving all messages pending"
+      _DM_JQ_SYSTEMIC_FAILURE=1
+      _warn "jq contract changed during dm consume for @$_pd_lane (${_DM_JQ_BIN:-<unresolved>}); leaving all messages pending"
       return 1
     fi
     _warn "invalid dm object in $_pd_file"
@@ -665,7 +712,6 @@ cmd_dm_take() {
   [ -n "$_dt_lane" ] || _die "brain dm take: whoami is empty"
   _dm_ensure_tree "$_dt_lane" || return 1
   _dt_pending="$BRAIN/dm/$_dt_lane/pending"
-  _dm_dir_ok "$_dt_pending" || return 1
   _dm_dir_has_entries "$_dt_pending"
   case $? in 0) ;; 1) return 0 ;; *) return 1 ;; esac
   if ! _dm_jq_preflight; then
@@ -676,14 +722,24 @@ cmd_dm_take() {
     _warn "brain dm take: stdout is unavailable; leaving all messages pending"
     return 1
   fi
-  _dt_count=0; _dt_rc=0
-  for _dt_file in "$_dt_pending"/*; do
+  _dt_count=0; _dt_rc=0; _dt_exhausted=1
+  for _dt_file in "$_dt_pending"/* "$_dt_pending"/.*; do
+    _dt_name=${_dt_file##*/}
+    case "$_dt_name" in .|..|.tmp-*) continue ;; esac
     [ -e "$_dt_file" ] || [ -L "$_dt_file" ] || continue
-    [ "$_dt_count" -lt "$DM_INJECT_MAX_LINES" ] || break
+    if [ "$_dt_count" -ge "$DM_INJECT_MAX_LINES" ]; then
+      _dt_exhausted=0
+      break
+    fi
     _dt_count=$((_dt_count + 1))
-    _dt_digest=$(_dm_pending_digest "$_dt_lane" "$_dt_file")
-    case $? in
-      0) ;;
+    _dm_pending_digest "$_dt_lane" "$_dt_file"
+    _dt_digest_rc=$?
+    if [ "${_DM_JQ_SYSTEMIC_FAILURE:-0}" = 1 ]; then
+      _dt_rc=1; _dt_exhausted=0
+      break
+    fi
+    case "$_dt_digest_rc" in
+      0) _dt_digest=$_DM_PENDING_DIGEST ;;
       2) continue ;;
       *) _dt_rc=1; continue ;;
     esac
@@ -693,6 +749,9 @@ cmd_dm_take() {
     fi
     _dm_archive "$_dt_lane" "$_dt_file" || _dt_rc=1
   done
+  if [ "$_dt_exhausted" = 1 ]; then
+    _dm_dir_ok "$_dt_pending" || _dt_rc=1
+  fi
   if [ "$_dt_count" -ge "$DM_INJECT_MAX_LINES" ]; then
     _dm_dir_has_entries "$_dt_pending"
     case $? in
@@ -741,7 +800,7 @@ cmd_dm() {
     _n=0; _failed=""
     for _pn in "$BRAIN"/presence/*.md; do
       [ -e "$_pn" ] || continue
-      _pn_name=${_pn##*/}; _rcpt=${_pn_name%.md}
+      _slug_of "$_pn"; _rcpt=$_SLUG
       [ "$_rcpt" = "$_from" ] && continue
       if _dm_send "$_from" "$_rcpt" "$_msg" "$_ts"; then
         _n=$((_n + 1))
@@ -1294,6 +1353,15 @@ _emit_session_ctx() {
     '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}' 2>/dev/null \
     || printf '%s\n' "$1"
 }
+_emit_session_ctx_pinned() {
+  [ -n "${_DM_JQ_BIN:-}" ] || return 1
+  # shellcheck disable=SC2016  # jq source; $c is a jq variable
+  _esc_payload=$("$_DM_JQ_BIN" -n --arg c "$1" \
+    '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}' 2>/dev/null) \
+    || return 1
+  [ -n "$_esc_payload" ] || return 1
+  printf '%s\n' "$_esc_payload"
+}
 _emit_pretool() { # <decision: allow|ask> <text>
   # Field placement is empirical (2026-08-01, DM-mechanisms eval E2/E9 — the eval doc lives
   # with the consuming project, not in this repo): permissionDecisionReason renders ONLY on
@@ -1334,31 +1402,41 @@ _hook_session_start() {
   _ib="$BRAIN/dm/$_feat/pending"
   _dm_block=""; _digest=""; _batch_count=0; _more_dm=0
   set --
-  if _dm_ensure_tree "$_feat" && _dm_dir_ok "$_ib"; then
-    _dm_dir_has_entries "$_ib"
-    _ib_entries_rc=$?
-    if [ "$_ib_entries_rc" = 0 ]; then
-      if ! _dm_jq_preflight; then
-        _warn "SessionStart dm consume: jq is unavailable or incompatible; leaving all messages pending"
-      else
-        for _pending_file in "$_ib"/*; do
-          [ -e "$_pending_file" ] || [ -L "$_pending_file" ] || continue
-          if [ "$_batch_count" -ge "$DM_INJECT_MAX_LINES" ]; then
-            _more_dm=1
-            break
-          fi
-          _batch_count=$((_batch_count + 1))
-          _digest_line=$(_dm_pending_digest "$_feat" "$_pending_file")
-          case $? in
-            0) ;;
-            3) _warn "could not quarantine invalid dm message for @$_feat: ${_pending_file##*/}"; continue ;;
-            *) continue ;;
-          esac
-          _digest="${_digest}${_digest:+
+  # Established-empty (rc 1) and unestablishable (rc 2, already diagnosed by _dm_dir_ok)
+  # deliberately converge on no consume; the SessionStart wrapper must remain rc 0.
+  if _dm_ensure_tree "$_feat" && _dm_dir_has_entries "$_ib"; then
+    if ! _dm_jq_preflight; then
+      _warn "SessionStart dm consume: jq is unavailable or incompatible; leaving all messages pending"
+    else
+      _ib_exhausted=1
+      for _pending_file in "$_ib"/* "$_ib"/.*; do
+        _pending_name=${_pending_file##*/}
+        case "$_pending_name" in .|..|.tmp-*) continue ;; esac
+        [ -e "$_pending_file" ] || [ -L "$_pending_file" ] || continue
+        if [ "$_batch_count" -ge "$DM_INJECT_MAX_LINES" ]; then
+          _more_dm=1; _ib_exhausted=0
+          break
+        fi
+        _batch_count=$((_batch_count + 1))
+        _dm_pending_digest "$_feat" "$_pending_file"
+        _digest_rc=$?
+        if [ "${_DM_JQ_SYSTEMIC_FAILURE:-0}" = 1 ]; then
+          _ib_exhausted=0
+          break
+        fi
+        case "$_digest_rc" in
+          0) _digest_line=$_DM_PENDING_DIGEST ;;
+          3) _warn "could not quarantine invalid dm message for @$_feat: $_pending_name"; continue ;;
+          *) continue ;;
+        esac
+        _digest="${_digest}${_digest:+
 }${_digest_line}"
-          _pending_name=${_pending_file##*/}
-          set -- "$@" "$_pending_name"
-        done
+        set -- "$@" "$_pending_name"
+      done
+      if [ "$_ib_exhausted" = 1 ] && ! _dm_dir_ok "$_ib"; then
+        # No archive may rest on an enumeration whose state could not be re-established.
+        _digest=""; _more_dm=0
+        set --
       fi
     fi
   fi
@@ -1378,13 +1456,21 @@ More DMs remain pending after this bounded batch. Continue by running: \"$BRAIN/
   cmd_reconcile >/dev/null 2>&1 || true
   # (d) inject the protocol nudge + live state
   _st=$(cmd_status 2>/dev/null)
-  if _emit_session_ctx "${_dm_block}Run the **navigation-standards** skill now (the Agent-Brain coordination protocol).
+  _session_ctx="${_dm_block}Run the **navigation-standards** skill now (the Agent-Brain coordination protocol).
 
 Your DM pending queue — arm a watch on directory activity: $_ib
 On activity, consume it by running: \"$BRAIN/bin/brain\" dm take
 ${_continue_dm}
 
-$_st"; then
+$_st"
+  if [ "$#" -gt 0 ]; then
+    _emit_session_ctx_pinned "$_session_ctx"
+    _emit_rc=$?
+  else
+    _emit_session_ctx "$_session_ctx"
+    _emit_rc=$?
+  fi
+  if [ "$_emit_rc" = 0 ]; then
     if [ "$#" -gt 0 ]; then
       _archive_rc=0
       for _emitted_name in "$@"; do

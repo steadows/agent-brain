@@ -2,23 +2,26 @@
 # test/dm.sh — RED-phase suite for the Agent-Brain lane-DM feature, v1.2 (claim layer DELETED).
 #
 # AUTHORITY (in precedence order):
-#   0. .context/seams/dm-v1.1-queue.md, the `# v1.2.1 — CONTRACT ADDENDUM` section — the LATEST
-#      ruling (committed 33efc2d, authorized by Steve). It AMENDS the `# v1.2` section's
+#   0. .context/seams/dm-v1.1-queue.md, the `# v1.2.2` and `# v1.2.3` CONTRACT ADDENDA — the
+#      latest rulings. Rulings 7/8/9 map to section V.R/67-71; rulings 10/11/12 map to
+#      V.R/72-74. Everything they do not name is unchanged, so items 1-4 below still govern.
+#   1. .context/seams/dm-v1.1-queue.md, the `# v1.2.1 — CONTRACT ADDENDUM` section
+#      (committed 33efc2d, authorized by Steve). It AMENDS the `# v1.2` section's
 #      "Poison, without a counter" ruling and must-survive items 3 and 6; its six numbered
-#      rulings are section V.Q's spec. Everything it does not name is unchanged, so items 1-3
+#      rulings are section V.Q's spec. Everything it does not name is unchanged, so items 2-4
 #      below still govern the rest of this file.
 #      docs/reviews/lane-dm-v12-pre-pr-code-review.md supplies the reproduced fixture shapes
 #      (H1's 41-entry wall, H4's crafted name) — it is EVIDENCE, never authority.
-#   1. .context/seams/dm-v1.1-queue.md, the `# v1.2` section (lines 335-467) — THE design
+#   2. .context/seams/dm-v1.1-queue.md, the `# v1.2` section (lines 335-467) — THE design
 #      authority, DECIDED by Steve 2026-08-04. It supersedes decisions 4, 6, 6b and 6c for the
 #      consume path; send-side atomicity (decisions 2 + 3) is explicitly UNCHANGED. Its "Delete"
 #      list, its 8-item "Must survive" checklist, its "Poison, without a counter" ruling and its
 #      "Suite consequences" retire/keep/add lists are this file's spec.
-#   2. The same map's surviving v1.1 sections — decision 2 (dot-temp + same-directory rename),
+#   3. The same map's surviving v1.1 sections — decision 2 (dot-temp + same-directory rename),
 #      decision 3 (message ID = filename = <_now_compact>-<pid>[+ collision bump]), decision 7
 #      (wire format from/to/ts/content), decision 8 (DM_MAX_BODY kept), the `_dm_dir_ok` and
 #      `_dm_digest` seams, and the altitude decision "no lock anywhere on the queue path".
-#   3. docs/lane-dm-ultrareview-findings.md — UR-1 (emit before the terminal move), UR-2 (symlink
+#   4. docs/lane-dm-ultrareview-findings.md — UR-1 (emit before the terminal move), UR-2 (symlink
 #      component refusal), UR-3 (a live-observed message is really consumed), UR-8 (no false
 #      announce promise), UR-9/UR-10 (round-trip + body-independent journal).
 # Implementation code is EVIDENCE, never authority. Where this suite pins something the map
@@ -121,6 +124,13 @@
 #     and that successive invocations drain the remainder without starvation. The map says "one
 #     'process at most K entries' cap" and deliberately does not name K, so pinning a value here
 #     would invent a ruling. A map decision, not an oversight. [L9]
+#   · v1.2.2 ruling 7's scanner-INTERNAL post-expansion `_dm_dir_ok` checks in `_dm_id_in_use`
+#     and `_dm_dir_has_entries` are not independently exercised. A permission flip after the
+#     upfront probe but before the same process expands its glob is not drivable through one CLI
+#     invocation without bespoke cross-process coordination. The upfront operation-fatal contract
+#     remains pinned by V.R/67; the internal TOCTOU witnesses are declared, not claimed. [Q6]
+#   · Read-side `_dm_collision_dest` is unreachable for hostile names: `_dm_archive`'s grammar
+#     gate precedes it. Hostile-name collision coverage therefore belongs to failed/ quarantine.
 #
 # RED DISCIPLINE: scenarios labelled "red" pin v1.2 behaviour and MUST fail against the current
 # v1.1 engine. Scenarios labelled "guard:" are regression guards that pass against the current
@@ -2476,7 +2486,7 @@ sc_failed_dest_collision_preserves_record() {
 # Authority: the seam map's `# v1.2.1 — CONTRACT ADDENDUM` section, rulings 1-6. Each scenario
 # names the ruling it pins. The pre-PR review's transcripts supply fixture SHAPES only.
 #
-# SHIM DISCIPLINE (rulings 2, 4 and 6 all need one): every PATH shim below follows V.N/53's
+# SHIM DISCIPLINE (rulings 2, 4, 6 and 9 all need one): every PATH shim below follows V.N/53's
 # rules exactly — PATH saved in the parent shell, restored BEFORE any assertion can return
 # early, and a post-restore leak check that the shim directory is no longer what `command -v`
 # resolves. A leaked shim would silently poison every later scenario in this file.
@@ -3310,6 +3320,8 @@ sc_empty_queue_does_not_consult_jq() {
   fi
 }
 
+# ═════════════════════ V.R — v1.2.2/v1.2.3 contract addenda (RED) ═════════════════════════
+
 # V.R/67 — v1.2.2 ruling 7: enumeration failure is operation-fatal, never "empty" or "free".
 # A 0300 state directory is searchable by exact path but cannot be enumerated. Each state is
 # exercised against all three queue operations: mint, live take, and SessionStart consumption.
@@ -3352,8 +3364,7 @@ sc_unreadable_state_is_operation_fatal() {
     hook_out="$base/unreadable-$state-hook.out"
     cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
 
-    chmod 755 "$state_dir" 2>/dev/null \
-      || fatal "could not restore permissions on disposable $state/ fixture"
+    chmod 755 "$state_dir" 2>/dev/null || true  # restore BEFORE any early return
     hook_added="$base/unreadable-$state-hook-added.err"
     tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
 
@@ -3587,8 +3598,359 @@ sc_lane_components_never_cross_command_substitution() {
     "the valid peer must receive the partial broadcast"
 }
 
+# V.R/71 — v1.2.2 ruling 9's same-executable RE-PROBE and operation-wide abort. The shim
+# overwrites its own bytes (without changing its resolvable path) on the final preflight probe.
+# Digestion then returns the RECORDED parse status, forcing `_dm_jq_contract_holds`; the hostile
+# replacement fails the capability probe, so neither entry is evidence for quarantine. One
+# systemic failure aborts the batch and emits one diagnostic naming the pinned executable.
+sc_jq_contract_reprobe_aborts_batch() {
+  for mode in take hook; do
+    fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+    base=$(dirname "$fx")
+    pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+    hooklog="$fx/.brain/.hook-errors.log"
+    marker1="jq-reprobe-$mode-one-v122"
+    marker2="jq-reprobe-$mode-two-v122"
+
+    run_brain "$fx" alpha dm @bravo "$marker1"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue the first $mode contract-reprobe victim" || return 0
+    run_brain "$fx" alpha dm @bravo "$marker2"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue the second $mode contract-reprobe victim" || return 0
+    need_count "$pd" 2 "prerequisite: two healthy contract-reprobe victims" || return 0
+
+    real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+    printf '{' | "$real_jq" -e . >/dev/null 2>&1
+    measured_parse_rc=$?
+    [ "$measured_parse_rc" != 0 ] \
+      || { fail "instrument: real jq parse failure unexpectedly returned success"; return 0; }
+
+    shim_dir="$base/jq-reprobe-$mode-bin"
+    mkdir -p "$shim_dir" || { fail "fixture: could not create the jq re-probe shim directory"; return 0; }
+    {
+      printf '#!/usr/bin/env sh\n'
+      printf 'exit %s\n' "$measured_parse_rc"
+    } > "$shim_dir/hostile" || { fail "fixture: could not write the hostile jq replacement"; return 0; }
+    # One physical line makes the overwrite + current real-jq exec indivisible from the shell
+    # parser's perspective; the next invocation reads the hostile bytes from the same path.
+    # shellcheck disable=SC2016
+    {
+      printf '#!/usr/bin/env sh\n'
+      printf 'case "$*" in *"dm preflight"*) cp "%s" "$0" || exit 97; chmod +x "$0" || exit 97; exec "%s" "$@" ;; esac\n' \
+        "$shim_dir/hostile" "$real_jq"
+      printf 'exec "%s" "$@"\n' "$real_jq"
+    } > "$shim_dir/jq" || { fail "fixture: could not write the jq re-probe shim"; return 0; }
+    chmod +x "$shim_dir/jq" "$shim_dir/hostile" \
+      || { fail "fixture: could not make the jq re-probe shim executable"; return 0; }
+
+    before_hook=$(line_count "$hooklog")
+    saved_path=$PATH
+    PATH="$shim_dir:$PATH"; export PATH
+    if [ "$mode" = take ]; then
+      run_brain "$fx" bravo dm take
+      op_rc=$?
+      op_err="$base/jq-reprobe-take.err"
+      cp "$ERR" "$op_err" 2>/dev/null || : > "$op_err"
+    else
+      run_brain "$fx" bravo hook session-start
+      op_rc=$?
+      op_err="$base/jq-reprobe-hook.err"
+      tail -n "+$((before_hook + 1))" "$hooklog" > "$op_err" 2>/dev/null || : > "$op_err"
+    fi
+    resolved_after=$(command -v jq)
+    jq -e -n '1' >/dev/null 2>&1
+    hostile_rc=$?
+    PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+    case "$(command -v jq)" in
+      "$shim_dir"/*)
+        fail "instrument leak: the self-overwriting jq shim is STILL what PATH resolves after the restore"; return 0 ;;
+    esac
+
+    need_eq "$resolved_after" "$shim_dir/jq" \
+      "instrument: the overwritten jq must remain resolvable at the exact pinned path" || return 0
+    need_eq "$hostile_rc" "$measured_parse_rc" \
+      "instrument: the overwritten jq must return the recorded parse-error status" || return 0
+    if [ "$mode" = take ]; then
+      need_rc_nonzero "$op_rc" "ruling 9 take must fail safe on a changed jq contract"
+    else
+      need_rc "$op_rc" 0 "SessionStart hook wrapper status contract"
+    fi
+    contract_warns=$(grep -cF 'jq contract changed during dm consume' "$op_err" 2>/dev/null)
+    need_eq "$contract_warns" 1 \
+      "ruling 9 $mode path must emit exactly one contract-changed warning for the whole batch"
+    need_file_has "$op_err" "$shim_dir/jq" \
+      "the contract-changed warning must name the pinned jq executable"
+    need_count "$pd" 2 "pending/ after the systemic jq mismatch — the whole batch stays retryable"
+    need_count "$rd" 0 "read/ after the systemic jq mismatch"
+    need_count "$fd" 0 "failed/ after the systemic jq mismatch — a changed contract proves no message invalid"
+
+    run_brain "$fx" bravo dm take
+    retry_rc=$?
+    need_rc "$retry_rc" 0 "retry after restoring a stable jq" || return 0
+    need_file_has "$OUT" "$marker1" "the first retained message must deliver on retry"
+    need_file_has "$OUT" "$marker2" "the second retained message must deliver on retry"
+    need_count "$pd" 0 "pending/ after the stable-jq retry"
+    need_count "$rd" 2 "read/ after the stable-jq retry"
+    need_count "$fd" 0 "failed/ after the stable-jq retry"
+  done
+}
+
+# V.R/72 — v1.2.3 ruling 10: SessionStart's serializer is part of the pinned operation. The
+# preflight executable removes itself only AFTER producing the final digest; the next PATH jq
+# exits 0 with zero bytes. Re-resolving that replacement would make an empty emit look successful
+# and archive the undelivered message. Pinned/verified emit leaves it pending and warns once.
+sc_session_emit_is_pinned_and_nonempty() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+  marker="empty-emit-swap-survivor-v123"
+
+  run_brain "$fx" alpha dm @bravo "$marker"
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: queue the empty-emit swap victim" || return 0
+
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  first_dir="$base/jq-emit-first-bin"
+  next_dir="$base/jq-emit-next-bin"
+  mkdir -p "$first_dir" "$next_dir" \
+    || { fail "fixture: could not create the emit-swap shim directories"; return 0; }
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'case "$*" in *"--arg id"*) rm -f "$0" || exit 97 ;; esac; exec "%s" "$@"\n' "$real_jq"
+  } > "$first_dir/jq" || { fail "fixture: could not write the digest jq shim"; return 0; }
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'exit 0\n'
+  } > "$next_dir/jq" || { fail "fixture: could not write the empty jq replacement"; return 0; }
+  chmod +x "$first_dir/jq" "$next_dir/jq" \
+    || { fail "fixture: could not make the emit-swap shims executable"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$first_dir:$next_dir:$PATH"; export PATH
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  resolved_after=$(command -v jq)
+  jq -n '1' > "$base/empty-jq.out" 2>/dev/null
+  empty_rc=$?
+  empty_bytes=$(byte_size "$base/empty-jq.out")
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$first_dir"/*|"$next_dir"/*)
+      fail "instrument leak: an emit-swap jq shim is STILL what PATH resolves after the restore"; return 0 ;;
+  esac
+  hook_added="$base/empty-emit-hook.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_file_absent "$first_dir/jq" \
+    "instrument: the probed jq must remove itself only after the digest invocation" || return 0
+  need_eq "$resolved_after" "$next_dir/jq" \
+    "instrument: a post-digest bare jq lookup must resolve the empty replacement" || return 0
+  need_eq "$empty_rc" 0 "instrument: the replacement jq must report success" || return 0
+  need_eq "$empty_bytes" 0 "instrument: the replacement jq must emit zero bytes" || return 0
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status contract"
+  emit_warns=$(grep -c '^brain:' "$hook_added" 2>/dev/null)
+  need_eq "$emit_warns" 1 "ruling 10: a failed/zero-byte SessionStart emit must warn exactly once"
+  need_file_has "$hook_added" "emit" "the one warning must diagnose the failed SessionStart emit"
+  need_count "$pd" 1 "pending/ after the post-digest emit swap"
+  need_tree_has "$pd" "$marker" "the un-emitted message must remain retryable"
+  need_count "$rd" 0 "read/ after a zero-byte SessionStart emit"
+  need_count "$fd" 0 "failed/ after a zero-byte SessionStart emit"
+
+  run_brain "$fx" bravo hook session-start
+  retry_rc=$?
+  need_rc "$retry_rc" 0 "stable-jq SessionStart retry" || return 0
+  need_file_has "$OUT" "$marker" "the retained message must deliver once jq is stable"
+  need_count "$pd" 0 "pending/ after the stable-jq emit retry"
+  need_count "$rd" 1 "read/ after the stable-jq emit retry"
+  need_count "$fd" 0 "failed/ after the stable-jq emit retry"
+}
+
+# V.R/73 — v1.2.3 ruling 11: every collision suffix is byte-checked. An operation-local wrapper
+# exports its pid before execing the engine; the date shim uses it to choose a stamp making the FIRST
+# collision candidate exactly NAME_MAX bytes, then occupies it. Appending `-1` would be overlong;
+# the engine must switch to the compact checksum form and quarantine the non-regular entry there.
+sc_collision_suffix_rechecks_name_max() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); fd=$(q_dir "$fx" bravo failed)
+  run_brain "$fx" bravo inbox
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: ensure the collision fixture tree" || return 0
+
+  near_name=$(printf '%220s' '' | tr ' ' n)
+  near_bytes=$(LC_ALL=C printf '%s' "$near_name" | wc -c | tr -d ' \n')
+  need_eq "$near_bytes" 220 "instrument: near-cap hostile basename size" || return 0
+  mkdir "$pd/$near_name" \
+    || { fail "fixture: could not plant the near-cap non-regular pending entry"; return 0; }
+  printf 'EXACT-TWIN-MUST-SURVIVE-v123\n' > "$fd/$near_name" \
+    || { fail "fixture: could not occupy the exact failed/ twin"; return 0; }
+
+  real_date=$(command -v date) || { fail "fixture: cannot locate the real date"; return 0; }
+  shim_dir="$base/name-max-date-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the NAME_MAX date shim directory"; return 0; }
+  source_brain=$BRAIN_BIN
+  wrapper_brain="$base/name-max-brain"
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'T6_BRAIN_PID=$$; export T6_BRAIN_PID\n'
+    printf 'exec "%s" "$@"\n' "$source_brain"
+  } > "$wrapper_brain" || { fail "fixture: could not write the NAME_MAX engine wrapper"; return 0; }
+  chmod +x "$wrapper_brain" \
+    || { fail "fixture: could not make the NAME_MAX engine wrapper executable"; return 0; }
+  T6_FAILED_DIR=$fd
+  T6_NAME=$near_name
+  T6_LOG="$base/name-max-candidate.log"
+  export T6_FAILED_DIR T6_NAME T6_LOG
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'case "$*" in\n'
+    printf '  *"+%%s"*)\n'
+    printf '    brain_pid=${T6_BRAIN_PID:-}\n'
+    printf '    case "$brain_pid" in ""|*[!0-9]*) exit 96 ;; esac\n'
+    printf '    stamp_len=$((255 - ${#T6_NAME} - 12 - ${#brain_pid}))\n'
+    printf '    [ "$stamp_len" -gt 0 ] || exit 95\n'
+    printf '    stamp=""; i=0; while [ "$i" -lt "$stamp_len" ]; do stamp="${stamp}7"; i=$((i + 1)); done\n'
+    printf '    candidate="$T6_FAILED_DIR/$T6_NAME.collision-$stamp-$brain_pid"\n'
+    printf '    printf "FIRST-CANDIDATE-MUST-SURVIVE-v123\\n" > "$candidate" || exit 94\n'
+    printf '    printf "%%s\\n" "$candidate" > "$T6_LOG" || exit 93\n'
+    printf '    printf "%%s\\n" "$stamp"; exit 0 ;;\n'
+    printf 'esac\n'
+    printf 'exec "%s" "$@"\n' "$real_date"
+  } > "$shim_dir/date" || { fail "fixture: could not write the NAME_MAX date shim"; return 0; }
+  chmod +x "$shim_dir/date" \
+    || { fail "fixture: could not make the NAME_MAX date shim executable"; return 0; }
+
+  saved_path=$PATH
+  saved_brain_bin=$BRAIN_BIN
+  BRAIN_BIN=$wrapper_brain
+  PATH="$shim_dir:$PATH"; export PATH
+  run_brain "$fx" bravo dm take
+  take_rc=$?
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  BRAIN_BIN=$saved_brain_bin
+  unset T6_FAILED_DIR T6_NAME T6_LOG
+  case "$(command -v date)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the NAME_MAX date shim is STILL what PATH resolves after the restore"; return 0 ;;
+  esac
+  need_eq "$BRAIN_BIN" "$source_brain" \
+    "instrument leak: the NAME_MAX engine wrapper survived the restore" || return 0
+
+  need_file "$base/name-max-candidate.log" \
+    "instrument: the date shim must record the occupied first collision candidate" || return 0
+  first_candidate=$(sed -n '1p' "$base/name-max-candidate.log")
+  first_base=${first_candidate##*/}
+  first_bytes=$(LC_ALL=C printf '%s' "$first_base" | wc -c | tr -d ' \n')
+  need_eq "$first_bytes" 255 \
+    "instrument: the occupied first collision candidate must be exactly NAME_MAX bytes" || return 0
+  need_real_file "$first_candidate" "the occupied first collision candidate" || return 0
+  need_file_has "$first_candidate" "FIRST-CANDIDATE-MUST-SURVIVE-v123" \
+    "the occupied first collision candidate must remain byte-intact"
+  need_file_has "$fd/$near_name" "EXACT-TWIN-MUST-SURVIVE-v123" \
+    "the occupied exact failed/ twin must remain byte-intact"
+  need_rc "$take_rc" 0 \
+    "ruling 11: quarantine must recover from an overlong next suffix via the compact form"
+  need_file_absent "$pd/$near_name" \
+    "the proven-invalid near-cap entry must not remain pending after its suffix exceeds NAME_MAX"
+
+  compact_dir=""
+  for candidate in "$fd"/collision-*; do
+    [ -d "$candidate" ] && [ ! -L "$candidate" ] || continue
+    compact_dir=$candidate
+    break
+  done
+  [ -n "$compact_dir" ] \
+    || { fail "ruling 11: no compact checksum-form quarantine destination was created"; return 0; }
+  compact_base=${compact_dir##*/}
+  compact_bytes=$(LC_ALL=C printf '%s' "$compact_base" | wc -c | tr -d ' \n')
+  [ "$compact_bytes" -le 255 ] \
+    || fail "ruling 11: compact quarantine basename is $compact_bytes bytes, exceeds NAME_MAX"
+  need_count "$pd" 0 "pending/ after compact collision quarantine"
+  need_count "$fd" 3 "failed/ — exact twin, occupied first candidate, and compact quarantine"
+}
+
+# V.R/74 — v1.2.3 ruling 12: every hidden child except the atomic-send `.tmp-*` namespace is a
+# queue entry. Exercise both consume loops with a healthy peer, then a hidden-only queue to pin
+# `_dm_dir_has_entries`; `.poison` is quarantined by the existing invalid-name classification,
+# while `.tmp-*` remains untouched and does not keep the queue logically non-empty.
+sc_hidden_pending_entries_are_classified() {
+  for mode in take hook; do
+    fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+    base=$(dirname "$fx")
+    pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+    marker="hidden-peer-$mode-v123"
+    poison="hidden-poison-$mode-v123"
+    temp="hidden-temp-$mode-v123"
+
+    run_brain "$fx" alpha dm @bravo "$marker"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue the healthy $mode hidden-entry peer" || return 0
+    printf '{"from":"mallory","to":"bravo","ts":"x","content":"%s"}\n' "$poison" \
+      > "$pd/.poison" || { fail "fixture: could not plant pending/.poison"; return 0; }
+    printf '%s\n' "$temp" > "$pd/.tmp-inflight-v123" \
+      || { fail "fixture: could not plant the protected .tmp-* entry"; return 0; }
+    temp_bytes=$(byte_size "$pd/.tmp-inflight-v123")
+
+    if [ "$mode" = take ]; then
+      run_brain "$fx" bravo dm take
+      op_rc=$?
+    else
+      run_brain "$fx" bravo hook session-start
+      op_rc=$?
+    fi
+
+    need_rc "$op_rc" 0 "$mode consume with a foreign dot entry and healthy peer"
+    need_file_has "$OUT" "$marker" "the healthy peer must deliver through the $mode loop"
+    need_file_absent "$pd/.poison" "the foreign dot entry must leave pending/"
+    need_real_file "$fd/.poison" "the foreign dot entry quarantined under its exact basename"
+    need_file_has "$fd/.poison" "$poison" "the quarantined foreign dot entry must retain its bytes"
+    need_file "$pd/.tmp-inflight-v123" "the protected atomic-send staging entry"
+    need_file_has "$pd/.tmp-inflight-v123" "$temp" "the .tmp-* staging entry must remain untouched"
+    need_eq "$(byte_size "$pd/.tmp-inflight-v123")" "$temp_bytes" \
+      "the .tmp-* staging entry's byte size"
+    need_count "$pd" 0 "visible pending queue after hidden classification and peer delivery"
+    need_eq "$(count_dotfiles "$pd")" 1 \
+      "only the sanctioned .tmp-* hidden entry may remain in pending/"
+    need_count "$rd" 1 "read/ after the healthy hidden-entry peer delivers"
+    need_count "$fd" 0 "visible failed/ entries after pending/.poison is classified"
+    need_eq "$(count_dotfiles "$fd")" 1 "failed/ must contain exactly the quarantined .poison"
+
+    run_brain "$fx" bravo dm take
+    empty_rc=$?
+    need_rc "$empty_rc" 0 "queue with only .tmp-* remaining must read empty"
+    need_eq "$(byte_size "$OUT")" 0 "stdout from a queue containing only .tmp-*"
+    need_file "$pd/.tmp-inflight-v123" ".tmp-* must survive the empty-queue probe"
+  done
+
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending); fd=$(q_dir "$fx" bravo failed)
+  run_brain "$fx" bravo inbox
+  rc=$?
+  need_rc "$rc" 0 "prerequisite: ensure the hidden-only queue tree" || return 0
+  printf '{"from":"mallory","to":"bravo","ts":"x","content":"hidden-only-poison-v123"}\n' \
+    > "$pd/.poison" || { fail "fixture: could not plant the hidden-only poison"; return 0; }
+  printf 'hidden-only-temp-v123\n' > "$pd/.tmp-hidden-only-v123" \
+    || { fail "fixture: could not plant the hidden-only temp"; return 0; }
+
+  run_brain "$fx" bravo dm take
+  hidden_only_rc=$?
+  need_rc "$hidden_only_rc" 0 \
+    "_dm_dir_has_entries must report a foreign dot child as work, not established-empty"
+  need_file_absent "$pd/.poison" "the hidden-only foreign entry must be classified"
+  need_real_file "$fd/.poison" "the hidden-only foreign entry quarantined into failed/"
+  need_file "$pd/.tmp-hidden-only-v123" "the hidden-only .tmp-* entry must remain untouched"
+  need_count "$pd" 0 "visible pending queue after hidden-only classification"
+  need_eq "$(count_dotfiles "$pd")" 1 "only .tmp-* may remain after the hidden-only scan"
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
-printf 'brain lane-DM v1.2 RED suite (claim layer deleted) + v1.2.1 contract addendum\n'
+printf 'brain lane-DM v1.2 RED suite (claim layer deleted) + v1.2.1/v1.2.2/v1.2.3 contract addenda\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
 printf '  scratch: %s\n\n' "$SUITE_TMP"
 
@@ -3668,6 +4030,10 @@ scenario red   "V.R/67  unreadable-state-operation-fatal"    sc_unreadable_state
 scenario red   "V.R/68  trailing-newline-path-quarantined"   sc_trailing_newline_path_reaches_quarantine
 scenario red   "V.R/69  jq-identity-pinned-per-operation"    sc_jq_identity_is_pinned_for_operation
 scenario red   "V.R/70  lane-components-byte-opaque"         sc_lane_components_never_cross_command_substitution
+scenario red   "V.R/71  jq-contract-reprobe-aborts-batch"    sc_jq_contract_reprobe_aborts_batch
+scenario red   "V.R/72  pinned-nonempty-session-emit"        sc_session_emit_is_pinned_and_nonempty
+scenario red   "V.R/73  collision-rechecks-name-max"         sc_collision_suffix_rechecks_name_max
+scenario red   "V.R/74  hidden-pending-entries-classified"   sc_hidden_pending_entries_are_classified
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'
