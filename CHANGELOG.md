@@ -2,9 +2,9 @@
 
 ## v1.2.2 — 2026-08-05 — enumeration is fatal-not-empty; paths, identities and the emit are byte-exact and pinned
 
-Two hardening rounds (v1.2.2 + v1.2.2-r2) closing seam-map rulings 7-12 (`.context/seams/
-dm-v1.1-queue.md` § v1.2.2 + § v1.2.3), each found by an adversarial gate on code the prior
-gate passed. (The intermediate v1.2.1 round — rulings 1-6 + 1a — is recorded in the plan and
+Five hardening rounds (v1.2.2 + r2/r3/r4/r5) closing seam-map rulings 7-14 (`.context/seams/
+dm-v1.1-queue.md` § v1.2.2 / v1.2.3 / v1.2.4 + erratum 13a), each round found by an
+adversarial gate on code the prior gate passed. (The intermediate v1.2.1 round — rulings 1-6 + 1a — is recorded in the plan and
 seam map; its entry was never added here.)
 
 - **Enumeration failure is operation-fatal, never "empty"/"free" (ruling 7).** A queue dir
@@ -30,7 +30,9 @@ seam map; its entry was never added here.)
   additionally gates on a cheap structural witness (object-shaped, carries the known id /
   the four field keys) — a probe-passing binary returning well-formed-looking `{}` with
   rc 0 can no longer archive, publish, or journal anything; the fully-byzantine
-  forged-payload adversary is declared out of the threat model in the seam map.
+  forged-payload adversary is declared out of the threat model in the seam map. An
+  uninspectable `failed/` renders an explicit cannot-inspect banner in `brain status`,
+  never a silent zero (ruling 14).
 - **Collision names are re-checked against the byte cap at every suffix (ruling 11).** A
   candidate at NAME_MAX no longer overflows on its first `-<n>` bump; the compact checksum
   fallback reserves worst-case counter headroom.
