@@ -376,6 +376,21 @@ first_file() {
   return 1
 }
 
+# staged_names <dir> — the pending entries in the SAME order the consume loop stages them (the
+# shell's collating order for `for f in dir/*`), one name per line.
+#
+# WHY THIS EXISTS: send order is NOT staged order. A queue name is `<_now_compact>-<pid>` (seam
+# decision 3), and pids do not collate monotonically — "10001" sorts BEFORE "9999". Any scenario
+# that reasons about "the first staged message" must read the order back from the queue rather
+# than assume the order its own sends happened in, or the assertion silently changes meaning
+# depending on which pids the machine handed out.
+staged_names() {
+  for _sn in "$1"/*; do
+    [ -e "$_sn" ] || [ -L "$_sn" ] || continue
+    printf '%s\n' "${_sn##*/}"
+  done
+}
+
 # Dot-prefixed entries — the temp names (seam decision 2, UNCHANGED by v1.2: the temp is
 # `.tmp-<id>` inside pending/ itself). A plain `for f in dir/*` never sees them, which is exactly
 # the property the design relies on; this helper is how the suite checks what the glob cannot.
@@ -707,6 +722,32 @@ write_status_only_envelope_jq() {
     printf 'exec "%s" "$@"\n' "$_ws_real"
   } > "$_ws_dest" || return 1
   chmod +x "$_ws_dest"
+}
+
+# write_id_editing_envelope_jq <dest> <real-jq> <sed-script-file>
+# For the SessionStart serializer call ONLY, run the caller's sed script over the
+# additionalContext VALUE before real jq serializes it; every other call — the three capability
+# probes and every per-message digest — is delegated to the real binary byte-for-byte, so the
+# batch that reaches the serializer is genuinely healthy and genuinely staged.
+#
+# This is the same argv case-check as write_status_only_envelope_jq (V.V/84), widened from "drop
+# the whole DM block" to "edit selected digest records", which is what the emit-time integrity
+# check is actually scoped against. It transforms an ENGINE value, never JSON: real jq still
+# produces the envelope, so the payload the engine validates is well-formed and rc 0 — the
+# anomaly is confined to WHICH staged ids survive into it.
+write_id_editing_envelope_jq() {
+  _wi_dest=$1; _wi_real=$2; _wi_script=$3
+  [ -s "$_wi_script" ] || return 1     # an empty script is a silently blind instrument
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'if [ "$#" -eq 5 ] && [ "$1" = "-n" ] && [ "$2" = "--arg" ] && [ "$3" = "c" ]; then\n'
+    printf '  _edited=$(printf "%%s\\n" "$4" | sed -f "%s") || exit 90\n' "$_wi_script"
+    printf '  exec "%s" -n --arg c "$_edited" "$5"\n' "$_wi_real"
+    printf 'fi\n'
+    printf 'exec "%s" "$@"\n' "$_wi_real"
+  } > "$_wi_dest" || return 1
+  chmod +x "$_wi_dest"
 }
 
 # plant_message <repo> <lane> <marker> — send a REAL message from alpha carrying <marker>, then
@@ -4807,6 +4848,351 @@ sc_status_counts_existing_failed_entries() {
     "an inspectable positive failed/ state must not render cannot-inspect"
 }
 
+# ══════════ V.B — emit-time batch integrity: the check must cover the set it authorizes ══════
+#
+# AUTHORITY: .context/prompts/serializer-defect-red.md — a defect in ALREADY-SHIPPED code (PR #7,
+# deployed 2026-08-05), independent of task 5.7. `_emit_session_ctx_pinned` validates that the
+# serialized envelope carries the FIRST staged id only, while `_hook_session_start` archives
+# EVERY staged name on its success. An envelope that kept message 1 and dropped 2..N therefore
+# passes the guard and archives all N as delivered — silent loss of messages that never reached
+# the model. Same defect class as the r8 lesson `count-checks-admit-set-drift`: an integrity
+# check scoped narrower than the set it authorizes, here first-only rather than count-only.
+#
+# THE RULING THIS SECTION FORCES (the brief pins "the batch is not archived" and demands absolute
+# counts, so a choice had to be made and is named here rather than left implicit): a partial
+# envelope rejects the WHOLE batch — nothing is emitted, nothing is archived, all N stay pending.
+# Two things force it over the "archive only the ids that survived" alternative:
+#   · it is what the existing guard ALREADY does when it fires (systemic flag, rc 1, no emit, no
+#     archive, warn + replay). The defect is the guard's SCOPE, not its remedy, so the fix is a
+#     strict widening of a reject that already exists — not a new partial-archive behaviour.
+#   · V.B/105 pins the drop-the-first-id case, which is caught by accident TODAY and whose
+#     today-behaviour is exactly that whole-batch reject. A partial-archive fix would turn
+#     V.B/105's correct outcome into a regression.
+# It is also the settled treatment of every other anomalous-payload path in this suite —
+# V.N/53, V.R/75, V.U/77, V.V/81 and V.V/84 all read "leave EVERYTHING pending".
+#
+# NUMBERING: 92-102 belong to section V.P (task 5.7), committed at 4e541c6 and deliberately
+# reverted off main so the tree stays green; it returns when 5.7 unblocks. This section starts
+# at 103 so that re-landing collides with nothing.
+#
+# INSTRUMENT (one, shared by all four): write_id_editing_envelope_jq — a PATH-shimmed jq that
+# edits the additionalContext value for the serializer call ONLY. Its NEGATIVE control is
+# V.B/103/106 (the edit engages — with a real jq the batch would be archived, so a blind shim
+# fails those scenarios rather than passing them); its POSITIVE control is V.B/104, which runs
+# the identical shim with a sed script that matches nothing and must still deliver the whole
+# batch — that is what proves the shim's rewrite path does not by itself corrupt the envelope.
+# PATH is restored BEFORE any assertion can return early, and the restore is checked.
+
+# V.B/103 — THE CORE FAULT. Three staged messages; the envelope keeps the first staged id and
+# loses the other two. Today the first-only case-check is satisfied, the payload is emitted, and
+# the archive loop walks "$@" — so all three are moved to read/ and the two that never reached
+# the model are gone.
+#   PROVES     absolute counts, never "it moved": pending/ == 3, read/ == 0, failed/ == 0, no
+#              payload on stdout, a diagnostic was written, and every message still delivers on a
+#              healthy retry (i.e. retained AND replayable, not merely retained).
+#   REJECTS    the shipped first-only check; any check that samples one id rather than the set;
+#              and a "reject but keep nothing" fix that loses the batch a different way.
+sc_partial_envelope_must_not_archive_the_batch() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "batch-integrity-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue batch message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  # Staged order, read back from the queue — see staged_names for why send order will not do.
+  kept=$(staged_names "$pd" | sed -n '1p')
+  lost_a=$(staged_names "$pd" | sed -n '2p')
+  lost_b=$(staged_names "$pd" | sed -n '3p')
+  [ -n "$kept" ] && [ -n "$lost_a" ] && [ -n "$lost_b" ] \
+    || { fail "fixture: could not resolve the three staged ids"; return 0; }
+
+  sed_script="$base/partial-envelope.sed"
+  { printf '/"id":"%s"/d\n' "$lost_a"; printf '/"id":"%s"/d\n' "$lost_b"; } > "$sed_script" \
+    || { fail "fixture: could not write the digest-dropping sed script"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-partial-envelope-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the partial-envelope shim dir"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the partial-envelope jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/jq) ;;                       # _dm_resolve_jq pins the first executable jq on
+    *) PATH=$saved_path; export PATH         # PATH, so if PATH does not resolve to the shim the
+       fail "instrument blind: PATH does not resolve jq to the partial-envelope shim, so the serializer under test would be the real one"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  hook_out="$base/partial-envelope.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the partial-envelope jq shim is STILL what PATH resolves"; return 0 ;;
+  esac
+  hook_added="$base/partial-envelope.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with a partial envelope"
+  need_eq "$(byte_size "$hook_out")" 0 \
+    "stdout after a partial envelope — an envelope missing staged ids must not be emitted at all"
+  # Instrument ENGAGED control. Vacuous under a correct engine (stdout is empty), load-bearing
+  # under the shipped one: a BLIND shim would have serialized the complete context, so the
+  # dropped ids WOULD appear here — and this fires with its own distinct reason instead of
+  # letting a blind instrument masquerade as the defect.
+  need_file_lacks "$hook_out" "$lost_a" \
+    "instrument control: an emitted payload must not carry the first dropped staged id (if it does, the shim never engaged and this scenario is measuring the wrong thing)"
+  need_file_lacks "$hook_out" "$lost_b" \
+    "instrument control: an emitted payload must not carry the second dropped staged id (if it does, the shim never engaged)"
+  warn_count=$(grep -c '^brain:' "$hook_added" 2>/dev/null)
+  [ "${warn_count:-0}" != 0 ] \
+    || fail "a rejected partial envelope must be diagnosed: no 'brain:' line reached .hook-errors.log"
+  need_count "$pd" 3 \
+    "pending/ after a partial envelope — the integrity check authorizes the archive of the WHOLE staged batch, so an envelope that lost part of it may archive NONE of it"
+  need_count "$rd" 0 \
+    "read/ after a partial envelope — a message the envelope dropped was never delivered, and archiving it as read is silent loss"
+  need_count "$fd" 0 "failed/ after a partial envelope — a serializer anomaly is not proof any message is invalid"
+  need_tree_has "$pd" "batch-integrity-a-v13" "batch message a must remain queued"
+  need_tree_has "$pd" "batch-integrity-b-v13" "batch message b must remain queued"
+  need_tree_has "$pd" "batch-integrity-c-v13" "batch message c must remain queued"
+
+  run_brain "$fx" bravo hook session-start
+  retry_rc=$?
+  need_rc "$retry_rc" 0 "stable-jq SessionStart retry after the partial envelope" || return 0
+  need_file_has "$OUT" "batch-integrity-a-v13" "retained batch message a must deliver on retry"
+  need_file_has "$OUT" "batch-integrity-b-v13" "retained batch message b must deliver on retry"
+  need_file_has "$OUT" "batch-integrity-c-v13" "retained batch message c must deliver on retry"
+  need_count "$pd" 0 "pending/ after the stable-jq retry"
+  need_count "$rd" 3 "read/ after the stable-jq retry"
+}
+
+# V.B/104 — THE HEALTHY BATCH STILL DELIVERS, and the instrument's positive control. The same
+# shim runs the same rewrite path with a sed script that matches nothing, so the envelope carries
+# every staged id: all three must archive. Widening the integrity check must not make it reject
+# healthy batches, and this is what stops V.B/103/106 from being satisfied by "reject whenever
+# the shim is on PATH" or by a fix that rejects any batch larger than one.
+#   BASELINE   green today. It is a guard, not a red.
+sc_complete_envelope_archives_the_whole_batch() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "complete-batch-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue complete-batch message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  sed_script="$base/complete-envelope.sed"
+  # Deliberately non-empty and deliberately unmatchable: the filter RUNS and removes nothing, so
+  # this exercises the shim's rewrite path rather than skipping it.
+  printf '/"id":"THIS-ID-IS-NEVER-STAGED-v13"/d\n' > "$sed_script" \
+    || { fail "fixture: could not write the no-op sed script"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-complete-envelope-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the complete-envelope shim dir"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the complete-envelope jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/jq) ;;                       # _dm_resolve_jq pins the first executable jq on
+    *) PATH=$saved_path; export PATH         # PATH, so if PATH does not resolve to the shim the
+       fail "instrument blind: PATH does not resolve jq to the complete-envelope shim, so the serializer under test would be the real one"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  hook_out="$base/complete-envelope.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the complete-envelope jq shim is STILL what PATH resolves"; return 0 ;;
+  esac
+  hook_added="$base/complete-envelope.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with a complete envelope"
+  need_eq "$(grep -c '^brain:' "$hook_added" 2>/dev/null)" 0 \
+    "a complete envelope must produce no emit warning"
+  need_file_has "$hook_out" "complete-batch-a-v13" "complete-batch message a must be delivered"
+  need_file_has "$hook_out" "complete-batch-b-v13" "complete-batch message b must be delivered"
+  need_file_has "$hook_out" "complete-batch-c-v13" "complete-batch message c must be delivered"
+  need_count "$pd" 0 \
+    "pending/ after a COMPLETE envelope — every staged id survived serialization, so the whole batch archives"
+  need_count "$rd" 3 "read/ after a complete envelope"
+  need_count "$fd" 0 "failed/ after a complete envelope"
+}
+
+# V.B/105 — ORDER INDEPENDENCE. The envelope loses the FIRST staged id and keeps the rest. Today
+# this is caught BY ACCIDENT — it is the one id the check happens to sample. Pinned so that
+# widening the check to the whole set cannot regress the case it already covers, and so a fix
+# that merely moves the sample (last id, any id) is rejected rather than accepted.
+#   BASELINE   green today, for the right reason.
+sc_envelope_dropping_first_staged_id_is_rejected() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "first-id-dropped-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue first-id-dropped message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  dropped=$(staged_names "$pd" | sed -n '1p')
+  [ -n "$dropped" ] || { fail "fixture: could not resolve the first staged id"; return 0; }
+
+  sed_script="$base/first-id-dropped.sed"
+  printf '/"id":"%s"/d\n' "$dropped" > "$sed_script" \
+    || { fail "fixture: could not write the first-id sed script"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-first-id-dropped-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the first-id shim dir"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the first-id jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/jq) ;;                       # _dm_resolve_jq pins the first executable jq on
+    *) PATH=$saved_path; export PATH         # PATH, so if PATH does not resolve to the shim the
+       fail "instrument blind: PATH does not resolve jq to the first-id shim, so the serializer under test would be the real one"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  hook_out="$base/first-id-dropped.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the first-id jq shim is STILL what PATH resolves"; return 0 ;;
+  esac
+  hook_added="$base/first-id-dropped.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with the first staged id dropped"
+  need_eq "$(byte_size "$hook_out")" 0 "stdout after the first staged id is dropped"
+  warn_count=$(grep -c '^brain:' "$hook_added" 2>/dev/null)
+  [ "${warn_count:-0}" != 0 ] \
+    || fail "a rejected envelope must be diagnosed: no 'brain:' line reached .hook-errors.log"
+  need_count "$pd" 3 "pending/ when the envelope lost the first staged id"
+  need_count "$rd" 0 "read/ when the envelope lost the first staged id"
+  need_count "$fd" 0 "failed/ when the envelope lost the first staged id"
+
+  run_brain "$fx" bravo hook session-start
+  retry_rc=$?
+  need_rc "$retry_rc" 0 "stable-jq SessionStart retry after the first staged id was dropped" || return 0
+  need_file_has "$OUT" "first-id-dropped-a-v13" "retained message a must deliver on retry"
+  need_file_has "$OUT" "first-id-dropped-b-v13" "retained message b must deliver on retry"
+  need_file_has "$OUT" "first-id-dropped-c-v13" "retained message c must deliver on retry"
+  need_count "$pd" 0 "pending/ after the stable-jq retry"
+  need_count "$rd" 3 "read/ after the stable-jq retry"
+}
+
+# V.B/106 — SET, NOT COUNT. The envelope carries three id fragments, but the second staged id has
+# been rewritten to repeat the first: the COUNT still matches the staged batch while the SET does
+# not. This is the r8 lesson the brief cites by name (`count-checks-admit-set-drift`) applied to
+# the obvious wrong fix — replacing a first-only sample with a "the envelope mentions as many ids
+# as we staged" tally, which V.B/103, /104 and /105 would all accept.
+#   BEYOND THE BRIEF's three scenarios, and flagged as such in the report: the brief names that
+#   lesson as this defect's class, which makes the count-only fix a plausible non-compliant
+#   implementation that nothing else here rejects. It needs no ruling the section header has not
+#   already made — an id that is not in the envelope may not be archived.
+sc_repeated_id_envelope_must_not_archive_the_batch() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "repeated-id-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue repeated-id message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  kept=$(staged_names "$pd" | sed -n '1p')
+  shadowed=$(staged_names "$pd" | sed -n '2p')
+  [ -n "$kept" ] && [ -n "$shadowed" ] \
+    || { fail "fixture: could not resolve the staged ids"; return 0; }
+
+  sed_script="$base/repeated-id.sed"
+  printf 's|"id":"%s"|"id":"%s"|\n' "$shadowed" "$kept" > "$sed_script" \
+    || { fail "fixture: could not write the id-repeating sed script"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-repeated-id-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the repeated-id shim dir"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the repeated-id jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/jq) ;;                       # _dm_resolve_jq pins the first executable jq on
+    *) PATH=$saved_path; export PATH         # PATH, so if PATH does not resolve to the shim the
+       fail "instrument blind: PATH does not resolve jq to the repeated-id shim, so the serializer under test would be the real one"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  hook_out="$base/repeated-id.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the repeated-id jq shim is STILL what PATH resolves"; return 0 ;;
+  esac
+  hook_added="$base/repeated-id.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with a repeated staged id"
+  need_eq "$(byte_size "$hook_out")" 0 \
+    "stdout when one staged id is missing but the id COUNT still matches"
+  # Instrument ENGAGED control — see V.B/103. Vacuous once the envelope is rejected; under the
+  # shipped engine it proves the rewritten id really is absent from what was serialized.
+  need_file_lacks "$hook_out" "$shadowed" \
+    "instrument control: an emitted payload must not carry the id the shim rewrote away (if it does, the shim never engaged)"
+  warn_count=$(grep -c '^brain:' "$hook_added" 2>/dev/null)
+  [ "${warn_count:-0}" != 0 ] \
+    || fail "a rejected repeated-id envelope must be diagnosed: no 'brain:' line reached .hook-errors.log"
+  need_count "$pd" 3 \
+    "pending/ when the envelope repeats one staged id in place of another — matching the id COUNT is not proof the SET was serialized"
+  need_count "$rd" 0 "read/ when a staged id is absent from the envelope under a matching count"
+  need_count "$fd" 0 "failed/ after a repeated-id envelope"
+  need_tree_has "$pd" "repeated-id-a-v13" "repeated-id message a must remain queued"
+  need_tree_has "$pd" "repeated-id-b-v13" "repeated-id message b must remain queued"
+  need_tree_has "$pd" "repeated-id-c-v13" "repeated-id message c must remain queued"
+
+  run_brain "$fx" bravo hook session-start
+  retry_rc=$?
+  need_rc "$retry_rc" 0 "stable-jq SessionStart retry after the repeated-id envelope" || return 0
+  need_file_has "$OUT" "repeated-id-a-v13" "retained repeated-id message a must deliver on retry"
+  need_file_has "$OUT" "repeated-id-b-v13" "retained repeated-id message b must deliver on retry"
+  need_file_has "$OUT" "repeated-id-c-v13" "retained repeated-id message c must deliver on retry"
+  need_count "$pd" 0 "pending/ after the stable-jq retry"
+  need_count "$rd" 3 "read/ after the stable-jq retry"
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
 printf 'brain lane-DM v1.2 RED suite (claim layer deleted) + v1.2.1-v1.2.4 contract addenda\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
@@ -4909,6 +5295,11 @@ scenario red   "V.Y/88  unreadable-lane-status-banner"      sc_status_surfaces_u
 scenario guard "V.Y/89  proven-absent-failed-is-silent"     sc_status_keeps_proven_absent_failed_state_silent
 scenario guard "V.Z/90  existing-empty-failed-is-silent"    sc_status_keeps_existing_empty_failed_state_silent
 scenario guard "V.Z/91  positive-failed-count-is-visible"  sc_status_counts_existing_failed_entries
+
+scenario red   "V.B/103 partial-envelope-archives-none"   sc_partial_envelope_must_not_archive_the_batch
+scenario guard "V.B/104 complete-envelope-archives-all"   sc_complete_envelope_archives_the_whole_batch
+scenario guard "V.B/105 first-id-dropped-is-rejected"     sc_envelope_dropping_first_staged_id_is_rejected
+scenario red   "V.B/106 repeated-id-envelope-rejected"    sc_repeated_id_envelope_must_not_archive_the_batch
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'
