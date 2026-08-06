@@ -711,6 +711,12 @@ file.
 **Fix:** validate **every** staged id, not `$1`. RED brief staged at
 `.context/prompts/serializer-defect-red.md`.
 
+**Same-class sweep — DONE, and it came back clean (@pm, 2026-08-06).** Only three sites iterate a
+list with `for … in "$@"`, and the other two are **not** this defect: `_resolve_whoami`'s multi-match
+tiebreak (~239) evaluates each candidate independently and returns on the first hit, and `cmd_init`
+(~1691) is flag parsing. The validate-once-authorize-many shape exists **only** at 1421/1539. That
+bounds the fix to one site — do not let it grow into a sweep.
+
 ## Phase 6 — End-to-end verification `[ ]` (two real lanes — the method used throughout E0–E15)
 
 - `[ ]` 6.1 Two cold scratch lanes, each armed only by the hook
