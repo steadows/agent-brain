@@ -550,12 +550,18 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
          at-least-once contract, which *explicitly permits crash replay*. It must be restated as
          **"no duplicate under a clean, non-crashing handoff"** — or the contract changes. My spec
          error, not Codex's misreading.
-      2. **The combination case is deeper than requirement 4 states.** The `ask` branch uses
-         `permissionDecisionReason`; `allow` uses `additionalContext`. A collision that triggers
-         **`ask`** PLUS a pending DM therefore cannot be solved by concatenating into one `ask`
-         call — the DM would never arrive, because it would ride the wrong field. One object needs
-         **both** fields, and that `ask + additionalContext` shape is itself unverified against the
-         harness.
+      2. **The combination case is deeper than requirement 4 states — but see the correction.** The
+         `ask` branch uses `permissionDecisionReason`; `allow` uses `additionalContext`. A collision
+         that triggers **`ask`** PLUS a pending DM cannot be solved by concatenating into one `ask`
+         call — the DM would ride the wrong field and never arrive.
+         **✅ DOWNGRADED — the `ask` branch is UNREACHABLE in hook context.** Found by `test-writer`
+         empirically, then confirmed independently by @pm: line 1577 gates it on
+         `[ "${BRAIN_PRETOOL_MODE:-allow}" = "ask" ] && [ -t 1 ]`, and a hook's stdout is never a
+         tty, so the engine always takes `allow` + `additionalContext` (verified: with
+         `BRAIN_PRETOOL_MODE=ask` and redirected stdout it still emits `allow`). The comment at
+         1576 says so deliberately — *"ask is forbidden without an attached human (fix K)"*.
+         **Net: a latent trap if anyone ever removes the tty guard, not a live blocker.** The
+         single-object requirement still stands for the `allow` + DM case.
       3. **PreToolUse cannot honestly satisfy "reaches a running lane in seconds."** A
          running-but-**idle** lane issues no tool calls, so the hook never fires. The task already
          conceded this in "out of scope" while the "Done when" clause still promises it. **Either
@@ -695,6 +701,15 @@ undetectable message loss, and the fix is trivial: validate **every** staged id,
 **This is the same defect class the r8 round already learned** — an integrity check scoped
 narrower than the set it authorizes (`count-checks-admit-set-drift`). It survived here in
 *first-only* form rather than count-only. Worth a targeted grep for other instances.
+
+⚠ **It is LIVE in the deployed vault.** `<main>/.brain/bin/brain` is byte-identical to this repo's
+`bin/brain` (md5 `4171e65e…` both sides), defect at deployed line 1422. **Fixing it here is not
+enough — the fix must be redeployed** via the 5.2 atomic-swap procedure (temp file → `chmod +x` →
+`sh -n` → `mv`), never a bare `cp`, and committed to the ERD repo where the engine is a tracked
+file.
+
+**Fix:** validate **every** staged id, not `$1`. RED brief staged at
+`.context/prompts/serializer-defect-red.md`.
 
 ## Phase 6 — End-to-end verification `[ ]` (two real lanes — the method used throughout E0–E15)
 
