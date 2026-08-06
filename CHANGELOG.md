@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.3 — 2026-08-06
+
+Fix: the serializer validated only the first staged message id while the caller archived all
+staged messages. A partial envelope could therefore archive undelivered messages as read. The
+serializer now validates every staged id and rejects the whole batch if any id is missing.
+
 ## v1.2.2 — 2026-08-05 — enumeration is fatal-not-empty; paths, identities and the emit are byte-exact and pinned
 
 Seven hardening rounds (v1.2.2 + r2-r7) closing seam-map rulings 7-14 (`.context/seams/

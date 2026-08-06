@@ -8,7 +8,7 @@
 # (the portable equivalent — mkdir is atomic create on POSIX filesystems).
 
 set -u
-VERSION="1.2.2"
+VERSION="1.2.3"
 
 # Clear the vault-resolution sentinel at process entry: it is a marker for "this process ran
 # brain_root()", and an inherited value would let a caller's environment stand in for that.
