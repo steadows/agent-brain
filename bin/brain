@@ -15,6 +15,9 @@ VERSION="1.2.3"
 _BRAIN_RESOLVED=""
 # Clear snapshot state too: inherited values must not stand in for work this process performed.
 _CHANGES_TOTAL=0; _CHANGES_CURRENT=0
+# Clear caller-visible warning state so inherited values cannot suppress or forge diagnostics.
+_WHOAMI_WARNED=""
+_DM_MISSING_IDS=""
 
 # DM bounds. One file per message removes the old append-atomicity rationale; the body cap now
 # bounds storage and digest work. Consumption is bounded by the surviving digest limits.
@@ -212,7 +215,7 @@ _resolve_whoami() {
     if _feat_ok "$BRAIN_FEATURE"; then
       _WHOAMI=$BRAIN_FEATURE
     else
-      _warn "invalid inherited BRAIN_FEATURE (bare slug only)"
+      [ "${_WHOAMI_WARNED:-}" = 1 ] || { _warn "invalid inherited BRAIN_FEATURE (bare slug only)"; _WHOAMI_WARNED=1; }
     fi
     return 0
   fi
@@ -891,15 +894,23 @@ _recent_journal() {
 }
 
 _changes_snapshot() { # <identity>
+  # Keep the sole CHANGES count here. Snapshot before rendering so commit records exactly what
+  # was displayed; re-counting at commit could mark later additions read. Neither invariant is
+  # test-guarded.
   _CHANGES_TOTAL=0; _CHANGES_CURRENT=0
   _CHANGES_CURSOR="$BRAIN/.cursors/${1:-anon}.changes"
   [ -f "$BRAIN/CHANGES.md" ] || return 0
   _CHANGES_TOTAL=$(grep -c '^- ' "$BRAIN/CHANGES.md" 2>/dev/null || echo 0)
-  [ -f "$_CHANGES_CURSOR" ] && \
+  if [ -f "$_CHANGES_CURSOR" ]; then
     _CHANGES_CURRENT=$(cat "$_CHANGES_CURSOR" 2>/dev/null || echo 0)
+  fi
+  return 0
 }
 
 _changes_commit() {
+  [ -n "${_CHANGES_CURSOR:-}" ] || return 0
+  # A stale concurrent snapshot may move the cursor backward, causing only a repeat banner.
+  # Deliberately write the snapshot without re-reading so undisplayed changes are never marked read.
   [ "$_CHANGES_TOTAL" -gt "$_CHANGES_CURRENT" ] 2>/dev/null || return 0
   mkdir -p "$BRAIN/.cursors"
   _atomic_place printf "$_CHANGES_CURSOR" '%s\n' "$_CHANGES_TOTAL"
@@ -1549,6 +1560,8 @@ $_st"
   fi
   if [ "$_emit_rc" = 0 ]; then
     _changes_commit
+    _changes_commit_rc=$?
+    [ "$_changes_commit_rc" = 0 ] || _warn "could not record the CHANGES cursor at $_CHANGES_CURSOR; the banner will repeat next boot"
     if [ "$#" -gt 0 ]; then
       _archive_rc=0
       for _emitted_name in "$@"; do
@@ -1789,6 +1802,8 @@ case "$_sub" in
     cmd_status "$@"
     _status_rc=$?
     _changes_commit
+    _changes_commit_rc=$?
+    [ "$_changes_commit_rc" = 0 ] || _warn "could not record the CHANGES cursor at $_CHANGES_CURSOR; the banner will repeat next boot"
     exit "$_status_rc"
     ;;
   reconcile)   cmd_reconcile "$@" ;;

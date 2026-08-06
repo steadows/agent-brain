@@ -382,6 +382,11 @@ probe "M5  prose-digest         " "V.W/26 V.W/27 V.W/28" "" 1 \
 #   envelope), not instrument damage, and they are deterministic, so they are REQUIRED rather
 #   than permitted. Removing the relaxation does not help: an un-relaxed loop rejects every
 #   batch wholesale and M6 becomes a blunt systemic mutant instead of a focused one.
+#   V.B/107, V.B/108 and V.D/109 die for M6 and M12 on a removed premise: both mutants stop the
+#   rejection, so the reject diagnostic is never reached. They do not cover that diagnostic.
+#   No mutant touches its warning because both replacements preserve _DM_MISSING_IDS: mutation
+#   coverage there is zero. The suite still pins it independently — naming every staged id instead
+#   of every missing id dies to V.B/107 alone — but the probe cannot re-prove that mechanism.
 probe "M6  digest-drops-id      " "V.N/52 V.B/103 V.B/105 V.B/106 V.B/107 V.B/108 V.D/109" "" 3 \
   's@^          id: \$id$@          id: ""@
 /^    case "\$_pd_digest" in$/{n;s@^      .*@      \\{*id*\\})@;}
@@ -486,6 +491,8 @@ probe "M11 no-directive-verb    " "V.C/24" "" 1 \
 #   NOT V.B/104 or V.B/105: both survive BY CONSTRUCTION, and that is the mutant's own control.
 #   /104's envelope carries every id, so first-only still accepts and the batch still archives;
 #   /105's envelope drops the first id, which first-only is precisely the check that catches.
+#   As documented at M6, V.B/107, V.B/108 and V.D/109 remove the rejection premise here too;
+#   those declared kills do not mutation-cover the preserved reject diagnostic.
 probe "M12 envelope-first-id-only" "V.B/103 V.B/106 V.B/107 V.B/108 V.D/109" "" 1 \
   's@^ *case "\$_esc_payload" in \*.*_DM_MISSING_IDS=.* ;; esac$@      case "$_esc_payload" in *'"'"'\\"id\\":\\"'"'"'"$1"'"'"'\\"'"'"'*) ;; *) _DM_MISSING_IDS="${_DM_MISSING_IDS}${_DM_MISSING_IDS:+ }$_ep_name" ;; esac@'
 
@@ -497,6 +504,9 @@ probe "M13 early-cursor-commit  " "V.D/109" "" 1 \
 
 # The hook must commit after a successful delivery even when no DMs were staged. Scope through
 # the unique delivery gate because the hook and CLI commit calls have identical indentation.
+# M14 covers row 2 only: it kills V.D/110 at boots 2 and 4, while moving the commit into the
+# archive block kills boot 4 only. Row 3 is suite-guarded by boots 3-4 but not mutation-covered;
+# deleting those boots would leave M14 green on boot 2 while losing the placement guard.
 probe "M14 hook-cursor-commit   " "V.D/110" "" 1 \
   '/^  if \[ "\$_emit_rc" = 0 \]; then$/{n;s@^    _changes_commit$@    :@;}'
 
