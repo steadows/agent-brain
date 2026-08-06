@@ -5193,6 +5193,510 @@ sc_repeated_id_envelope_must_not_archive_the_batch() {
   need_count "$rd" 3 "read/ after the stable-jq retry"
 }
 
+# ══════════ V.B (cont.) — the reject path must be DIAGNOSABLE, not merely correct ═════════
+#
+# AUTHORITY: the code-review finding on the V.B/103-106 fix (relayed 2026-08-06). The widened
+# loop is correct — it rejects the whole batch when any staged id is absent from the envelope —
+# but it `return 1`s fail-fast and DISCARDS which id was missing. The caller's sole diagnostic
+# (`bin/brain:1546`) names the jq binary, never the message, and is byte-identical for two
+# different faults: the envelope-FRAMING rejection (the payload is not `{...}`) and the new
+# PER-ID rejection. V.B/103, /105 and /106 assert only `warn_count != 0`, so they pass whether
+# the warning identifies the offender or says nothing useful at all.
+#
+# WHY IT MATTERS: 13 lanes share this engine and a rejected batch stays pending, so a persistent
+# condition reprints the same generic line at every SessionStart forever. The only way to find
+# the stuck message today is hand-inspecting pending/. `bin/brain` itself does not work this way
+# anywhere else — 297-321 name their offender uniformly (`invalid dm lane component: $_do_lane`,
+# `dm queue path escapes the queue root: $_do_path`).
+#
+# THE RULING THESE PIN, and the places they deliberately stay silent:
+#   · PINNED — the per-id rejection's diagnostic names the MISSING staged id(s), and must NOT
+#     enumerate ids the envelope KEPT. See the RULING block on V.B/107 for the dispatcher's
+#     rationale and for the verbose "staged: a b c; missing: b c" shape it deliberately rejects.
+#   · NOT PINNED — whether it names the FIRST missing id or EVERY missing id. Seam §3's ruling
+#     of 2026-08-06 is name-every-missing-id (it REVERSED an earlier first-only lean), but these
+#     assertions stay compatible with both shapes on purpose: V.B/107 asserts the first missing
+#     id is PRESENT and never that the others are absent. Ratifying either way costs no test
+#     edit, and a first-only GREEN is measurably still green here.
+#   · NOT PINNED — any wording. V.B/108 pins only that the two fault classes do not emit the
+#     SAME text, which is the reviewable property; prescribing a phrase would freeze prose the
+#     authority never fixed.
+#   · PINNED, and easy to miss — the per-id reject path must emit EXACTLY ONE `brain:` line.
+#     That is V.U/77's and V.V/84's constraint, not this section's; see V.B/108's header.
+#
+# INSTRUMENTS: both scenarios reuse `write_id_editing_envelope_jq` exactly as V.B/103-106 do.
+# V.B/108 additionally reuses `write_rc0_truncated_payload_jq` (V.V/81's framing fault). No new
+# apparatus. The instrument-ENGAGED control in both is the pending/read count: a shim that never
+# edited the envelope would emit and archive the batch, so pending/ == 3 could not hold.
+
+# V.B/107 — THE REJECTED BATCH MUST NAME ITS OFFENDER. Three staged messages; the envelope keeps
+# the FIRST staged id and loses the other two, so the loop accepts index 1 and rejects at index 2.
+#   PROVES     the diagnostic written to .hook-errors.log carries the id of the staged message
+#              that was absent from the envelope.
+#   REJECTS    the shipped generic warning, which names jq and no message at all; a fix that
+#              reports `"$1"` — the first STAGED id — instead of the first MISSING one, which is
+#              the natural copy-paste from the pre-fix check and which the fixture separates by
+#              keeping index 1 intact; and W6 below.
+#
+# RULING (@pm, 2026-08-06): the reject diagnostic names the MISSING ids and must NOT enumerate
+# ids that were present. Rationale: `pending/` already preserves the staged set, so re-listing it
+# in the warning is redundant with what an operator can already see; the omission set is precisely
+# the thing `pending/` cannot tell them. A verbose "staged: a b c; missing: b c" shape is
+# deliberately rejected by this — mixing the two sets is exactly what made W6 indistinguishable
+# from a correct fix.
+#
+# W6 — THE FALSE GREEN THIS SCENARIO ONCE MISSED, and the assertion that closes it. W6 sets the
+# reject diagnostic to `$*` (EVERY staged id) rather than the accumulated missing subset, and
+# surfaces it through one enriched caller warning. Measured 2026-08-06: W6 passed all 100
+# scenarios. `need_file_has "$hook_added" "$lost_a"` is satisfied by any superset containing
+# lost_a, and the staged batch is a superset by construction; V.B/108 misses it too, because only
+# the per-id class carries ids so the two classes still differ. Under W6 the operator sees the
+# same id list no matter which ids the serializer actually dropped, which defeats the whole point
+# of this scenario. The `need_file_lacks "$hook_added" "$kept"` assertion below kills it, and was
+# measured to leave both a name-every-missing-id GREEN and a first-missing-only GREEN untouched —
+# so it stays neutral on the first-vs-all question, exactly as the has-assertion already is.
+sc_rejected_batch_diagnostic_names_the_missing_id() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "diag-missing-id-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue diagnostic batch message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  # Staged order, read back from the queue — see staged_names for why send order will not do.
+  kept=$(staged_names "$pd" | sed -n '1p')
+  lost_a=$(staged_names "$pd" | sed -n '2p')
+  lost_b=$(staged_names "$pd" | sed -n '3p')
+  [ -n "$kept" ] && [ -n "$lost_a" ] && [ -n "$lost_b" ] \
+    || { fail "fixture: could not resolve the three staged ids"; return 0; }
+
+  sed_script="$base/diag-missing-id.sed"
+  { printf '/"id":"%s"/d\n' "$lost_a"; printf '/"id":"%s"/d\n' "$lost_b"; } > "$sed_script" \
+    || { fail "fixture: could not write the digest-dropping sed script"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-diag-missing-id-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the diagnostic shim dir"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the diagnostic jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/jq) ;;                       # _dm_resolve_jq pins the first executable jq on
+    *) PATH=$saved_path; export PATH         # PATH, so if PATH does not resolve to the shim the
+       fail "instrument blind: PATH does not resolve jq to the diagnostic shim, so the serializer under test would be the real one"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the diagnostic jq shim is STILL what PATH resolves"; return 0 ;;
+  esac
+  hook_added="$base/diag-missing-id.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with a partial envelope"
+  # Instrument ENGAGED control: a shim that never edited the envelope would have emitted the
+  # complete context and archived all three, so these counts cannot hold unless the reject fired.
+  need_count "$pd" 3 "pending/ — the partial envelope must reject the whole staged batch"
+  need_count "$rd" 0 "read/ — nothing may be archived out of a rejected batch"
+  need_count "$fd" 0 "failed/ — a serializer anomaly is not proof any message is invalid"
+  warn_count=$(grep -c '^brain:' "$hook_added" 2>/dev/null)
+  [ "${warn_count:-0}" != 0 ] \
+    || { fail "a rejected partial envelope must be diagnosed: no 'brain:' line reached .hook-errors.log"; return 0; }
+  need_file_has "$hook_added" "$lost_a" \
+    "the reject diagnostic must name the staged id that was absent from the envelope — the shipped warning names only the jq binary, which leaves an operator hand-inspecting pending/ to find the message that stopped the batch"
+  need_file_lacks "$hook_added" "$kept" \
+    "the reject diagnostic must name the MISSING ids, not the staged batch: the id the envelope KEPT must not appear"
+}
+
+# V.B/108 — THE TWO REJECT CLASSES MUST BE TELLABLE APART. One fixture, one batch, ONE shim path,
+# two consecutive SessionStarts driving two different faults: (1) a staged id missing from an
+# otherwise well-formed envelope — the per-id check; (2) real jq's envelope minus its final byte
+# — the envelope-FRAMING check, which fires before any per-id check runs (V.V/81's fault).
+#   PROVES     the diagnostics the two faults write to .hook-errors.log are not identical text.
+#   REJECTS    the shipped engine, where both faults land on the single generic warning at
+#              bin/brain:1546 and are byte-for-byte indistinguishable; and the lazy fix of
+#              appending the staged batch to that SHARED line, which names ids in both classes
+#              and so still leaves an operator unable to tell which check rejected.
+#   WHY ONE SHIM PATH IS LOAD-BEARING: the generic warning interpolates $_DM_JQ_BIN, so two shim
+#   directories would make the two diagnostics differ on the BINARY PATH alone and this scenario
+#   would pass against the very engine it exists to reject. The shim file is overwritten in place
+#   between the runs; the batch is untouched because neither fault archives anything.
+#   DOES NOT   pin any wording. Comparing the whole added slice leaves GREEN free to phrase both
+#   PROVE      classes however it likes, so long as they differ.
+#   ⚠ WARNING  the per-id reject path must emit EXACTLY ONE `brain:` line. It must contain the jq
+#     COUNT    binary path (V.U/77, V.V/84), must name the missing id(s) (V.B/107), and must
+#     IS PINNED  differ from the framing line (this scenario). A single enriched CALLER warning
+#     ELSEWHERE  satisfies all four; an added `_warn` at the reject site does NOT.
+#              This header previously claimed the opposite — that only the FRAMING path was
+#              pinned at one line and GREEN "may legitimately add a second line on the per-id
+#              path". That was measurably false and is corrected here, because leaving it stood
+#              would have pushed GREEN into "fixing" two frozen, currently-passing scenarios.
+#              Both V.U/77 and V.V/84 drive the PER-ID path, not the framing path:
+#              write_rc0_empty_payload_jq emits `{}`, which PASSES the `\{*\}` framing case at
+#              bin/brain:1420 and rejects in the id loop at :1422; write_status_only_envelope_jq
+#              likewise yields a well-formed envelope that only fails per-id. Measured
+#              2026-08-06: a GREEN that adds a second `_warn` at the reject site scores 98/100,
+#              failing V.U/77 and V.V/84 with `got '2', want '1'`.
+sc_reject_classes_are_distinguishable() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "reject-class-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue reject-class message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  lost=$(staged_names "$pd" | sed -n '2p')
+  [ -n "$lost" ] || { fail "fixture: could not resolve the second staged id"; return 0; }
+
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-reject-class-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the reject-class shim dir"; return 0; }
+
+  # ── run 1: a staged id is absent from a well-formed envelope ──
+  sed_script="$base/reject-class.sed"
+  printf '/"id":"%s"/d\n' "$lost" > "$sed_script" \
+    || { fail "fixture: could not write the id-dropping sed script"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the id-dropping jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in
+    "$shim_dir"/jq) ;;
+    *) PATH=$saved_path; export PATH
+       fail "instrument blind: PATH does not resolve jq to the reject-class shim on the missing-id run"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  missing_rc=$?
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the reject-class jq shim is STILL what PATH resolves after the missing-id run"; return 0 ;;
+  esac
+  missing_err="$base/reject-class-missing-id.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$missing_err" 2>/dev/null || : > "$missing_err"
+
+  need_rc "$missing_rc" 0 "SessionStart hook wrapper status with a staged id missing from the envelope"
+  # Instrument ENGAGED control, and the precondition for run 2: the batch must survive intact.
+  need_count "$pd" 3 "pending/ after the missing-id rejection — the batch must survive for the framing run" || return 0
+
+  # ── run 2: SAME shim path, the envelope loses its closing delimiter instead ──
+  write_rc0_truncated_payload_jq "$shim_dir/jq" "$real_jq" c \
+    || { fail "fixture: could not overwrite the shim with the truncated-envelope jq"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in
+    "$shim_dir"/jq) ;;
+    *) PATH=$saved_path; export PATH
+       fail "instrument blind: PATH does not resolve jq to the reject-class shim on the framing run"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  framing_rc=$?
+  PATH=$saved_path; export PATH
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the reject-class jq shim is STILL what PATH resolves after the framing run"; return 0 ;;
+  esac
+  framing_err="$base/reject-class-framing.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$framing_err" 2>/dev/null || : > "$framing_err"
+
+  need_rc "$framing_rc" 0 "SessionStart hook wrapper status with a truncated envelope"
+  need_count "$pd" 3 "pending/ after the envelope-framing rejection"
+  need_count "$rd" 0 "read/ — neither rejection may archive anything"
+  need_count "$fd" 0 "failed/ — neither serializer anomaly is proof any message is invalid"
+
+  missing_warns=$(grep -c '^brain:' "$missing_err" 2>/dev/null)
+  framing_warns=$(grep -c '^brain:' "$framing_err" 2>/dev/null)
+  [ "${missing_warns:-0}" != 0 ] \
+    || { fail "the missing-staged-id rejection produced no 'brain:' line in .hook-errors.log"; return 0; }
+  [ "${framing_warns:-0}" != 0 ] \
+    || { fail "the envelope-framing rejection produced no 'brain:' line in .hook-errors.log"; return 0; }
+
+  missing_text=$(cat "$missing_err" 2>/dev/null)
+  framing_text=$(cat "$framing_err" 2>/dev/null)
+  [ "$missing_text" != "$framing_text" ] \
+    || fail "the two reject classes are indistinguishable: a staged id missing from the envelope and an envelope missing its closing delimiter wrote byte-identical diagnostics ($missing_text) — an operator cannot tell which check rejected the batch"
+}
+
+# ═══════ V.D — the CHANGES cursor may only advance when the banner was DELIVERED ═════════
+#
+# A SEPARATE CONCERN FROM V.B/103-108, which is why this takes its own section letter instead of
+# extending that block. V.B is BATCH INTEGRITY: which staged DM ids must survive into the envelope
+# before an archive is authorized. This is DELIVERY-CONDITIONED CURSOR COMMIT: a piece of on-disk
+# state that `cmd_status` advances while RENDERING, inside a caller that may then throw the render
+# away. The two share a fixture shape (a rejected pinned emit) and one instrument, and nothing
+# else — different state, different failure, different fix.
+#
+# AUTHORITY: .context/seams/pr10-cursor-and-diagnostic.md §2 ("Seam decision A — the CHANGES
+# cursor: ONE counter, ONE writer, split render from commit"), plus the dispatcher's ruling of
+# 2026-08-06 that settles the one thing §2 leaves ambivalent (see THE TENSION, below).
+# Implementation lines are cited as EVIDENCE only: bin/brain:944-953 (the banner block — reads the
+# bookmark at :946, writes it at :951), :1521 (`_st=$(cmd_status 2>/dev/null)` — the hook CAPTURES
+# that render), :1530 and :1535 (the pinned emit, and the rc check that may discard the whole
+# payload), :1770 (the CLI `status` dispatch).
+#
+# THE DEFECT: `cmd_status` advances the bookmark as a side effect of rendering the banner.
+# `_hook_session_start` captures the render into a variable and discards the entire payload when
+# `_emit_session_ctx_pinned` rejects. The bookmark moved, the banner was never delivered to the
+# agent, and because the bookmark now equals the entry count, EVERY later healthy boot omits it —
+# permanently, silently, and unrecoverably short of hand-editing a gitignored file.
+#
+# WHY THIS BRANCH OWNS IT: on main only a MISSING FIRST staged id rejected. This branch widened the
+# check to every staged id, so the set of envelopes that reach the discard path is strictly larger.
+# V.D/109's fixture keeps the first staged id and drops the SECOND precisely so the widened loop is
+# the only thing that can reject it — a missing-first fixture would reject on main too and would
+# not isolate this branch's regression.
+#
+# THE TENSION IN THE AUTHORITY, and how it was resolved (declared, not quietly picked): §2's
+# headline sentence reads "stop the HOOK from committing the bookmark", and its cost bullet calls
+# "never marking read → the banner repeats (annoying, harmless)" an acceptable error. Read
+# literally, that permits a fix under which the hook NEVER commits — which V.D/110 rejects. But the
+# same section also says "the decision to commit moves to the delivery-aware caller" and names
+# three permitted shapes that all have the caller committing after a successful emit; and the
+# dispatcher's 2026-08-06 brief is explicit — "a healthy SessionStart that DOES deliver MUST still
+# advance the cursor ... this guard is load-bearing; do not omit it." That is the later and more
+# specific ruling, so V.D/110 pins it. Raised in the hand-off report rather than buried here.
+#
+# OBSERVABLE, NOT STRUCTURAL: every assertion in this section reads the banner text out of an
+# emitted payload or a terminal capture. NOTHING here inspects `$BRAIN/.cursors/*.changes`. That
+# file is an implementation detail — its path, its format, and whether it exists at all are the
+# fix's business — and a test that read it would pass against a fix that moved the bookmark
+# correctly while losing the banner some other way, which is exactly the failure under test.
+#
+# FIXTURE NOTE: CHANGES.md entries are appended DIRECTLY, for `write_presence`'s reason — the only
+# engine route to one is `brain propose` + `brain apply`, a governance gauntlet whose own behaviour
+# is not under test here. The engine's sole reader counts lines matching `^- ` (:945); that is the
+# shape these fixtures write.
+#
+# INSTRUMENTS: V.D/109 reuses `write_id_editing_envelope_jq` exactly as V.B/103-108 do, with the
+# same instrument-blind check before the run and instrument-leak check after PATH is restored. Its
+# POSITIVE control — the same shim with a matchless script must still deliver the whole batch — is
+# V.B/104 and is deliberately NOT duplicated here. V.D/110 and V.D/111 use NO instrument at all:
+# they drive the unmodified engine and read its output. No new apparatus in this section.
+#
+# NUMBERING: starts at 109, after V.B/108. 92-102 stay reserved for section V.P (task 5.7).
+
+# V.D/109 — THE REGRESSION. Three unread CHANGES entries, three staged DMs, and an envelope missing
+# the SECOND staged id, so the widened per-id loop is what rejects and the whole payload — banner
+# included — is discarded. The assertion that matters is the SUBSEQUENT healthy boot.
+#   PROVES     a boot whose payload was rejected does not consume the CHANGES banner: the next
+#              healthy SessionStart still carries it in additionalContext.
+#   REJECTS    the shipped engine, which advances the bookmark inside cmd_status at render time, so
+#              the banner dies the moment the caller discards the render; and any fix that stops
+#              the bookmark moving without leaving the banner deliverable on a later boot.
+#   WHY NOT A  a `.cursors/bravo.changes` assertion would also pass against a fix that keeps the
+#   CURSOR     bookmark honest but drops the banner from the payload for some unrelated reason. The
+#   ASSERTION  retry's additionalContext is what an agent actually receives, so that is what is
+#              asserted; no structural witness is needed to discriminate the named fault.
+#   DOES NOT   pin WHERE the deferral lives — seam §2 permits a cmd_status mode, a pending-value
+#     PIN      global the caller commits, or a caller-side stash/restore, and this scenario cannot
+#              tell them apart; nor the cursor file's path, format or existence; nor the banner's
+#              wording beyond the substring the engine has always printed; nor what the REJECTED
+#              boot's own bookmark state looks like — only that the banner survives to be
+#              delivered. It also does not re-pin batch retention: V.B/103 owns that.
+sc_rejected_boot_does_not_consume_the_changes_banner() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+  changes="$fx/.brain/CHANGES.md"
+  needle="brain change(s) since you last looked"
+
+  for n in 1 2 3; do
+    printf '%s\n' "- 2026-08-06T00:00:0$n cursor-red-$n — fixture change $n" >> "$changes" \
+      || { fail "fixture: could not seed CHANGES.md"; return 0; }
+  done
+  # Fixture sanity only — the shape bin/brain:945 counts. Deliberately NOT a render: any status
+  # render here would consume the very banner this scenario is about.
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 3 \
+    "prerequisite: three unread CHANGES entries seeded" || return 0
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "cursor-red-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue cursor-regression message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  # Staged order, read back from the queue — see staged_names for why send order will not do.
+  # The FIRST staged id is kept on purpose: it is what makes this a regression of THIS branch
+  # rather than a fault main would also have rejected.
+  lost=$(staged_names "$pd" | sed -n '2p')
+  [ -n "$lost" ] || { fail "fixture: could not resolve the second staged id"; return 0; }
+
+  sed_script="$base/cursor-red.sed"
+  printf '/"id":"%s"/d\n' "$lost" > "$sed_script" \
+    || { fail "fixture: could not write the digest-dropping sed script"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-cursor-red-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the cursor-regression shim dir"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the cursor-regression jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/jq) ;;                       # _dm_resolve_jq pins the first executable jq on
+    *) PATH=$saved_path; export PATH         # PATH, so if PATH does not resolve to the shim the
+       fail "instrument blind: PATH does not resolve jq to the cursor-regression shim, so the serializer under test would be the real one"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  hook_out="$base/cursor-red.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the cursor-regression jq shim is STILL what PATH resolves"; return 0 ;;
+  esac
+  hook_added="$base/cursor-red.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with a partial envelope"
+  # Instrument ENGAGED controls: a shim that never edited the envelope would have emitted the
+  # complete context and archived all three, so neither the empty stdout nor these counts could
+  # hold. They fire with their own distinct reasons rather than letting a blind instrument
+  # masquerade as the defect.
+  need_eq "$(byte_size "$hook_out")" 0 \
+    "stdout after a partial envelope — an envelope missing a staged id must not be emitted at all"
+  need_count "$pd" 3 "pending/ — the partial envelope must reject the whole staged batch"
+  need_count "$rd" 0 "read/ — nothing may be archived out of a rejected batch"
+  need_count "$fd" 0 "failed/ — a serializer anomaly is not proof any message is invalid"
+  warn_count=$(grep -c '^brain:' "$hook_added" 2>/dev/null)
+  [ "${warn_count:-0}" != 0 ] \
+    || { fail "a rejected partial envelope must be diagnosed: no 'brain:' line reached .hook-errors.log"; return 0; }
+
+  # THE ASSERTION THIS SCENARIO EXISTS FOR. The rejected boot delivered nothing, so the unread
+  # CHANGES must still be unread — a healthy boot right afterwards must carry the banner.
+  retry_ctx=$(hook_context "$fx" bravo) \
+    || { fail "the healthy SessionStart retry emitted no readable additionalContext"; return 0; }
+  need_str_has "$retry_ctx" "$needle" \
+    "the healthy SessionStart after a REJECTED one must still show the CHANGES banner — the rejected boot's payload was discarded, so the banner it rendered was never delivered to any agent, and a bookmark advanced during that render silences it on this and every later boot, permanently"
+}
+
+# V.D/110 — THE OVER-FIX GUARD: a DELIVERED banner must be consumed. Four consecutive healthy boots
+# against one fixture. No shim, no instrument — the unmodified engine, read through its output.
+#   boot 1   three unread entries + two staged DMs → the PINNED emit path (:1530). Banner present.
+#   boot 2   nothing staged (boot 1 archived it)   → banner ABSENT: boot 1's delivery consumed it.
+#   ── a fourth entry is appended ──
+#   boot 3   no DMs staged → the UNPINNED emit path (:1533). Banner present again.
+#   boot 4   no DMs staged → banner ABSENT: boot 3's delivery consumed it too.
+#   PROVES     a SessionStart whose payload was actually emitted advances the bookmark, on BOTH
+#              emit paths.
+#   REJECTS    "never commit the bookmark from the hook at all", which satisfies V.D/109 and turns
+#              the banner into a permanent nag on every boot of all 13 lanes (boots 2 and 4); and
+#              the adjacent misplacement of putting the commit inside the `[ "$#" -gt 0 ]` archive
+#              block at :1537, which would consume the banner only on boots that happened to carry
+#              DMs (boot 4 alone).
+#   BASELINE   green today — the shipped engine advances the bookmark on every render, by both
+#              paths. It is a guard, not a red.
+#   DOES NOT   pin the NUMBER in the banner (boot 3 legitimately shows a different count from boot
+#     PIN      1), nor the emit paths' shapes, nor anything about a boot whose emit FAILED — that
+#              is V.D/109's half of the contract, and re-pinning it here would double-red one
+#              defect. Boots 3-4 extend the same claim to the second emit path rather than adding
+#              a new one; they cost two engine invocations and no apparatus.
+sc_delivered_changes_banner_is_consumed() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending)
+  changes="$fx/.brain/CHANGES.md"
+  needle="brain change(s) since you last looked"
+
+  for n in 1 2 3; do
+    printf '%s\n' "- 2026-08-06T00:00:0$n cursor-guard-$n — fixture change $n" >> "$changes" \
+      || { fail "fixture: could not seed CHANGES.md"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 3 \
+    "prerequisite: three unread CHANGES entries seeded" || return 0
+
+  for m in a b; do
+    run_brain "$fx" alpha dm @bravo "cursor-guard-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue delivered-banner message $m" || return 0
+  done
+  need_count "$pd" 2 "prerequisite: two healthy messages staged" || return 0
+
+  ctx1=$(hook_context "$fx" bravo) \
+    || { fail "boot 1 (DMs staged) emitted no readable additionalContext"; return 0; }
+  need_str_has "$ctx1" "$needle" \
+    "boot 1 must show the CHANGES banner — three entries are unread and this boot emits successfully"
+  need_count "$pd" 0 \
+    "boot 1 must deliver and archive the staged batch, otherwise boot 2 is not the no-DM path this scenario means to drive" || return 0
+
+  ctx2=$(hook_context "$fx" bravo) \
+    || { fail "boot 2 emitted no readable additionalContext"; return 0; }
+  need_str_lacks "$ctx2" "$needle" \
+    "boot 2 must NOT repeat the banner: boot 1 emitted its payload, so the banner WAS delivered and the bookmark must have advanced — a fix that never commits from the hook makes this banner a permanent nag on every boot of all 13 lanes"
+
+  printf '%s\n' "- 2026-08-06T00:00:04 cursor-guard-4 — fixture change 4" >> "$changes" \
+    || { fail "fixture: could not append the fourth CHANGES entry"; return 0; }
+
+  ctx3=$(hook_context "$fx" bravo) \
+    || { fail "boot 3 emitted no readable additionalContext"; return 0; }
+  need_str_has "$ctx3" "$needle" \
+    "boot 3 must show the banner again — a fourth entry was appended after boot 2 consumed the first three"
+  ctx4=$(hook_context "$fx" bravo) \
+    || { fail "boot 4 emitted no readable additionalContext"; return 0; }
+  need_str_lacks "$ctx4" "$needle" \
+    "boot 4 must NOT repeat the banner: boot 3 delivered it with NO DMs staged, so a commit placed only in the staged-DM archive branch leaves every DM-free boot nagging forever"
+}
+
+# V.D/111 — THE CLI PATH MUST NOT REGRESS. `brain status` (:1770) prints straight to the terminal:
+# once printed, delivered. There is no capture and no discard, so the fix has no business reaching
+# into it — seam §2 says so in as many words ("leave the CLI exactly as-is").
+#   PROVES     two consecutive `brain status` invocations show the banner, then omit it.
+#   REJECTS    a fix that defers the bookmark commit for EVERY caller — e.g. making cmd_status
+#              render-only and relying on _hook_session_start to commit — under which the CLI
+#              reprints the same banner on every invocation forever.
+#   BASELINE   green today. It is a guard, not a red.
+#   DOES NOT   pin the CLI's output format, nor that the CLI and the hook share one code path: a
+#     PIN      fix that gives cmd_status a deferred MODE and leaves the CLI on the committing
+#              default satisfies this exactly as a fix that touches nothing here does.
+sc_cli_status_consumes_the_changes_banner() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  changes="$fx/.brain/CHANGES.md"
+  needle="brain change(s) since you last looked"
+
+  for n in 1 2; do
+    printf '%s\n' "- 2026-08-06T00:00:0$n cursor-cli-$n — fixture change $n" >> "$changes" \
+      || { fail "fixture: could not seed CHANGES.md"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 2 \
+    "prerequisite: two unread CHANGES entries seeded" || return 0
+
+  run_brain "$fx" bravo status
+  first_rc=$?
+  need_rc "$first_rc" 0 "first CLI 'brain status' invocation"
+  need_file_has "$OUT" "$needle" \
+    "the first CLI 'brain status' must show the CHANGES banner — two entries are unread"
+
+  run_brain "$fx" bravo status
+  second_rc=$?
+  need_rc "$second_rc" 0 "second CLI 'brain status' invocation"
+  need_file_lacks "$OUT" "$needle" \
+    "the second CLI 'brain status' must not repeat the banner: the CLI prints straight to the terminal, so the first invocation DELIVERED it, and a fix that defers the bookmark commit for every caller would nag here forever"
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
 printf 'brain lane-DM v1.2 RED suite (claim layer deleted) + v1.2.1-v1.2.4 contract addenda\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
@@ -5300,6 +5804,12 @@ scenario red   "V.B/103 partial-envelope-archives-none"   sc_partial_envelope_mu
 scenario guard "V.B/104 complete-envelope-archives-all"   sc_complete_envelope_archives_the_whole_batch
 scenario guard "V.B/105 first-id-dropped-is-rejected"     sc_envelope_dropping_first_staged_id_is_rejected
 scenario red   "V.B/106 repeated-id-envelope-rejected"    sc_repeated_id_envelope_must_not_archive_the_batch
+scenario red   "V.B/107 reject-names-missing-id"          sc_rejected_batch_diagnostic_names_the_missing_id
+scenario red   "V.B/108 reject-classes-distinguishable"   sc_reject_classes_are_distinguishable
+
+scenario red   "V.D/109 rejected-boot-keeps-banner"       sc_rejected_boot_does_not_consume_the_changes_banner
+scenario guard "V.D/110 delivered-banner-is-consumed"     sc_delivered_changes_banner_is_consumed
+scenario guard "V.D/111 cli-status-consumes-banner"       sc_cli_status_consumes_the_changes_banner
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'
