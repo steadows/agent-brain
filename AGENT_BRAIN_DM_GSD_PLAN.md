@@ -488,12 +488,24 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
       `test -f <main>/.brain/templates/DM-PROTOCOL.md`.
 - `[!]` 5.4 **Never run `brain init --force`** — it unconditionally overwrites `.gitignore` and
       `INDEX.md`, and the deployed `.gitignore` is a hand-commented variant that would be clobbered
-- `[~]` 5.5 **(a) DONE 2026-08-05** — cutover announced in the journal (landed in the **UTC-dated**
-      `journal/2026-08-06.md`, attributed `system` per the known whoami-on-main behavior).
-      **(b)–(d) OPEN — needs Steve.** Only 2 lanes had live sessions at deploy time (`@observatory`
-      and the `~/agent-brain` session, plus this `@pm` one); the other 11 were already down and pick
-      up the new engine automatically at next boot. Ack probe = `brain inbox <lane>` printing the
-      `pending/` path.
+- `[~]` 5.5 **(a) DONE 2026-08-05.** Cutover announced in the journal (landed in the **UTC-dated**
+      `journal/2026-08-06.md`, attributed `system` per the whoami-on-main defect).
+      **(b)(c) SUBSTANTIALLY SATISFIED — the 13-lane coordination problem did not materialise.**
+      Re-measured after the P6 run: **no ERD lane session is live except `@pm`.** `@observatory`'s
+      session ended on its own; the `~/agent-brain` session **has no `.brain/` and is therefore not
+      an ERD lane at all** — it was wrongly counted as one in the earlier estimate. `@graph` and
+      `@cockpit` booted during P6 and armed, which is a **stronger** ack than the `brain inbox`
+      probe: they received, took, and replied to real messages.
+      **Arming needs no human step.** The SessionStart dispatcher calls `_dm_ensure_tree`
+      unconditionally (engine ~line 1468) before checking for a digest, so *booting a lane is the
+      arming*. The remaining 10 lanes arm automatically at next boot with nothing typed.
+      **Armed so far: cockpit, graph, pm (3/13). Queue is empty fleet-wide — nothing is waiting on
+      anyone**, so the cutover window carries no stranded-message risk.
+      **(d) Steve's call to declare DM live.** One caveat to pass to lanes: run brain commands from
+      **your own worktree** — a `cd` into main costs you your identity (see the attribution defect).
+      ⚠ **`@pm` (this session) is deliberately NOT being restarted** (Steve, 2026-08-05). It runs in
+      a degraded but workable mode: no automatic SessionStart digest, but `brain dm take` pulls
+      messages on demand — proven live, that is how both P6 acks were collected.
       **Restart-and-ack gate — DM is NOT live until every active lane has restarted**
       (ultrareview UR-6). The atomic swap replaces the engine, but inbox creation and the
       watch instruction happen only at **SessionStart** — a session already running under the old
