@@ -129,20 +129,11 @@ instrument_selfcheck() {
 # multi-line by design; every matched line is listed here, so those selectors are bounded by
 # their declared counts AND their exact line sets.
 #
-# ⚠ ONE ENTRY IS WRITTEN AGAINST THE POST-FIX ENGINE, DELIBERATELY: the `$_esc_payload` case
-# line. The V.B batch-integrity fix replaces `_emit_session_ctx_pinned`'s single first-id check
-# with a loop over every staged id, so the shipped line dies the moment GREEN lands and this
-# manifest is the RED-phase co-change for it. Two consequences, both intended:
-#   · BEFORE GREEN this manifest reports STALE for that line. That is the probe correctly saying
-#     it is anchored to an engine that does not exist yet — not drift. (The probe cannot run
-#     meaningfully during RED anyway: its baseline requires a green dm.sh, and V.B/103 + V.B/106
-#     are red by design until the fix lands.)
-#   · The entry is whole-line-exact, so it PRESCRIBES a spelling — the loop variable `_ep_name`
-#     and the six-space body indent. That is a real constraint on GREEN and is called out in the
-#     hand-off rather than hidden here. Its purpose is the same as the non-target entry below:
-#     if the shape changes, fail loud and make a human re-check the probe. The complementary
-#     sed address is deliberately looser (indent- and variable-agnostic), so a GREEN that spells
-#     the loop differently trips ONLY this line and nothing silently mis-mutates.
+# The `$_esc_payload` case is whole-line-exact because both M6 and M12 replace it. Its missing-id
+# accumulator is load-bearing in its own right, so both replacement programs preserve that tail
+# while changing only which envelope witness passes. The complementary sed address is deliberately
+# looser (indent- and variable-agnostic), so spelling drift trips this manifest before a mutant can
+# silently erase the diagnostic mechanism along with the envelope check.
 #
 # ONE ENTRY IS NOT A MUTATION TARGET: `set -- "$@" "$_pending_name"` is ruling 3(b)'s quoted
 # positional accumulation, and test/dm.sh declares at [Q3] that it CANNOT pin that mechanism —
@@ -169,7 +160,8 @@ anchors_ok() {
         | if (($record | tojson | utf8bytelength) <= $line_max) or $limit <= 1
           id: $id
       \{*'"id":"'"$_pd_name"'"'*\})
-      case "$_esc_payload" in *'\"id\":\"'"$_ep_name"'\"'*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
+      case "$_esc_payload" in *'\"id\":\"'"$_ep_name"'\"'*) ;; *) _DM_MISSING_IDS="${_DM_MISSING_IDS}${_DM_MISSING_IDS:+ }$_ep_name" ;; esac
+  if [ "$_emit_rc" = 0 ]; then
 _dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
     _dm_route_failed "$_pd_lane" "$_pd_file" "structurally unusable dm queue entry" || return 3
   _warn "dm $_cd_state destination is occupied for $_cd_name; using a collision-safe name"
@@ -210,13 +202,12 @@ addresses_ok() {
 1~M5 bounded serializer~^      bounded(\$field_max) | tojson$
 1~M6 digest id field~^          id: \$id$
 1~M6 digest-case scope~^    case "\$_pd_digest" in$
-# The two envelope-witness rows are indent- and variable-agnostic (`^ *`, `.*`) so they survive
-# the V.B fix turning the single first-id check into a loop, whichever way GREEN spells it. The
-# leading `\*` is NOT decoration: without it the address also reaches the `\{*\}` brace check two
-# lines above, which shares the whole `_DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac` tail. That
-# ambiguity was introduced and then caught by this very table (measured: 2 matches, want 1).
-1~M6 envelope witness~^ *case "\$_esc_payload" in \*.*_DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac$
-1~M12 envelope witness~^ *case "\$_esc_payload" in \*.*_DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac$
+# The two envelope-witness rows are indent- and variable-agnostic (`^ *`, `.*`). The leading `\*`
+# disambiguates the per-id witness from the `\{*\}` envelope-framing case, while the accumulator
+# tail ensures each mutant preserves the diagnostic mechanism it is not meant to break.
+1~M6 envelope witness~^ *case "\$_esc_payload" in \*.*_DM_MISSING_IDS=.* ;; esac$
+1~M12 envelope witness~^ *case "\$_esc_payload" in \*.*_DM_MISSING_IDS=.* ;; esac$
+1~M13 cursor commit gate~^  if \[ "\$_emit_rc" = 0 \]; then$
 2~M7 byte metric~utf8bytelength
 1~M8 collision predicate~^_dm_dest_occupied() { \[ -e "\$1" \] || \[ -L "\$1" \]; }$
 1~MQ1 nonregular route~^    _dm_route_failed "\$_pd_lane" "\$_pd_file" "structurally unusable dm queue entry" || return 3$
@@ -390,10 +381,10 @@ probe "M5  prose-digest         " "V.W/26 V.W/27 V.W/28" "" 1 \
 #   envelope), not instrument damage, and they are deterministic, so they are REQUIRED rather
 #   than permitted. Removing the relaxation does not help: an un-relaxed loop rejects every
 #   batch wholesale and M6 becomes a blunt systemic mutant instead of a focused one.
-probe "M6  digest-drops-id      " "V.N/52 V.B/103 V.B/105 V.B/106" "" 3 \
+probe "M6  digest-drops-id      " "V.N/52 V.B/103 V.B/105 V.B/106 V.B/107 V.B/108 V.D/109" "" 3 \
   's@^          id: \$id$@          id: ""@
 /^    case "\$_pd_digest" in$/{n;s@^      .*@      \\{*id*\\})@;}
-s@^ *case "\$_esc_payload" in \*.*_DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac$@      case "$_esc_payload" in *id*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac@'
+s@^ *case "\$_esc_payload" in \*.*_DM_MISSING_IDS=.* ;; esac$@      case "$_esc_payload" in *id*) ;; *) _DM_MISSING_IDS="${_DM_MISSING_IDS}${_DM_MISSING_IDS:+ }$_ep_name" ;; esac@'
 
 # Must-survive #6: the wire caps are BYTE caps (utf8bytelength), not code-point counts. Both
 # source sites move together — the shared measurement used by preflight/re-probe, plus digest —
@@ -494,8 +485,14 @@ probe "M11 no-directive-verb    " "V.C/24" "" 1 \
 #   NOT V.B/104 or V.B/105: both survive BY CONSTRUCTION, and that is the mutant's own control.
 #   /104's envelope carries every id, so first-only still accepts and the batch still archives;
 #   /105's envelope drops the first id, which first-only is precisely the check that catches.
-probe "M12 envelope-first-id-only" "V.B/103 V.B/106" "" 1 \
-  's@^ *case "\$_esc_payload" in \*.*_DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac$@      case "$_esc_payload" in *'"'"'\\"id\\":\\"'"'"'"$1"'"'"'\\"'"'"'*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac@'
+probe "M12 envelope-first-id-only" "V.B/103 V.B/106 V.B/107 V.B/108 V.D/109" "" 1 \
+  's@^ *case "\$_esc_payload" in \*.*_DM_MISSING_IDS=.* ;; esac$@      case "$_esc_payload" in *'"'"'\\"id\\":\\"'"'"'"$1"'"'"'\\"'"'"'*) ;; *) _DM_MISSING_IDS="${_DM_MISSING_IDS}${_DM_MISSING_IDS:+ }$_ep_name" ;; esac@'
+
+# Delivery-conditioned cursor commit: add the bookmark commit before the delivery result is
+# consulted. The normal success-path commit remains, so this changes only the rejected-payload
+# behavior and recreates the silent banner loss without disturbing DM archive authorization.
+probe "M13 early-cursor-commit  " "V.D/109" "" 1 \
+  's@^  if \[ "\$_emit_rc" = 0 \]; then$@  if _changes_commit; [ "$_emit_rc" = 0 ]; then@'
 
 echo "=== final tree check ==="
 if cmp -s "$ENGINE_BACKUP" "$ENGINE_SOURCE"; then
