@@ -5447,8 +5447,9 @@ sc_reject_classes_are_distinguishable() {
 # else — different state, different failure, different fix.
 #
 # AUTHORITY: .context/seams/pr10-cursor-and-diagnostic.md §2 ("Seam decision A — the CHANGES
-# cursor: ONE counter, ONE writer, split render from commit"), plus the dispatcher's ruling of
-# 2026-08-06 that settles the one thing §2 leaves ambivalent (see THE TENSION, below).
+# cursor: ONE counter, ONE writer, split render from commit") — its delivery condition and its
+# settled shape are the spec for all three scenarios here; plus the dispatcher's 2026-08-06 brief,
+# which is what forced the V.D/110 guard (see WHY V.D/110 EXISTS, below).
 # Implementation lines are cited as EVIDENCE only: bin/brain:944-953 (the banner block — reads the
 # bookmark at :946, writes it at :951), :1521 (`_st=$(cmd_status 2>/dev/null)` — the hook CAPTURES
 # that render), :1530 and :1535 (the pinned emit, and the rc check that may discard the whole
@@ -5466,15 +5467,16 @@ sc_reject_classes_are_distinguishable() {
 # the only thing that can reject it — a missing-first fixture would reject on main too and would
 # not isolate this branch's regression.
 #
-# THE TENSION IN THE AUTHORITY, and how it was resolved (declared, not quietly picked): §2's
-# headline sentence reads "stop the HOOK from committing the bookmark", and its cost bullet calls
-# "never marking read → the banner repeats (annoying, harmless)" an acceptable error. Read
-# literally, that permits a fix under which the hook NEVER commits — which V.D/110 rejects. But the
-# same section also says "the decision to commit moves to the delivery-aware caller" and names
-# three permitted shapes that all have the caller committing after a successful emit; and the
-# dispatcher's 2026-08-06 brief is explicit — "a healthy SessionStart that DOES deliver MUST still
-# advance the cursor ... this guard is load-bearing; do not omit it." That is the later and more
-# specific ruling, so V.D/110 pins it. Raised in the hand-off report rather than buried here.
+# WHY V.D/110 EXISTS — a resolved authority defect, kept on the record because it is the reason
+# this guard is not optional. §2 once read "stop the HOOK from committing the bookmark", full stop,
+# and its cost bullet called "never marking read → the banner repeats (annoying, harmless)" an
+# acceptable error. Read literally that describes a DIFFERENT implementation — one where the hook
+# never commits at all — which passes V.D/109 and leaves the banner nagging on every boot of all 13
+# lanes forever. It was built during the RED audit and V.D/110 rejected it. §2 has since been
+# corrected (see its own ⚠ CORRECTION note): the condition is DELIVERY, not caller — the hook must
+# not commit on a boot that did not deliver, and must still commit on one that did, which is
+# exactly what V.D/109 and V.D/110 pin between them. Nothing is open here; this paragraph is
+# history, not a live tension, and §2 is not ambivalent any more.
 #
 # OBSERVABLE, NOT STRUCTURAL: every assertion in this section reads the banner text out of an
 # emitted payload or a terminal capture. NOTHING here inspects `$BRAIN/.cursors/*.changes`. That
@@ -5507,12 +5509,15 @@ sc_reject_classes_are_distinguishable() {
 #   CURSOR     bookmark honest but drops the banner from the payload for some unrelated reason. The
 #   ASSERTION  retry's additionalContext is what an agent actually receives, so that is what is
 #              asserted; no structural witness is needed to discriminate the named fault.
-#   DOES NOT   pin WHERE the deferral lives — seam §2 permits a cmd_status mode, a pending-value
-#     PIN      global the caller commits, or a caller-side stash/restore, and this scenario cannot
-#              tell them apart; nor the cursor file's path, format or existence; nor the banner's
-#              wording beyond the substring the engine has always printed; nor what the REJECTED
-#              boot's own bookmark state looks like — only that the banner survives to be
-#              delivered. It also does not re-pin batch retention: V.B/103 owns that.
+#   DOES NOT   pin WHERE the commit decision lives — only that the banner survives a rejected
+#     PIN      boot and is delivered on the next healthy one. That neutrality is deliberate here
+#              but is NOT an open design question: seam §2 settles the shape as the parent-prepared
+#              snapshot (`_changes_snapshot` before the render, `cmd_status` renders only, the
+#              callers commit) and ELIMINATES the alternatives it once entertained — read §2 for
+#              which and why; this block is not a menu of permitted designs. Also unpinned: the
+#              cursor file's path, format or existence; the banner's wording beyond the substring
+#              the engine has always printed; and the REJECTED boot's own bookmark state. It does
+#              not re-pin batch retention either: V.B/103 owns that.
 sc_rejected_boot_does_not_consume_the_changes_banner() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   base=$(dirname "$fx")
@@ -5665,13 +5670,14 @@ sc_delivered_changes_banner_is_consumed() {
 # once printed, delivered. There is no capture and no discard, so the fix has no business reaching
 # into it — seam §2 says so in as many words ("leave the CLI exactly as-is").
 #   PROVES     two consecutive `brain status` invocations show the banner, then omit it.
-#   REJECTS    a fix that defers the bookmark commit for EVERY caller — e.g. making cmd_status
-#              render-only and relying on _hook_session_start to commit — under which the CLI
-#              reprints the same banner on every invocation forever.
+#   REJECTS    a fix that makes `cmd_status` render-only — which the shipped shape does — but then
+#              commits from `_hook_session_start` ALONE, leaving the CLI path with no committer,
+#              under which `brain status` reprints the same banner on every invocation forever.
 #   BASELINE   green today. It is a guard, not a red.
-#   DOES NOT   pin the CLI's output format, nor that the CLI and the hook share one code path: a
-#     PIN      fix that gives cmd_status a deferred MODE and leaves the CLI on the committing
-#              default satisfies this exactly as a fix that touches nothing here does.
+#   DOES NOT   pin the CLI's output format, nor HOW the CLI ends up committing — whether it shares
+#     PIN      one code path with the hook or commits explicitly at its own call site. Any shape
+#              that leaves `brain status` consuming the banner passes here; seam §2 picks which
+#              shape ships, and this scenario deliberately does not restate that choice.
 sc_cli_status_consumes_the_changes_banner() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   changes="$fx/.brain/CHANGES.md"
