@@ -771,6 +771,17 @@ file.
 **Fix:** validate **every** staged id, not `$1`. RED brief staged at
 `.context/prompts/serializer-defect-red.md`.
 
+⚠ **The fix target is a MUTATION-PROBE ANCHOR — a co-change nearly missed.** `test/mutation-probe.sh`
+declares every line it mutates in a whole-line-exact manifest checked *before* any mutant runs, with
+a per-mutant changed-line count and sed address cardinality. The defective line is anchored three
+times: the manifest (~157), mutant **`M6 envelope witness`** (~198), and M6's sed replacement (~367,
+which weakens the check to `*id*`). **Replacing the single `case` with a loop kills the anchor, M6
+cannot apply, and gate item 5 fails** — the probe's own header calls that "a gate that lies."
+Because `mutation-probe.sh` is a **test file**, the co-change belongs to RED (`test-writer`), never
+to GREEN. Caught by @pm before dispatch, after reading the probe's header rather than assuming the
+gate was independent of the diff. Generalizes the standing lesson *sweep the whole test tree for
+co-change*, extended to **mutation anchors, not just callers**.
+
 **Same-class sweep — DONE, and it came back clean (@pm, 2026-08-06).** Only three sites iterate a
 list with `for … in "$@"`, and the other two are **not** this defect: `_resolve_whoami`'s multi-match
 tiebreak (~239) evaluates each candidate independently and returns on the first hit, and `cmd_init`
