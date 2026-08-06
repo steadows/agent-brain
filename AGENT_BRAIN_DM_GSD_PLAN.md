@@ -539,6 +539,62 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
       them; (c) note that `read/` and `failed/` archives are inert under the old engine — they are
       safe to leave in place.
 
+- `[~]` 5.7 **Automatic delivery to a RUNNING lane — via the PreToolUse injector** (Steve,
+      2026-08-05, after the live P6 run showed the gap). **RED in progress.**
+
+      **The gap.** Delivery today has exactly two paths: `_hook_session_start` (automatic, at boot)
+      and `cmd_dm_take` (explicit). `_hook_pre_tool` does collision detection only and never emits a
+      digest. So a **running** lane hears a DM only if it remembers to ask — which is what the
+      skill's "Watch it for activity" line asks of it, and which is compliance, not machinery.
+      Steve's verdict on seeing it live: *"I still had to tell the lanes to check their inbox … I
+      want this to work where it would just automatically inject into their lane."*
+
+      **The mechanism, and why it is now believed viable.** `_emit_pretool`'s allow branch already
+      ships a **verified `additionalContext` injector** (E2/E9 in the DM-mechanisms eval) — it is
+      what surfaces collision warnings today. Delivering DMs through that same courier needs no new
+      primitive, no feature flag, no agent-armed watcher.
+      ⚠ The eval's E3/E9 recorded hook-injected DMs being **refused as prompt injection, 3/3** —
+      which is what originally pushed the design to `Monitor`. **That finding is now believed to be
+      an artifact of the test fixture, not a property of hook delivery:** all three refusals were
+      bare scratch lanes with no vault (one objected *"this working directory isn't even a git
+      repository, there's no `.brain/` here"*). The P6 run is the counter-example — SessionStart is
+      a hook, it injected a DM into real `@graph`/`@cockpit`, and both accepted and acted.
+      **If a RED scenario shows a real armed lane refusing a pre-tool-delivered DM, STOP and
+      escalate — that invalidates the approach, and `Monitor` becomes the answer after all.**
+
+      **Seam decision (named up front — single file, but a real fork).** The consume→emit→archive
+      loop gets **ONE home**, shared by `_hook_session_start` and `_hook_pre_tool`. The loop lives
+      in `_hook_session_start` today (~1468–1544). Extract it; do **not** write a second copy. A
+      duplicated loop is the specific defect this task must not create — divergence between two
+      copies is how at-least-once quietly becomes at-most-once on one path.
+
+      **Requirements to pin in RED:**
+      1. Pending DMs are emitted on PreToolUse via `additionalContext`, for the resolved lane.
+      2. **At-least-once preserved:** nothing leaves `pending/` until emitted; archive after emit;
+         an archive failure leaves the message pending + replayable **and warns** — identical
+         discipline to SessionStart. Assert on the **absolute** count, not just "moved".
+      3. **Delivery is NOT gated behind collision detection.** The hook exits early today in three
+         places (non-matching tool, empty `_paths`, empty `_collisions`); a DM must still be
+         delivered on all three.
+      4. **The combination case — the trap.** Collision AND pending DMs together must reach the
+         agent as **ONE well-formed JSON object**. Two `_emit_pretool` calls put two objects on
+         stdout and the payload is malformed. Pin that the collision warning is not clobbered by
+         the DM, nor the DM by the collision.
+      5. `DM_INJECT_MAX_LINES` cap honored on this path too.
+      6. Unresolvable whoami → **silent** `exit 0` (non-brain repos must stay silent — unchanged).
+      7. jq-missing degradation neither swallows nor duplicates a message.
+      8. **No double-delivery with SessionStart** — both consume the same `pending/`.
+      9. Hot path: PreToolUse fires constantly. Short-circuit cheaply when `pending/` is empty
+         (reuse the 7.1 `_require_brain` short-circuit pattern, do not add a new one).
+
+      **Gotchas:** the suite runs under **sh AND dash**; and zsh throws `no matches found` on a
+      glob against an empty directory — use `ls -1`, never a bare glob (hit live twice: by
+      @cockpit's watcher and by @pm this session).
+
+      **Out of scope:** the `Monitor` loop stays as documented **belt-and-braces for a lane that is
+      running but idle** (making no tool calls — PreToolUse cannot fire for it, so the two are
+      complementary, not competing). No send-side change. No Channels/`tengu_harbor` work.
+
 ## Phase 6 — End-to-end verification `[ ]` (two real lanes — the method used throughout E0–E15)
 
 - `[ ]` 6.1 Two cold scratch lanes, each armed only by the hook
