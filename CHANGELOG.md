@@ -1,10 +1,36 @@
 # Changelog
 
-## v1.2.3 — 2026-08-06
+## v1.2.3 — 2026-08-06 — nothing is marked delivered that was not delivered
 
-Fix: the serializer validated only the first staged message id while the caller archived all
-staged messages. A partial envelope could therefore archive undelivered messages as read. The
-serializer now validates every staged id and rejects the whole batch if any id is missing.
+Two ways a message could be marked read without ever reaching an agent — one in the DM queue, one
+in the CHANGES banner — plus the diagnostic that made the first undiagnosable. Design record:
+`.context/seams/pr10-cursor-and-diagnostic.md`.
+
+- **The serializer validated only the FIRST staged message id while the caller archived all of
+  them.** A partial envelope — first id kept, 2..N dropped — passed the guard, and
+  `_hook_session_start` archived every staged name to `read/` as delivered. Silent loss, in the
+  one check whose whole purpose is catching it. The serializer now validates every staged id and
+  rejects the entire batch if any is missing.
+- **`cmd_status` no longer advances the CHANGES bookmark as a side effect of RENDERING the
+  banner.** The SessionStart hook captures that render and can discard the payload when the
+  widened check above rejects — so the bookmark moved, the banner was never delivered, and every
+  later healthy boot silently omitted it. Permanently. Widening the id check widened that path,
+  which is how the regression arrived with the fix. The count is now snapshotted **once, before**
+  the render, and the two callers commit it: the hook only after a successful emit, the CLI
+  immediately as before. Committing early loses the notification; failing to commit merely repeats
+  it — this errs the second way, deliberately. `brain status` behaviour is otherwise unchanged.
+- **A rejected batch names its offender.** The reject discarded which ids were missing, and the
+  caller's sole warning named the `jq` binary — byte-identical for an envelope-framing rejection
+  and a per-id one, so an operator could not tell which check fired. It now lists **every** missing
+  staged id in one warning. Naming all of them rather than the first is deliberate: `pending/`
+  preserves the staged set but never the omissions, and the extent is the diagnosis — a contiguous
+  run reads as truncation, a scattered subset as non-deterministic corruption.
+- **Suite: 100 scenarios** (V.B/107-108 pin the diagnostic; V.D/109-111 pin the delivery-conditioned
+  commit, its two guards rejecting "never commit from the hook" and "defer for every caller").
+  Mutation probe at **19 mutants** — M12 envelope-first-id-only, M13 early-cursor-commit, M14
+  hook-cursor-commit. Two mutation gaps are declared in the seam map rather than closed: the reject
+  diagnostic is suite-pinned but not mutation-covered, and M14 covers the missing-commit fault but
+  not the adjacent misplacement.
 
 ## v1.2.2 — 2026-08-05 — enumeration is fatal-not-empty; paths, identities and the emit are byte-exact and pinned
 
