@@ -481,9 +481,11 @@ probe "M11 no-directive-verb    " "V.C/24" "" 1 \
 # all N as delivered. Same class as the r8 `count-checks-admit-set-drift` lesson: an integrity
 # check scoped narrower than the set it authorizes.
 #
-# This mutant reverts exactly that scope and nothing else. `set --` truncates the staged list to
-# its first entry, so the post-fix loop still runs, still uses the real `\"id\":\"<name>\"`
-# framing, and still rejects — it just never looks past message 1.
+# This mutant reverts exactly that scope and nothing else. It rewrites the loop-BODY case line so
+# that every iteration tests the FIRST staged name (`"$1"`) instead of the name the loop is
+# currently on. The post-fix loop still runs once per staged message, still uses the real
+# `\"id\":\"<name>\"` framing, and still rejects — it just checks the same id N times, so it never
+# looks past message 1.
 #   WHY THE CASE LINE AND NOT THE LOOP HEADER: the case line already has a declared address that
 #   is indent- and variable-agnostic, so this mutant costs no new dependency on how GREEN spells
 #   the loop. Rewriting the pattern to a bare `*"$1"*` was measured and REJECTED as the mutant:
