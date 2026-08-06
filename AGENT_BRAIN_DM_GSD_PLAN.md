@@ -530,7 +530,20 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
 ## Phase 6 — End-to-end verification `[ ]` (two real lanes — the method used throughout E0–E15)
 
 - `[ ]` 6.1 Two cold scratch lanes, each armed only by the hook
-- `[ ]` 6.2 Lane A DMs B an unblock signal → B acts within ~15s with no human
+- `[x]` 6.2 **PASSED 2026-08-05 on REAL idle lanes (@graph, @cockpit)** — Steve's call to use the two
+      idle lanes rather than scratch; see the real-vs-scratch split recorded below 6.7.
+      **Delivery proven twice independently:** structurally (message moved `pending`→`read`, which
+      only happens once the digest is emitted) and behaviourally (both lanes named the DM unprompted
+      in their own output). **Action:** @cockpit acted even with a competing operator question in
+      play; @graph deferred it in round 1 (answered the operator, explicitly noted the DM as
+      unanswered) and **acted in round 2 when nothing competed** — so the protocol drives action
+      when it is the only ask, and round 1 was correct triage, not a defect.
+      ⚠ **Round 1 is the real datum: a DM does NOT reliably preempt a lane that already has a task
+      in hand.** Empirical support for the instruction-competition risk (a ~300-byte digest against
+      the full production instruction stack). Do not assume DM interrupts a busy lane.
+      Instrument: `claude -p` in each lane's own worktree — a real session with a real SessionStart
+      hook, bounded and non-interactive.
+      Lane A DMs B an unblock signal → B acts within ~15s with no human
 - `[ ]` 6.2a **The Steve scenario — merge broadcast to a mixed-liveness crew.** With B running and a
       third lane C **shut down**, A runs `brain dm @all "merging X, re-sync before your gates"`.
       Assert: B acts within ~15s; then boot C and assert **C reports the message as part of waking
@@ -547,15 +560,53 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
 - `[ ]` 6.4 Seed a question with a real external standard; **assert a lane researches before taking a
       position** rather than asserting from priors
 - `[ ]` 6.5 Convergence writes a `connections/` note recording the contested point
-- `[ ]` 6.6 `git status` in the **real main worktree** (`<main>/`, not the scratch fixtures 6.1 uses)
+- `[x]` 6.6 **PASSED 2026-08-05 — and in its stronger form, with real traffic present** rather than
+      against empty trees: zero `.brain/dm/` churn in `git status`, zero DM bodies in journal
+      history. Measured footprint of the whole exercise = **2 committed journal call-log lines**
+      (`pm — dm → @graph (transcripts: …)`), naming recipients only, no bodies — matching the
+      predicted ledger exactly.
+      `git status` in the **real main worktree** (`<main>/`, not the scratch fixtures 6.1 uses)
       shows no `.brain/dm/` churn, and `git log -p` on the journal shows no DM body
-- `[ ]` 6.7 **Queue-lifecycle e2e (v1.2) — the crash window, live.** The unit suite proves it with
+- `[~]` 6.7 **(b)(c)(d) PASSED 2026-08-05 on the real vault; (a) still owed in scratch.**
+      **(b)** `brain dm take` delivered both acks with ids; an immediate second `take` was **silent**
+      — no replay. **(c)** no `claimed/` directory anywhere under `dm/` — no stale pre-v1.2 engine
+      has run. **(d)** `failed/` empty **fleet-wide** across all inboxes, not just the exercised
+      pair — a read-only sweep that scratch structurally cannot reproduce, since it is what proves
+      no lane on this machine is executing a stale engine.
+      **(a) the crash-window kill test is NOT done** — deliberately left to scratch (killing a real
+      lane mid-take costs conversation context its presence note does not capture, and the code path
+      is identical in a scratch vault).
+      **Queue-lifecycle e2e (v1.2) — the crash window, live.** The unit suite proves it with
       fixtures; prove it once with real sessions. (a) DM a lane, **kill the session mid-take before
       the digest is emitted**, boot again → the message IS delivered (nothing leaves `pending/`
       until emitted); (b) after a normal delivery, boot again → it is NOT replayed; (c) confirm no
       `claimed/` directory ever appears anywhere under `dm/` (the layer is deleted — its
       reappearance means a stale engine is running); (d) confirm `failed/` is empty across the run —
       quarantine requires structural proof, and a healthy run must produce none.
+
+### P6 real-vs-scratch split (Steve, 2026-08-05) — and what it turned up
+
+The Phase 6 header's "two real lanes" and 6.1's "two cold **scratch** lanes" are **two axes, not a
+contradiction**: *real* = a genuine agent session rather than a shell fixture; *scratch* = where the
+vault lives. The plan already split them per-gate (6.6 was always carved out to the real worktree).
+Steve elected to run the safe subset on the two idle lanes:
+
+| Ran on real @graph/@cockpit | Deliberately left in scratch |
+|---|---|
+| 6.2 (delivery + action), 6.6, 6.7(b)(c)(d) | **6.2a** `@all` — fans to 12 recipients, 11 uninvolved, carrying a *false merge instruction* they would each act on at next boot; the assertion cannot survive a neutered body. **6.3/6.5** — demand a *fabricated* proposal, and 6.5 writes a permanent `connections/` note; a fake record in the vault's real signal. **6.4** — equivalent in scratch, no reason to pay. **6.7(a)** — see above. |
+
+**⚠ NEW FINDING — DM sender attribution silently degrades to `system`.** `_resolve_whoami` maps the
+current branch to a presence note via `owns_branches`; **no note owns `main`**, so any brain write
+run with cwd in the **main worktree** resolves empty and `cmd_dm`'s `${_WHOAMI:-system}` fallback
+(engine line ~837) stamps the message `from: system`. Observed live: @cockpit's ack arrived
+`from: system` because it had `cd`'d into the main worktree to inspect the shared vault before
+replying, while @graph's arrived correctly `from: graph`. `whoami` resolves correctly from *both*
+lane worktrees — the data is fine, the **cwd** is the trigger.
+This is pre-existing whoami behavior, but **DM makes it consequential**: a recipient cannot tell who
+messaged them, and inspecting the shared vault (which lives in main) is exactly what a lane
+naturally does before replying. Not a deploy blocker; logged to the PM punch list. Candidate fixes:
+have `cmd_dm` refuse rather than fall back to `system`, or resolve identity from `BRAIN_FEATURE`
+exported at SessionStart so it survives a `cd`.
 
 ## Phase 7 — Review gates & ship `[ ]` (requires P6)
 
