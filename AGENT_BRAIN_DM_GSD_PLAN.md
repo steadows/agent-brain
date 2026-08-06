@@ -451,7 +451,9 @@ still has its own stale tracked copy. **Deploying only `<main>/.brain/bin/brain`
 does not require lanes to rebase.** There is no staged rollout or per-lane opt-in: the moment 5.2
 lands, all 13 lanes are directed to the new engine. Sequence accordingly.
 
-- `[ ]` 5.1 **FIRST — hand-add `dm/` to the DEPLOYED `<main-worktree>/.brain/.gitignore`.**
+- `[x]` 5.1 **FIRST — hand-add `dm/` to the DEPLOYED `<main-worktree>/.brain/.gitignore`.**
+      **DONE 2026-08-05** — added as a commented block ahead of the engine swap; verified with
+      `git check-ignore --no-index -q -- .brain/dm/.brain-ignore-probe` (exit 0).
       **This must land BEFORE the engine, not after.** Task 1.3 edits only `cmd_init`'s `printf`,
       which affects **fresh inits only**, and 5.4 correctly forbids the one command that would
       regenerate the deployed file — so nothing else will ever add it. Deploy the engine first and any
@@ -459,14 +461,24 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
       committer** and `cmd_commit` stages the whole vault with a single pathspec, so the very next
       `brain commit` sweeps them in — which then poisons every lane's `touches[]` and fires
       `_detect_collisions` on every push. The window is small and the blast radius is every lane.
-- `[ ]` 5.2 **Atomic engine swap — NOT a bare `cp`** (adversarial finding #9). `cp` truncates the
+- `[x]` 5.2 **Atomic engine swap — NOT a bare `cp`** (adversarial finding #9). **DONE 2026-08-05** —
+      `cp` → `.brain/bin/.brain.new`, `chmod +x`, `sh -n` (passed), `mv` over live. 35121 → 77700
+      bytes; `cmd_dm` refs 0 → 5; exec bit confirmed; no temp residue. `cp` truncates the
       destination before rewriting it, and all 13 lanes execute that one file continuously
       (SessionStart, PreToolUse, dm, commit) — a concurrent invocation during the copy runs an
       empty or half-written script. Sequence: `cp` to a **same-directory** temp file
       (`.brain/bin/.brain.new`), `chmod +x`, `sh -n` it, then `mv` over the live engine — `mv`
       within one directory is an atomic rename, so every invocation sees either the old engine or
       the new one, never a partial file.
-- `[ ]` 5.3 Deploy **both** templates (seam decision d + adversarial finding #8): cp
+- `[x]` 5.3 **DONE 2026-08-05** — both templates deployed; ERD project-hooks appended to the
+      DEPLOYED copies only (generic templates in this repo verified still ERD-free); `brain install`
+      run from the main worktree. `test -f <main>/.brain/templates/DM-PROTOCOL.md` → PASS.
+      ⚠ **Incidental finding:** `brain install`'s jq merge wrote the correct
+      `Bash(/Users/amap3i/…/.brain/bin/brain:*)` + `additionalDirectories` entries — the global
+      settings previously carried only dead `/Users/stevemeadows/…` paths (that user does not exist
+      on this machine). The gap was masked by `defaultMode: auto`, not covered by the allowlist.
+      Dead entries remain (jq merges with `unique`, does not prune) — cosmetic.
+      Deploy **both** templates (seam decision d + adversarial finding #8): cp
       `navigation-standards.SKILL.md` **and `DM-PROTOCOL.md`** into the deployed
       `<main>/.brain/templates/`, add the ERD project-hooks section to those copies, then
       `brain install` (which cp's the skill from the vault copy, not this repo).
@@ -476,7 +488,13 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
       `test -f <main>/.brain/templates/DM-PROTOCOL.md`.
 - `[!]` 5.4 **Never run `brain init --force`** — it unconditionally overwrites `.gitignore` and
       `INDEX.md`, and the deployed `.gitignore` is a hand-commented variant that would be clobbered
-- `[ ]` 5.5 **Restart-and-ack gate — DM is NOT live until every active lane has restarted**
+- `[~]` 5.5 **(a) DONE 2026-08-05** — cutover announced in the journal (landed in the **UTC-dated**
+      `journal/2026-08-06.md`, attributed `system` per the known whoami-on-main behavior).
+      **(b)–(d) OPEN — needs Steve.** Only 2 lanes had live sessions at deploy time (`@observatory`
+      and the `~/agent-brain` session, plus this `@pm` one); the other 11 were already down and pick
+      up the new engine automatically at next boot. Ack probe = `brain inbox <lane>` printing the
+      `pending/` path.
+      **Restart-and-ack gate — DM is NOT live until every active lane has restarted**
       (ultrareview UR-6). The atomic swap replaces the engine, but inbox creation and the
       watch instruction happen only at **SessionStart** — a session already running under the old
       engine is never re-armed, so a DM to it queues silently until its next boot. That defeats the
@@ -486,7 +504,9 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
       each lane running `brain inbox` and reporting the `pending/` path, which only the new engine
       prints; (d) only then declare DM live and tell lanes to start using it. A lane that cannot
       restart is NOT reachable by DM — say so rather than assuming.
-- `[ ]` 5.6 **Rollback runbook — drain before downgrading** (ultrareview UR-5). The new engine is
+- `[x]` 5.6 **DONE 2026-08-05** — runbook written to `docs/DM-ROLLBACK.md`, with the drain-check and
+      `claimed/` sweep commands executed against the live vault to confirm they run (both clean).
+      **Rollback runbook — drain before downgrading** (ultrareview UR-5). The new engine is
       the only consumer of `dm/<lane>/pending`; rolling `bin/brain` back to a pre-DM build
       strands every queued message permanently (the old engine has no queue reader, and a broadcast
       call-log line names only `@all`, which matches no recipient's journal filter).
