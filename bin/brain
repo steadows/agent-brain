@@ -1418,9 +1418,9 @@ _emit_session_ctx_pinned() { # <context> [staged-message-name...]
     '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}' 2>/dev/null) \
     || return 1
   case "$_esc_payload" in \{*\}) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
-  if [ "$#" -gt 0 ]; then
-    case "$_esc_payload" in *'\"id\":\"'"$1"'\"'*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
-  fi
+  for _ep_name in "$@"; do
+      case "$_esc_payload" in *'\"id\":\"'"$_ep_name"'\"'*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
+  done
   printf '%s\n' "$_esc_payload"
 }
 _emit_pretool() { # <decision: allow|ask> <text>
