@@ -208,6 +208,7 @@ addresses_ok() {
 1~M6 envelope witness~^ *case "\$_esc_payload" in \*.*_DM_MISSING_IDS=.* ;; esac$
 1~M12 envelope witness~^ *case "\$_esc_payload" in \*.*_DM_MISSING_IDS=.* ;; esac$
 1~M13 cursor commit gate~^  if \[ "\$_emit_rc" = 0 \]; then$
+1~M14 hook cursor commit scope~^  if \[ "\$_emit_rc" = 0 \]; then$
 2~M7 byte metric~utf8bytelength
 1~M8 collision predicate~^_dm_dest_occupied() { \[ -e "\$1" \] || \[ -L "\$1" \]; }$
 1~MQ1 nonregular route~^    _dm_route_failed "\$_pd_lane" "\$_pd_file" "structurally unusable dm queue entry" || return 3$
@@ -493,6 +494,11 @@ probe "M12 envelope-first-id-only" "V.B/103 V.B/106 V.B/107 V.B/108 V.D/109" "" 
 # behavior and recreates the silent banner loss without disturbing DM archive authorization.
 probe "M13 early-cursor-commit  " "V.D/109" "" 1 \
   's@^  if \[ "\$_emit_rc" = 0 \]; then$@  if _changes_commit; [ "$_emit_rc" = 0 ]; then@'
+
+# The hook must commit after a successful delivery even when no DMs were staged. Scope through
+# the unique delivery gate because the hook and CLI commit calls have identical indentation.
+probe "M14 hook-cursor-commit   " "V.D/110" "" 1 \
+  '/^  if \[ "\$_emit_rc" = 0 \]; then$/{n;s@^    _changes_commit$@    :@;}'
 
 echo "=== final tree check ==="
 if cmp -s "$ENGINE_BACKUP" "$ENGINE_SOURCE"; then

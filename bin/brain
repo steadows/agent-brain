@@ -13,6 +13,8 @@ VERSION="1.2.3"
 # Clear the vault-resolution sentinel at process entry: it is a marker for "this process ran
 # brain_root()", and an inherited value would let a caller's environment stand in for that.
 _BRAIN_RESOLVED=""
+# Clear snapshot state too: inherited values must not stand in for work this process performed.
+_CHANGES_TOTAL=0; _CHANGES_CURRENT=0
 
 # DM bounds. One file per message removes the old append-atomicity rationale; the body cap now
 # bounds storage and digest work. Consumption is bounded by the surviving digest limits.
@@ -900,7 +902,7 @@ _changes_snapshot() { # <identity>
 _changes_commit() {
   [ "$_CHANGES_TOTAL" -gt "$_CHANGES_CURRENT" ] 2>/dev/null || return 0
   mkdir -p "$BRAIN/.cursors"
-  printf '%s\n' "$_CHANGES_TOTAL" > "$_CHANGES_CURSOR"
+  _atomic_place printf "$_CHANGES_CURSOR" '%s\n' "$_CHANGES_TOTAL"
 }
 
 cmd_status() {
@@ -1556,9 +1558,7 @@ $_st"
         || _warn "one or more DMs were emitted but could not be archived; they remain pending and may replay"
     fi
   else
-    _missing_detail=""
-    [ -n "${_DM_MISSING_IDS:-}" ] && _missing_detail="; missing staged DM ids: $_DM_MISSING_IDS"
-    _warn "could not emit SessionStart context with ${_DM_JQ_BIN:-<unresolved>}${_missing_detail}; DMs remain pending and replayable"
+    _warn "could not emit SessionStart context with ${_DM_JQ_BIN:-<unresolved>}${_DM_MISSING_IDS:+; missing staged DM ids: $_DM_MISSING_IDS}; DMs remain pending and replayable"
   fi
   exit 0
 }
