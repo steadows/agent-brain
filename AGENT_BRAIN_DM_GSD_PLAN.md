@@ -550,6 +550,17 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
          at-least-once contract, which *explicitly permits crash replay*. It must be restated as
          **"no duplicate under a clean, non-crashing handoff"** — or the contract changes. My spec
          error, not Codex's misreading.
+         **✅ WORDING ONLY — NO ASSERTION CHANGE NEEDED.** `test-writer` reported and **@pm verified
+         independently against commit `4e541c6`**: V.P/100 already pins the clean-handoff reading
+         *structurally*, not by wording. Both limbs gate on
+         `need_count "$pd" 0 "...after the first consumer" || return 0`, so the no-redelivery
+         assertion is only ever reached when the first consumer completed fully, and neither
+         consumer is faulted (no closed stdout, no read-only `read/`, no broken jq). Crash replay
+         is out of scope **by construction**. The deliberate counterweight is V.P/94, which
+         *requires* a replay after an archive failure — the two cannot collide because V.P/94's
+         message is still pending when it replays and V.P/100's is not.
+         ⚠ **This corrects the RED commit message on `4e541c6`, which claimed V.P/100 "needs
+         restating before GREEN."** The requirement *prose* needs restating; the suite does not.
       2. **The combination case is deeper than requirement 4 states — but see the correction.** The
          `ask` branch uses `permissionDecisionReason`; `allow` uses `additionalContext`. A collision
          that triggers **`ask`** PLUS a pending DM cannot be solved by concatenating into one `ask`
@@ -619,6 +630,55 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
       corroborable by construction (sender's presence note + the `read/` archive), and the digest
       should carry what the receiver needs to check rather than assuming it will go looking.
       ⚠ The round-3 ack again arrived `from: system` — the attribution defect recurring.
+
+      **RED suite — FROZEN at 102 scenarios, preserved on branch `red/5.7-pretool-dm-delivery`
+      (commit `4e541c6`), reverted on main so the tree stays green.** Independently re-run by @pm
+      under `sh`: 102 scenarios, 93 pass, 9 fail, **0 guard failures**, every failure the right
+      reason ("no payload emitted, message still pending"). Byte-identical under `sh` and `dash`.
+      - **Discrimination is proven, not assumed.** Requirements 4 and 5 are *vacuously* satisfied at
+        baseline, so the pair built the plausible wrong implementation the plan names (consumes all
+        pending DMs before the early exits, its own second `_emit_pretool` call, no cap) as a
+        sed-patched throwaway driven through the suite's existing `BRAIN_BIN` override —
+        `bin/brain` never touched. The mutant **passes 7 of 10** (a genuine candidate, not a
+        strawman) and dies to exactly three: V.P/96 `got '2', want '1'`, V.P/97 `delivered 45 of 45
+        — DM_INJECT_MAX_LINES (40)`, V.P/93 (archived with stdout closed). Mutant deleted,
+        regressions retained — per the proportionality brake.
+      - **Instrument budget: 36 executable lines serving 369 lines of cases (~1:10).** No
+        classifier, oracle, normalizer, or shared harness, so nothing needed dispatcher approval.
+        `run_pretool` was unavoidable — `_hook_pre_tool` opens with `_input=$(cat)`, so every
+        existing runner would *hang*; `hooklog_since` was required because `cmd_hook` redirects
+        hook stderr to `.brain/.hook-errors.log`, so a scenario grepping `$ERR` would pass
+        vacuously.
+      - **V.P/98 and V.P/101 are guards, not REDs, and that is the honest disposition** — they pin
+        "unchanged" and "adds no cost", which the engine satisfies trivially *because it does no DM
+        work on this path yet*. Manufacturing a failure would have been dishonest.
+      - **V.P/102 was added from the seam map** (pretool payload must not carry `cmd_status`), with
+        a SessionStart positive control in the same fixture that passes at baseline — proving the
+        needle is real rather than the assertion vacuous.
+
+      **Open items the pair returned for a ruling:**
+      - **[P2] continuation instruction — RULED by @pm 2026-08-06: NO continuation line on the
+        pretool path.** SessionStart needs one because it fires once per session, so a capped batch
+        would otherwise strand its remainder until next boot. PreToolUse is the opposite: it fires
+        on *every* Bash/Edit/Write, so the next tool call drains the next batch automatically.
+        Adding the instruction would put permanent noise on a hot path to solve a problem that
+        does not exist there. **GREEN must not emit one.**
+      - **[P5] the `ask`-branch gap is REAL IN THE SUITE and correctly escalated rather than
+        built.** V.P/96 drives the `allow` branch only, so it cannot see a GREEN that satisfies
+        requirement 4 by concatenating both texts into one `_emit_pretool ask` call — shipping the
+        DM through `permissionDecisionReason`, a field requirement 1 never authorized. Reaching it
+        from the suite costs a pty harness (`script(1)`, whose flags differ across macOS/Linux and
+        is not portable across sh/dash) — an instrument needing its own tests, which is the
+        standing signal to escalate. **Blocking only if the gate moves:** a GREEN that relaxes
+        `[ -t 1 ]`, or a ruling that one object must carry BOTH fields. The pair explicitly
+        declined to invent that ruling.
+      - **[P1] the shared-loop seam decision has no structural witness** — it is a source-shape
+        claim. The pair pinned the *consequence* instead, holding pre-tool to SessionStart's
+        discipline assertion-for-assertion (V.P/93↔V.N/47, V.P/94↔V.N/48, V.P/97↔V.N/50). A loop
+        that has already diverged fails those; one that has not is a **review** concern, so
+        `/simplify` must check it per seam map §6.
+      - **[P4] whether pretool delivery writes its own journal line is unasserted either way** —
+        GREEN may do either; decide at review.
 
       ---
       **The original spec follows, retained for the RED suite's contract. Do not implement it
