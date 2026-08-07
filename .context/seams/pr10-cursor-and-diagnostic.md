@@ -4,6 +4,29 @@ Pre-code design pass for the two fixes bundled onto `fix/serializer-batch-integr
 authorized the bundle 2026-08-06 ~07:15, so the ~30-minute mutation probe runs once rather than
 twice). `/simplify` verifies the finished diff against this map.
 
+---
+
+## ⚠ ERRATA — read before trusting a line number or a ruling below (2026-08-07)
+
+This document is now tracked and ships with the repo, so its errors travel. Three corrections,
+all found by review rather than by the author:
+
+1. **Line numbers below are as-of-the-ruling and have DRIFTED.** The engine grew ~30 lines across
+   this arc. Most consequentially, §4 discusses the per-id envelope reject as `bin/brain:1422`;
+   that line is now **`:1451`** (and `:1422` is today `cmd_revert`'s rewrite call). The framing
+   check is **`:1449`**. `_changes_snapshot` is **`:896`**, `_changes_commit` **`:912`**.
+   **§4's probe co-change instructions read off these numbers — re-derive them, don't copy them.**
+2. **"Clearing `_CHANGES_CURSOR` at process entry breaks `_atomic_place`" is NO LONGER TRUE.** It
+   was true when written — an empty path made `_ap_dir=${""%/*}`=`""`, targeting `/.tmp-$$`. The
+   consumer guard added in the same round (`[ -n "${_CHANGES_CURSOR:-}" ] || return 0`) means
+   `_changes_commit` now returns before ever reaching the helper. Measured under `sh` and `dash`:
+   an empty cursor produces **zero** helper calls. The guard is still the right place for the
+   check; the absolute warning attached to it is stale.
+3. **The "accepted append race" is no longer live.** A plain append between render and commit is
+   **not** marked read on this branch — the content token mismatches and the commit is skipped.
+   What remains is narrower and purely a test-coverage gap: nothing in the suite rejects a
+   hypothetical implementation that re-counts at commit time and commits the re-counted value.
+
 **Scope:** `bin/brain` (implementation) + `test/mutation-probe.sh` (a REQUIRED co-change, §4).
 `test/dm.sh` is frozen RED — GREEN must not touch it. No new dependencies, no new module, so no
 `ARCHITECTURE.md` change and no hard-lock trigger.
