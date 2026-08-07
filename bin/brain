@@ -14,7 +14,7 @@ VERSION="1.2.3"
 # brain_root()", and an inherited value would let a caller's environment stand in for that.
 _BRAIN_RESOLVED=""
 # Clear snapshot state too: inherited values must not stand in for work this process performed.
-_CHANGES_TOTAL=0; _CHANGES_CURRENT=0
+_CHANGES_TOTAL=0; _CHANGES_CURRENT=0; _CHANGES_TOKEN=""
 # Clear caller-visible warning state so inherited values cannot suppress or forge diagnostics.
 _WHOAMI_WARNED=""
 _DM_MISSING_IDS=""
@@ -897,9 +897,11 @@ _changes_snapshot() { # <identity>
   # Keep the sole CHANGES count here. Snapshot before rendering so commit records exactly what
   # was displayed; re-counting at commit could mark later additions read. Neither invariant is
   # test-guarded.
-  _CHANGES_TOTAL=0; _CHANGES_CURRENT=0
+  _CHANGES_TOTAL=0; _CHANGES_CURRENT=0; _CHANGES_TOKEN=""
   _CHANGES_CURSOR="$BRAIN/.cursors/${1:-anon}.changes"
   [ -f "$BRAIN/CHANGES.md" ] || return 0
+  # Take the token first so a rewrite before or after the count makes the later check fail safe.
+  _CHANGES_TOKEN=$(cksum < "$BRAIN/CHANGES.md" 2>/dev/null) || return 0
   _CHANGES_TOTAL=$(grep -c '^- ' "$BRAIN/CHANGES.md" 2>/dev/null || echo 0)
   if [ -f "$_CHANGES_CURSOR" ]; then
     _CHANGES_CURRENT=$(cat "$_CHANGES_CURSOR" 2>/dev/null || echo 0)
@@ -912,7 +914,11 @@ _changes_commit() {
   # A stale concurrent snapshot may move the cursor backward, causing only a repeat banner.
   # Deliberately write the snapshot without re-reading so undisplayed changes are never marked read.
   [ "$_CHANGES_TOTAL" -gt "$_CHANGES_CURRENT" ] 2>/dev/null || return 0
+  # mv treats a directory destination as a container, which would falsely report a committed cursor.
+  [ ! -d "$_CHANGES_CURSOR" ] || return 1
   mkdir -p "$BRAIN/.cursors"
+  # If CHANGES changed after the render snapshot, repeat the banner instead of risking silent loss.
+  [ "$(cksum < "$BRAIN/CHANGES.md" 2>/dev/null)" = "$_CHANGES_TOKEN" ] || return 0
   _atomic_place printf "$_CHANGES_CURSOR" '%s\n' "$_CHANGES_TOTAL"
 }
 
