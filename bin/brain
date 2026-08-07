@@ -900,9 +900,19 @@ _changes_snapshot() { # <identity>
   _CHANGES_TOTAL=0; _CHANGES_CURRENT=0; _CHANGES_TOKEN=""
   _CHANGES_CURSOR="$BRAIN/.cursors/${1:-anon}.changes"
   [ -f "$BRAIN/CHANGES.md" ] || return 0
-  # Count first so the commit token describes a file state observed no earlier than the count.
-  _CHANGES_TOTAL=$(grep -c '^- ' "$BRAIN/CHANGES.md" 2>/dev/null || echo 0)
-  _CHANGES_TOKEN=$(cksum < "$BRAIN/CHANGES.md" 2>/dev/null) || return 0
+  # The sentinel preserves trailing newlines through command substitution; both values below
+  # then describe this one read. A failed read leaves an invalid, empty snapshot.
+  if ! _CHANGES_SNAPSHOT=$(cat "$BRAIN/CHANGES.md" 2>/dev/null && printf '%s' .); then
+    _CHANGES_SNAPSHOT=""
+    return 0
+  fi
+  _CHANGES_SNAPSHOT=${_CHANGES_SNAPSHOT%.}
+  _CHANGES_TOTAL=$(printf '%s' "$_CHANGES_SNAPSHOT" | grep -c '^- ' 2>/dev/null) \
+    || _CHANGES_TOTAL=0
+  if ! _CHANGES_TOKEN=$(printf '%s' "$_CHANGES_SNAPSHOT" | cksum 2>/dev/null); then
+    _CHANGES_TOTAL=0; _CHANGES_TOKEN=""
+    return 0
+  fi
   if [ -f "$_CHANGES_CURSOR" ]; then
     _CHANGES_CURRENT=$(cat "$_CHANGES_CURSOR" 2>/dev/null || echo 0)
   fi
@@ -917,8 +927,9 @@ _changes_commit() {
   # mv treats a directory destination as a container, which would falsely report a committed cursor.
   [ ! -d "$_CHANGES_CURSOR" ] || return 1
   mkdir -p "$BRAIN/.cursors"
-  # If CHANGES changed after the render snapshot, repeat the banner instead of risking silent loss.
-  [ "$(cksum < "$BRAIN/CHANGES.md" 2>/dev/null)" = "$_CHANGES_TOKEN" ] || return 0
+  # If CHANGES cannot be read or changed after the snapshot, repeat rather than risk silent loss.
+  _CHANGES_LIVE_TOKEN=$(cksum < "$BRAIN/CHANGES.md" 2>/dev/null) || return 0
+  [ "$_CHANGES_LIVE_TOKEN" = "$_CHANGES_TOKEN" ] || return 0
   _atomic_place printf "$_CHANGES_CURSOR" '%s\n' "$_CHANGES_TOTAL"
 }
 
