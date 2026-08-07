@@ -6149,12 +6149,23 @@ sc_directory_shaped_cursor_commit_is_diagnosed() {
 #              re-checksums after the count and compares (`_CHANGES_TOTAL=0` on mismatch) still
 #              commits 6 here, because the revert lands on that revalidating read and it too
 #              compares equal.
-#   ADMITS     both obvious honest repairs, measured against hand-built engines rather than
-#              assumed: taking the count BEFORE the token (so the token describes a state at or
-#              after the count, and the revert makes :921 differ) commits 5; deriving BOTH the
-#              count and the token from ONE read of the file commits 5. Each then announces the
-#              later entry, and each still fires both arms of the instrument, so every control
-#              below survives GREEN instead of turning this into a permanent red.
+#   ADMITS     deriving BOTH the count and the token from ONE read of the file: it commits 5,
+#              announces the later entry, fires both arms of the instrument and matches both
+#              checksums, so every control below survives GREEN instead of turning this into a
+#              permanent red. This is the repair this suite should be read as blessing.
+#   ⚠ ALSO     taking the count BEFORE the token also passes — and that is a GAP IN THIS
+#     ADMITS   INSTRUMENT, not an endorsement. This block asserted on 2026-08-07 that count-first
+#     A REPAIR was the second "obvious honest repair"; the engine shipped on that claim at
+#     THAT IS  a89ecc7, and the next convergence pass measured the claim wrong. The shim's append
+#     NOT      arm fires on the TOKEN read, so with the count taken first the count never sees the
+#     HONEST   phantom entry and the MIRROR window is never driven: an append seen by the COUNT
+#              and reverted before the token leaves the token describing the smaller state, the
+#              commit-time compare succeeds, and a cursor of 6 lands on a 5-entry file — the same
+#              permanent silencing this scenario exists to reject, reached from the other side.
+#              Driving it needs a second shim limb that appends BEFORE the count; Steve ruled on
+#              2026-08-07 not to build it, so the mirror direction is UNTESTED and is declared in
+#              seam map §2 rather than guarded here. ONE read has no window in either direction,
+#              which is why it is the only shape the fix may take.
 #   SAME FAULT V.D/112 reaches "the bookmark outran the file" through a SHRINK during the render.
 #   CLASS,     This reaches it through a change-and-change-back inside the snapshot itself, which
 #   DIFFERENT  V.D/112's fixture cannot produce: its shim leaves CHANGES.md shrunk, so the

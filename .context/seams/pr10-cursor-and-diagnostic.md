@@ -120,6 +120,25 @@ read any CHANGES lines added between render and commit. Same defect class, narro
 > independent counts is green. It is a `/simplify` and `/steadows-code-review` obligation. Check it
 > by reading the diff, not by trusting the gate.
 
+> ⚠ **DECLARED GAP #2 — the MIRROR of the ABA window is untested (added 2026-08-07).** The count
+> and the token must describe **one** read of `CHANGES.md`. `V.D/114` drives only one of the two
+> ways two reads can disagree: its `cksum` shim appends its phantom entry on the **token** read, so
+> a count taken *first* never sees the append and the scenario passes. The mirror — an entry seen
+> by the COUNT and reverted before the token, leaving a cursor of 6 on a 5-entry file — **is not
+> drivable by this instrument** and no scenario rejects it.
+>
+> **This gap has already cost one shipped defect.** `a89ecc7` reordered the two reads to
+> count-before-token, `V.D/114` went green, and the branch shipped a mirror-image of the fault it
+> had just closed. Reaching the mirror needs a second shim limb that appends before the count;
+> **Steve ruled on 2026-08-07 not to build it** (the same ruling that waived the
+> `test-writer` + `spec-watchdog` pair for this arc). Declared here instead.
+>
+> **What this means for any future edit to `_changes_snapshot`:** a green suite does **not** tell
+> you the snapshot is coherent — it only tells you the token-side window is closed. The invariant
+> to hold by reading the diff is that **exactly one** read of `CHANGES.md` feeds both
+> `_CHANGES_TOTAL` and `_CHANGES_TOKEN`. Any construction that reads the file twice is wrong in one
+> direction or the other, however the two reads are ordered; both orderings were measured failing.
+
 **@pm amendment — no defer sentinel. `cmd_status` renders; CALLERS commit.**
 The consult sketched a `_STATUS_CHANGES_DEFER` sentinel to tell `cmd_status` which mode it is in.
 Drop it and make `cmd_status` a pure renderer that never commits, with both call sites owning the
