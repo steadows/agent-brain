@@ -6201,9 +6201,11 @@ sc_directory_shaped_cursor_commit_is_diagnosed() {
 #              the window and why invocation order is safe to key on here. NEGATIVE control: with
 #              the shim unarmed the shipped engine commits 5 and announces the later entry — this
 #              scenario passes vacuously — which is why the three markers below are asserted and
-#              not merely created. POSITIVE control: the two honest repairs named under ADMITS
-#              both fire both arms, match both checksums and restore byte-identically, so none of
-#              the controls rejects a permitted fix.
+#              not merely created. POSITIVE control: BOTH repairs this instrument admits — the
+#              honest single-read one, and the count-first one it CANNOT reject (see the ⚠ ALSO
+#              ADMITS block above) — fire both arms, match both checksums and restore
+#              byte-identically, so none of the controls rejects a repair this scenario permits.
+#              "Permitted by the controls" is not "correct": only single-read is correct.
 sc_aba_changes_window_does_not_silence_later_entries() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   base=$(dirname "$fx")

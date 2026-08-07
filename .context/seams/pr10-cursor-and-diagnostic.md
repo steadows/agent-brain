@@ -14,7 +14,8 @@ all found by review rather than by the author:
 1. **Line numbers below are as-of-the-ruling and have DRIFTED.** The engine grew ~30 lines across
    this arc. Most consequentially, §4 discusses the per-id envelope reject as `bin/brain:1422`;
    that line is now **`:1451`** (and `:1422` is today `cmd_revert`'s rewrite call). The framing
-   check is **`:1449`**. `_changes_snapshot` is **`:896`**, `_changes_commit` **`:912`**.
+   check is **`:1449`**. `_changes_snapshot` is **`:896`**, `_changes_commit` **`:922`** (it was `:912` before the
+   single-read repair at `6761ce4` lengthened the snapshot helper).
    **§4's probe co-change instructions read off these numbers — re-derive them, don't copy them.**
 2. **"Clearing `_CHANGES_CURSOR` at process entry breaks `_atomic_place`" is NO LONGER TRUE.** It
    was true when written — an empty path made `_ap_dir=${""%/*}`=`""`, targeting `/.tmp-$$`. The
@@ -77,8 +78,10 @@ commit on a boot that did. The CLI is left exactly as-is.** A narrow bug fix, no
 
 **The seam constraint — the one thing that must not be got wrong:**
 
-> **`_total` is computed in exactly one place.** The count is `grep -c '^- ' "$BRAIN/CHANGES.md"`
-> (`:945`). A fix that has `_hook_session_start` re-count CHANGES.md so it knows what value to
+> **`_total` is computed in exactly one place.** The count is a single `grep -c '^- '` — since
+> `6761ce4` it is fed the captured snapshot (`printf '%s' "$_CHANGES_SNAPSHOT" | grep -c '^- '`)
+> rather than the file directly, because the count and the integrity token must describe ONE read.
+> The rule below is unchanged: one call site, one definition. A fix that has `_hook_session_start` re-count CHANGES.md so it knows what value to
 > commit after `_emit_rc = 0` creates **two independent definitions of "how many changes exist"**,
 > which drift the first time the CHANGES format changes. The grep stays singular.
 
