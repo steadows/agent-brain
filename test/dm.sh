@@ -376,6 +376,21 @@ first_file() {
   return 1
 }
 
+# staged_names <dir> — the pending entries in the SAME order the consume loop stages them (the
+# shell's collating order for `for f in dir/*`), one name per line.
+#
+# WHY THIS EXISTS: send order is NOT staged order. A queue name is `<_now_compact>-<pid>` (seam
+# decision 3), and pids do not collate monotonically — "10001" sorts BEFORE "9999". Any scenario
+# that reasons about "the first staged message" must read the order back from the queue rather
+# than assume the order its own sends happened in, or the assertion silently changes meaning
+# depending on which pids the machine handed out.
+staged_names() {
+  for _sn in "$1"/*; do
+    [ -e "$_sn" ] || [ -L "$_sn" ] || continue
+    printf '%s\n' "${_sn##*/}"
+  done
+}
+
 # Dot-prefixed entries — the temp names (seam decision 2, UNCHANGED by v1.2: the temp is
 # `.tmp-<id>` inside pending/ itself). A plain `for f in dir/*` never sees them, which is exactly
 # the property the design relies on; this helper is how the suite checks what the glob cannot.
@@ -707,6 +722,149 @@ write_status_only_envelope_jq() {
     printf 'exec "%s" "$@"\n' "$_ws_real"
   } > "$_ws_dest" || return 1
   chmod +x "$_ws_dest"
+}
+
+# write_id_editing_envelope_jq <dest> <real-jq> <sed-script-file>
+# For the SessionStart serializer call ONLY, run the caller's sed script over the
+# additionalContext VALUE before real jq serializes it; every other call — the three capability
+# probes and every per-message digest — is delegated to the real binary byte-for-byte, so the
+# batch that reaches the serializer is genuinely healthy and genuinely staged.
+#
+# This is the same argv case-check as write_status_only_envelope_jq (V.V/84), widened from "drop
+# the whole DM block" to "edit selected digest records", which is what the emit-time integrity
+# check is actually scoped against. It transforms an ENGINE value, never JSON: real jq still
+# produces the envelope, so the payload the engine validates is well-formed and rc 0 — the
+# anomaly is confined to WHICH staged ids survive into it.
+write_id_editing_envelope_jq() {
+  _wi_dest=$1; _wi_real=$2; _wi_script=$3
+  [ -s "$_wi_script" ] || return 1     # an empty script is a silently blind instrument
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'if [ "$#" -eq 5 ] && [ "$1" = "-n" ] && [ "$2" = "--arg" ] && [ "$3" = "c" ]; then\n'
+    printf '  _edited=$(printf "%%s\\n" "$4" | sed -f "%s") || exit 90\n' "$_wi_script"
+    printf '  exec "%s" -n --arg c "$_edited" "$5"\n' "$_wi_real"
+    printf 'fi\n'
+    printf 'exec "%s" "$@"\n' "$_wi_real"
+  } > "$_wi_dest" || return 1
+  chmod +x "$_wi_dest"
+}
+
+# write_changes_shrinking_awk <dest> <real-awk> <changes-file> <fired-marker>
+# A one-shot `awk` shim that empties <changes-file> of its recorded entries the FIRST time the
+# engine runs the presence-frontmatter pass, then delegates that call — and every later one —
+# to the real binary byte-for-byte.
+#
+# WHY AN awk SHIM IS THE CHEAPEST THING THAT DRIVES THIS. The fault is a WINDOW: the CHANGES count
+# is snapshotted before the render and committed after the emit, so a CHANGES.md that SHRINKS in
+# between makes the engine commit a bookmark higher than the file's entry count. Reaching it needs
+# a write to land inside that window. A concurrent writer would need cross-process coordination —
+# the class of apparatus the proportionality rules exclude — but the engine already forks a
+# process inside the window for us: `_fm_presence` (bin/brain:116, called from cmd_status at :932)
+# runs one `awk` per presence note, strictly after `_changes_snapshot` (:1545) and strictly before
+# `_changes_commit` (:1562). Shimming it is deterministic, single-process, and needs no clock.
+#
+# WHY IT KEYS ON THE PROGRAM TEXT, not on "first invocation". `_fm` (:100) also runs awk, and
+# `cmd_reconcile` calls it many times at :1543 — BEFORE the snapshot. A fire-on-first-call shim
+# would mutate CHANGES.md outside the window and prove nothing. `_fm_presence` is the only awk
+# program in the engine carrying `current_ticket dialog_with` (its one-pass field list), and it is
+# called from nowhere but cmd_status, so that substring selects the window exactly. This is the
+# same argv case-check discipline as write_rc0_empty_payload_jq — not a JSON/awk parser, not a
+# cross-process state machine.
+#
+# The <fired-marker> is the shim's ENGAGED control: a scenario asserts it exists, so a shim that
+# never resolved, or resolved but never matched, fails loudly instead of rendering as a pass.
+# The replacement content is `brain init`'s own CHANGES.md header (bin/brain:1713) with no `- `
+# lines — the shape `cmd_revert` (:1407-1422, `_atomic_place _render_without_change`) leaves
+# behind once every recorded change has been reverted. That is the real engine route by which
+# CHANGES.md shrinks; it is written directly here for the same reason V.D's other fixtures append
+# directly — `brain propose` + `brain apply` is a governance gauntlet not under test.
+write_changes_shrinking_awk() {
+  _wc_dest=$1; _wc_real=$2; _wc_changes=$3; _wc_fired=$4
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'case "$*" in\n'
+    printf '  *"current_ticket dialog_with"*)\n'
+    printf '    if [ ! -e "%s" ]; then\n' "$_wc_fired"
+    printf '      : > "%s"\n' "$_wc_fired"
+    printf '      printf "%%s\\n\\n" "# Brain CHANGES — structural change log" > "%s"\n' "$_wc_changes"
+    printf '    fi\n'
+    printf '    ;;\n'
+    printf 'esac\n'
+    printf 'exec "%s" "$@"\n' "$_wc_real"
+  } > "$_wc_dest" || return 1
+  chmod +x "$_wc_dest"
+}
+
+# write_changes_aba_cksum <dest> <real-cksum> <changes-file> <pristine-copy> <marker-prefix>
+# A two-armed `cksum` PATH shim that drives one ABA cycle across the engine's token→count→commit
+# sequence, and records what it did so a blind arming cannot render as a pass.
+#   arm 1 (the ENGINE'S TOKEN READ)  compute the real checksum of <changes-file> and emit it, THEN
+#                                    append one entry, so the count that follows sees the LARGER
+#                                    state while the token describes the smaller one.
+#   arm 2 (the ENGINE'S COMMIT CHECK) restore <changes-file> from <pristine-copy> FIRST, then
+#                                    compute and emit the real checksum — which now equals arm 1's.
+#   arm 3 (anything else)            delegate to the real binary byte-for-byte, stdin included.
+#
+# WHY A cksum SHIM IS THE CHEAPEST THING THAT REACHES THIS WINDOW. `_changes_snapshot`
+# (bin/brain:896-909) reads CHANGES.md TWICE — `cksum` at :904, `grep -c` at :905 — and
+# revalidates nothing between them, and `_changes_commit` (:921) compares its own checksum against
+# that FIRST read. The fault therefore needs two writes landing at two specific instants inside one
+# process. A concurrent writer would need cross-process coordination — the class of apparatus the
+# proportionality rules exclude — but the engine already forks a process at each of those instants
+# FOR US: `cksum` itself. Shimming it is deterministic, single-process, and needs no clock.
+#
+# WHY PLAIN INVOCATION ORDER IS SAFE HERE, where write_changes_shrinking_awk needed a program-text
+# match. `cksum` appears in exactly THREE places in the engine — :904, :921, and :536, a DM
+# collision-destination fallback inside `_dm_collision_dest` that is reachable only when a `read/`
+# or `failed/` destination is already occupied AND the name exceeds NAME_MAX. `brain status`
+# archives nothing, so :536 cannot run at all in this fixture and the first two invocations are the
+# token and the commit check. Measured: exactly two invocations on the shipped engine.
+#
+# WHY BOTH ARMS READ BY PATH AND IGNORE STDIN. Arm 2 must checksum the file it has just restored,
+# but the engine opened its `< "$BRAIN/CHANGES.md"` redirect BEFORE this process started — that
+# descriptor's contents after a restore depend on whether the restoring tool truncated in place or
+# replaced the inode. Reading the path is deterministic and is exactly what a real concurrent
+# writer racing just ahead of the engine's open would produce. Arm 1 reads the path for symmetry;
+# at that instant nothing has been written, so path and stdin are the same bytes either way.
+#
+# THE MARKERS ARE THE SHIM'S ENGAGED CONTROLS, and each carries the evidence for one claim rather
+# than merely existing: `<prefix>.sum1` is what arm 1 emitted, `<prefix>.grew` is the entry count
+# measured the instant after the append (a shim whose append silently failed reads 5, not 6, and
+# fails loudly instead of leaving the scenario to pass against any engine), and `<prefix>.sum2` is
+# what arm 2 emitted. A scenario asserting sum1 == sum2 is asserting that the guard at :921
+# compared two EQUAL values — the ABA itself — rather than assuming it.
+#
+# The appended entry is written directly, for the same reason every other fixture in section V.D
+# appends directly: the only engine route to a CHANGES.md entry is `brain propose` + `brain apply`,
+# a governance gauntlet whose own behaviour is not under test. The restore is a copy of the file's
+# own earlier bytes, which is the byte-for-byte outcome `cmd_revert`'s `_atomic_place
+# _render_without_change` rewrite produces once the appended change is reverted.
+write_changes_aba_cksum() {
+  _wa_dest=$1; _wa_real=$2; _wa_changes=$3; _wa_pristine=$4; _wa_pre=$5
+  [ -s "$_wa_pristine" ] || return 1   # nothing to restore FROM is a silently blind instrument
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'if [ ! -e "%s.sum1" ]; then\n' "$_wa_pre"
+    printf '  _s=$("%s" < "%s") || exit 1\n' "$_wa_real" "$_wa_changes"
+    printf '  printf "%%s\\n" "$_s" > "%s.sum1"\n' "$_wa_pre"
+    printf '  printf "%%s\\n" "- 2026-08-07T00:00:06 cursor-aba-phantom — appended between the token read and the count read" >> "%s" || exit 1\n' "$_wa_changes"
+    printf '  grep -c "^- " "%s" > "%s.grew" 2>/dev/null\n' "$_wa_changes" "$_wa_pre"
+    printf '  printf "%%s\\n" "$_s"\n'
+    printf '  exit 0\n'
+    printf 'fi\n'
+    printf 'if [ ! -e "%s.sum2" ]; then\n' "$_wa_pre"
+    printf '  cp "%s" "%s" || exit 1\n' "$_wa_pristine" "$_wa_changes"
+    printf '  _s=$("%s" < "%s") || exit 1\n' "$_wa_real" "$_wa_changes"
+    printf '  printf "%%s\\n" "$_s" > "%s.sum2"\n' "$_wa_pre"
+    printf '  printf "%%s\\n" "$_s"\n'
+    printf '  exit 0\n'
+    printf 'fi\n'
+    printf 'exec "%s" "$@"\n' "$_wa_real"
+  } > "$_wa_dest" || return 1
+  chmod +x "$_wa_dest"
 }
 
 # plant_message <repo> <lane> <marker> — send a REAL message from alpha carrying <marker>, then
@@ -4807,6 +4965,1328 @@ sc_status_counts_existing_failed_entries() {
     "an inspectable positive failed/ state must not render cannot-inspect"
 }
 
+# ══════════ V.B — emit-time batch integrity: the check must cover the set it authorizes ══════
+#
+# AUTHORITY: .context/prompts/serializer-defect-red.md — a defect in ALREADY-SHIPPED code (PR #7,
+# deployed 2026-08-05), independent of task 5.7. `_emit_session_ctx_pinned` validates that the
+# serialized envelope carries the FIRST staged id only, while `_hook_session_start` archives
+# EVERY staged name on its success. An envelope that kept message 1 and dropped 2..N therefore
+# passes the guard and archives all N as delivered — silent loss of messages that never reached
+# the model. Same defect class as the r8 lesson `count-checks-admit-set-drift`: an integrity
+# check scoped narrower than the set it authorizes, here first-only rather than count-only.
+#
+# THE RULING THIS SECTION FORCES (the brief pins "the batch is not archived" and demands absolute
+# counts, so a choice had to be made and is named here rather than left implicit): a partial
+# envelope rejects the WHOLE batch — nothing is emitted, nothing is archived, all N stay pending.
+# Two things force it over the "archive only the ids that survived" alternative:
+#   · it is what the existing guard ALREADY does when it fires (systemic flag, rc 1, no emit, no
+#     archive, warn + replay). The defect is the guard's SCOPE, not its remedy, so the fix is a
+#     strict widening of a reject that already exists — not a new partial-archive behaviour.
+#   · V.B/105 pins the drop-the-first-id case, which is caught by accident TODAY and whose
+#     today-behaviour is exactly that whole-batch reject. A partial-archive fix would turn
+#     V.B/105's correct outcome into a regression.
+# It is also the settled treatment of every other anomalous-payload path in this suite —
+# V.N/53, V.R/75, V.U/77, V.V/81 and V.V/84 all read "leave EVERYTHING pending".
+#
+# NUMBERING: 92-102 belong to section V.P (task 5.7), committed at 4e541c6 and deliberately
+# reverted off main so the tree stays green; it returns when 5.7 unblocks. This section starts
+# at 103 so that re-landing collides with nothing.
+#
+# INSTRUMENT (one, shared by all four): write_id_editing_envelope_jq — a PATH-shimmed jq that
+# edits the additionalContext value for the serializer call ONLY. Its NEGATIVE control is
+# V.B/103/106 (the edit engages — with a real jq the batch would be archived, so a blind shim
+# fails those scenarios rather than passing them); its POSITIVE control is V.B/104, which runs
+# the identical shim with a sed script that matches nothing and must still deliver the whole
+# batch — that is what proves the shim's rewrite path does not by itself corrupt the envelope.
+# PATH is restored BEFORE any assertion can return early, and the restore is checked.
+
+# V.B/103 — THE CORE FAULT. Three staged messages; the envelope keeps the first staged id and
+# loses the other two. Today the first-only case-check is satisfied, the payload is emitted, and
+# the archive loop walks "$@" — so all three are moved to read/ and the two that never reached
+# the model are gone.
+#   PROVES     absolute counts, never "it moved": pending/ == 3, read/ == 0, failed/ == 0, no
+#              payload on stdout, a diagnostic was written, and every message still delivers on a
+#              healthy retry (i.e. retained AND replayable, not merely retained).
+#   REJECTS    the shipped first-only check; any check that samples one id rather than the set;
+#              and a "reject but keep nothing" fix that loses the batch a different way.
+sc_partial_envelope_must_not_archive_the_batch() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "batch-integrity-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue batch message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  # Staged order, read back from the queue — see staged_names for why send order will not do.
+  kept=$(staged_names "$pd" | sed -n '1p')
+  lost_a=$(staged_names "$pd" | sed -n '2p')
+  lost_b=$(staged_names "$pd" | sed -n '3p')
+  [ -n "$kept" ] && [ -n "$lost_a" ] && [ -n "$lost_b" ] \
+    || { fail "fixture: could not resolve the three staged ids"; return 0; }
+
+  sed_script="$base/partial-envelope.sed"
+  { printf '/"id":"%s"/d\n' "$lost_a"; printf '/"id":"%s"/d\n' "$lost_b"; } > "$sed_script" \
+    || { fail "fixture: could not write the digest-dropping sed script"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-partial-envelope-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the partial-envelope shim dir"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the partial-envelope jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/jq) ;;                       # _dm_resolve_jq pins the first executable jq on
+    *) PATH=$saved_path; export PATH         # PATH, so if PATH does not resolve to the shim the
+       fail "instrument blind: PATH does not resolve jq to the partial-envelope shim, so the serializer under test would be the real one"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  hook_out="$base/partial-envelope.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the partial-envelope jq shim is STILL what PATH resolves"; return 0 ;;
+  esac
+  hook_added="$base/partial-envelope.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with a partial envelope"
+  need_eq "$(byte_size "$hook_out")" 0 \
+    "stdout after a partial envelope — an envelope missing staged ids must not be emitted at all"
+  # Instrument ENGAGED control. Vacuous under a correct engine (stdout is empty), load-bearing
+  # under the shipped one: a BLIND shim would have serialized the complete context, so the
+  # dropped ids WOULD appear here — and this fires with its own distinct reason instead of
+  # letting a blind instrument masquerade as the defect.
+  need_file_lacks "$hook_out" "$lost_a" \
+    "instrument control: an emitted payload must not carry the first dropped staged id (if it does, the shim never engaged and this scenario is measuring the wrong thing)"
+  need_file_lacks "$hook_out" "$lost_b" \
+    "instrument control: an emitted payload must not carry the second dropped staged id (if it does, the shim never engaged)"
+  warn_count=$(grep -c '^brain:' "$hook_added" 2>/dev/null)
+  [ "${warn_count:-0}" != 0 ] \
+    || fail "a rejected partial envelope must be diagnosed: no 'brain:' line reached .hook-errors.log"
+  need_count "$pd" 3 \
+    "pending/ after a partial envelope — the integrity check authorizes the archive of the WHOLE staged batch, so an envelope that lost part of it may archive NONE of it"
+  need_count "$rd" 0 \
+    "read/ after a partial envelope — a message the envelope dropped was never delivered, and archiving it as read is silent loss"
+  need_count "$fd" 0 "failed/ after a partial envelope — a serializer anomaly is not proof any message is invalid"
+  need_tree_has "$pd" "batch-integrity-a-v13" "batch message a must remain queued"
+  need_tree_has "$pd" "batch-integrity-b-v13" "batch message b must remain queued"
+  need_tree_has "$pd" "batch-integrity-c-v13" "batch message c must remain queued"
+
+  run_brain "$fx" bravo hook session-start
+  retry_rc=$?
+  need_rc "$retry_rc" 0 "stable-jq SessionStart retry after the partial envelope" || return 0
+  need_file_has "$OUT" "batch-integrity-a-v13" "retained batch message a must deliver on retry"
+  need_file_has "$OUT" "batch-integrity-b-v13" "retained batch message b must deliver on retry"
+  need_file_has "$OUT" "batch-integrity-c-v13" "retained batch message c must deliver on retry"
+  need_count "$pd" 0 "pending/ after the stable-jq retry"
+  need_count "$rd" 3 "read/ after the stable-jq retry"
+}
+
+# V.B/104 — THE HEALTHY BATCH STILL DELIVERS, and the instrument's positive control. The same
+# shim runs the same rewrite path with a sed script that matches nothing, so the envelope carries
+# every staged id: all three must archive. Widening the integrity check must not make it reject
+# healthy batches, and this is what stops V.B/103/106 from being satisfied by "reject whenever
+# the shim is on PATH" or by a fix that rejects any batch larger than one.
+#   BASELINE   green today. It is a guard, not a red.
+sc_complete_envelope_archives_the_whole_batch() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "complete-batch-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue complete-batch message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  sed_script="$base/complete-envelope.sed"
+  # Deliberately non-empty and deliberately unmatchable: the filter RUNS and removes nothing, so
+  # this exercises the shim's rewrite path rather than skipping it.
+  printf '/"id":"THIS-ID-IS-NEVER-STAGED-v13"/d\n' > "$sed_script" \
+    || { fail "fixture: could not write the no-op sed script"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-complete-envelope-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the complete-envelope shim dir"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the complete-envelope jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/jq) ;;                       # _dm_resolve_jq pins the first executable jq on
+    *) PATH=$saved_path; export PATH         # PATH, so if PATH does not resolve to the shim the
+       fail "instrument blind: PATH does not resolve jq to the complete-envelope shim, so the serializer under test would be the real one"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  hook_out="$base/complete-envelope.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the complete-envelope jq shim is STILL what PATH resolves"; return 0 ;;
+  esac
+  hook_added="$base/complete-envelope.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with a complete envelope"
+  need_eq "$(grep -c '^brain:' "$hook_added" 2>/dev/null)" 0 \
+    "a complete envelope must produce no emit warning"
+  need_file_has "$hook_out" "complete-batch-a-v13" "complete-batch message a must be delivered"
+  need_file_has "$hook_out" "complete-batch-b-v13" "complete-batch message b must be delivered"
+  need_file_has "$hook_out" "complete-batch-c-v13" "complete-batch message c must be delivered"
+  need_count "$pd" 0 \
+    "pending/ after a COMPLETE envelope — every staged id survived serialization, so the whole batch archives"
+  need_count "$rd" 3 "read/ after a complete envelope"
+  need_count "$fd" 0 "failed/ after a complete envelope"
+}
+
+# V.B/105 — ORDER INDEPENDENCE. The envelope loses the FIRST staged id and keeps the rest. Today
+# this is caught BY ACCIDENT — it is the one id the check happens to sample. Pinned so that
+# widening the check to the whole set cannot regress the case it already covers, and so a fix
+# that merely moves the sample (last id, any id) is rejected rather than accepted.
+#   BASELINE   green today, for the right reason.
+sc_envelope_dropping_first_staged_id_is_rejected() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "first-id-dropped-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue first-id-dropped message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  dropped=$(staged_names "$pd" | sed -n '1p')
+  [ -n "$dropped" ] || { fail "fixture: could not resolve the first staged id"; return 0; }
+
+  sed_script="$base/first-id-dropped.sed"
+  printf '/"id":"%s"/d\n' "$dropped" > "$sed_script" \
+    || { fail "fixture: could not write the first-id sed script"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-first-id-dropped-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the first-id shim dir"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the first-id jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/jq) ;;                       # _dm_resolve_jq pins the first executable jq on
+    *) PATH=$saved_path; export PATH         # PATH, so if PATH does not resolve to the shim the
+       fail "instrument blind: PATH does not resolve jq to the first-id shim, so the serializer under test would be the real one"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  hook_out="$base/first-id-dropped.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the first-id jq shim is STILL what PATH resolves"; return 0 ;;
+  esac
+  hook_added="$base/first-id-dropped.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with the first staged id dropped"
+  need_eq "$(byte_size "$hook_out")" 0 "stdout after the first staged id is dropped"
+  warn_count=$(grep -c '^brain:' "$hook_added" 2>/dev/null)
+  [ "${warn_count:-0}" != 0 ] \
+    || fail "a rejected envelope must be diagnosed: no 'brain:' line reached .hook-errors.log"
+  need_count "$pd" 3 "pending/ when the envelope lost the first staged id"
+  need_count "$rd" 0 "read/ when the envelope lost the first staged id"
+  need_count "$fd" 0 "failed/ when the envelope lost the first staged id"
+
+  run_brain "$fx" bravo hook session-start
+  retry_rc=$?
+  need_rc "$retry_rc" 0 "stable-jq SessionStart retry after the first staged id was dropped" || return 0
+  need_file_has "$OUT" "first-id-dropped-a-v13" "retained message a must deliver on retry"
+  need_file_has "$OUT" "first-id-dropped-b-v13" "retained message b must deliver on retry"
+  need_file_has "$OUT" "first-id-dropped-c-v13" "retained message c must deliver on retry"
+  need_count "$pd" 0 "pending/ after the stable-jq retry"
+  need_count "$rd" 3 "read/ after the stable-jq retry"
+}
+
+# V.B/106 — SET, NOT COUNT. The envelope carries three id fragments, but the second staged id has
+# been rewritten to repeat the first: the COUNT still matches the staged batch while the SET does
+# not. This is the r8 lesson the brief cites by name (`count-checks-admit-set-drift`) applied to
+# the obvious wrong fix — replacing a first-only sample with a "the envelope mentions as many ids
+# as we staged" tally, which V.B/103, /104 and /105 would all accept.
+#   BEYOND THE BRIEF's three scenarios, and flagged as such in the report: the brief names that
+#   lesson as this defect's class, which makes the count-only fix a plausible non-compliant
+#   implementation that nothing else here rejects. It needs no ruling the section header has not
+#   already made — an id that is not in the envelope may not be archived.
+sc_repeated_id_envelope_must_not_archive_the_batch() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "repeated-id-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue repeated-id message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  kept=$(staged_names "$pd" | sed -n '1p')
+  shadowed=$(staged_names "$pd" | sed -n '2p')
+  [ -n "$kept" ] && [ -n "$shadowed" ] \
+    || { fail "fixture: could not resolve the staged ids"; return 0; }
+
+  sed_script="$base/repeated-id.sed"
+  printf 's|"id":"%s"|"id":"%s"|\n' "$shadowed" "$kept" > "$sed_script" \
+    || { fail "fixture: could not write the id-repeating sed script"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-repeated-id-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the repeated-id shim dir"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the repeated-id jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/jq) ;;                       # _dm_resolve_jq pins the first executable jq on
+    *) PATH=$saved_path; export PATH         # PATH, so if PATH does not resolve to the shim the
+       fail "instrument blind: PATH does not resolve jq to the repeated-id shim, so the serializer under test would be the real one"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  hook_out="$base/repeated-id.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the repeated-id jq shim is STILL what PATH resolves"; return 0 ;;
+  esac
+  hook_added="$base/repeated-id.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with a repeated staged id"
+  need_eq "$(byte_size "$hook_out")" 0 \
+    "stdout when one staged id is missing but the id COUNT still matches"
+  # Instrument ENGAGED control — see V.B/103. Vacuous once the envelope is rejected; under the
+  # shipped engine it proves the rewritten id really is absent from what was serialized.
+  need_file_lacks "$hook_out" "$shadowed" \
+    "instrument control: an emitted payload must not carry the id the shim rewrote away (if it does, the shim never engaged)"
+  warn_count=$(grep -c '^brain:' "$hook_added" 2>/dev/null)
+  [ "${warn_count:-0}" != 0 ] \
+    || fail "a rejected repeated-id envelope must be diagnosed: no 'brain:' line reached .hook-errors.log"
+  need_count "$pd" 3 \
+    "pending/ when the envelope repeats one staged id in place of another — matching the id COUNT is not proof the SET was serialized"
+  need_count "$rd" 0 "read/ when a staged id is absent from the envelope under a matching count"
+  need_count "$fd" 0 "failed/ after a repeated-id envelope"
+  need_tree_has "$pd" "repeated-id-a-v13" "repeated-id message a must remain queued"
+  need_tree_has "$pd" "repeated-id-b-v13" "repeated-id message b must remain queued"
+  need_tree_has "$pd" "repeated-id-c-v13" "repeated-id message c must remain queued"
+
+  run_brain "$fx" bravo hook session-start
+  retry_rc=$?
+  need_rc "$retry_rc" 0 "stable-jq SessionStart retry after the repeated-id envelope" || return 0
+  need_file_has "$OUT" "repeated-id-a-v13" "retained repeated-id message a must deliver on retry"
+  need_file_has "$OUT" "repeated-id-b-v13" "retained repeated-id message b must deliver on retry"
+  need_file_has "$OUT" "repeated-id-c-v13" "retained repeated-id message c must deliver on retry"
+  need_count "$pd" 0 "pending/ after the stable-jq retry"
+  need_count "$rd" 3 "read/ after the stable-jq retry"
+}
+
+# ══════════ V.B (cont.) — the reject path must be DIAGNOSABLE, not merely correct ═════════
+#
+# AUTHORITY: the code-review finding on the V.B/103-106 fix (relayed 2026-08-06). The widened
+# loop is correct — it rejects the whole batch when any staged id is absent from the envelope —
+# but it `return 1`s fail-fast and DISCARDS which id was missing. The caller's sole diagnostic
+# (`bin/brain:1546`) names the jq binary, never the message, and is byte-identical for two
+# different faults: the envelope-FRAMING rejection (the payload is not `{...}`) and the new
+# PER-ID rejection. V.B/103, /105 and /106 assert only `warn_count != 0`, so they pass whether
+# the warning identifies the offender or says nothing useful at all.
+#
+# WHY IT MATTERS: 13 lanes share this engine and a rejected batch stays pending, so a persistent
+# condition reprints the same generic line at every SessionStart forever. The only way to find
+# the stuck message today is hand-inspecting pending/. `bin/brain` itself does not work this way
+# anywhere else — 297-321 name their offender uniformly (`invalid dm lane component: $_do_lane`,
+# `dm queue path escapes the queue root: $_do_path`).
+#
+# THE RULING THESE PIN, and the places they deliberately stay silent:
+#   · PINNED — the per-id rejection's diagnostic names the MISSING staged id(s), and must NOT
+#     enumerate ids the envelope KEPT. See the RULING block on V.B/107 for the dispatcher's
+#     rationale and for the verbose "staged: a b c; missing: b c" shape it deliberately rejects.
+#   · NOT PINNED — whether it names the FIRST missing id or EVERY missing id. Seam §3's ruling
+#     of 2026-08-06 is name-every-missing-id (it REVERSED an earlier first-only lean), but these
+#     assertions stay compatible with both shapes on purpose: V.B/107 asserts the first missing
+#     id is PRESENT and never that the others are absent. Ratifying either way costs no test
+#     edit, and a first-only GREEN is measurably still green here.
+#   · NOT PINNED — any wording. V.B/108 pins only that the two fault classes do not emit the
+#     SAME text, which is the reviewable property; prescribing a phrase would freeze prose the
+#     authority never fixed.
+#   · PINNED, and easy to miss — the per-id reject path must emit EXACTLY ONE `brain:` line.
+#     That is V.U/77's and V.V/84's constraint, not this section's; see V.B/108's header.
+#
+# INSTRUMENTS: both scenarios reuse `write_id_editing_envelope_jq` exactly as V.B/103-106 do.
+# V.B/108 additionally reuses `write_rc0_truncated_payload_jq` (V.V/81's framing fault). No new
+# apparatus. The instrument-ENGAGED control in both is the pending/read count: a shim that never
+# edited the envelope would emit and archive the batch, so pending/ == 3 could not hold.
+
+# V.B/107 — THE REJECTED BATCH MUST NAME ITS OFFENDER. Three staged messages; the envelope keeps
+# the FIRST staged id and loses the other two, so the loop accepts index 1 and rejects at index 2.
+#   PROVES     the diagnostic written to .hook-errors.log carries the id of the staged message
+#              that was absent from the envelope.
+#   REJECTS    the shipped generic warning, which names jq and no message at all; a fix that
+#              reports `"$1"` — the first STAGED id — instead of the first MISSING one, which is
+#              the natural copy-paste from the pre-fix check and which the fixture separates by
+#              keeping index 1 intact; and W6 below.
+#
+# RULING (@pm, 2026-08-06): the reject diagnostic names the MISSING ids and must NOT enumerate
+# ids that were present. Rationale: `pending/` already preserves the staged set, so re-listing it
+# in the warning is redundant with what an operator can already see; the omission set is precisely
+# the thing `pending/` cannot tell them. A verbose "staged: a b c; missing: b c" shape is
+# deliberately rejected by this — mixing the two sets is exactly what made W6 indistinguishable
+# from a correct fix.
+#
+# W6 — THE FALSE GREEN THIS SCENARIO ONCE MISSED, and the assertion that closes it. W6 sets the
+# reject diagnostic to `$*` (EVERY staged id) rather than the accumulated missing subset, and
+# surfaces it through one enriched caller warning. Measured 2026-08-06: W6 passed all 100
+# scenarios. `need_file_has "$hook_added" "$lost_a"` is satisfied by any superset containing
+# lost_a, and the staged batch is a superset by construction; V.B/108 misses it too, because only
+# the per-id class carries ids so the two classes still differ. Under W6 the operator sees the
+# same id list no matter which ids the serializer actually dropped, which defeats the whole point
+# of this scenario. The `need_file_lacks "$hook_added" "$kept"` assertion below kills it, and was
+# measured to leave both a name-every-missing-id GREEN and a first-missing-only GREEN untouched —
+# so it stays neutral on the first-vs-all question, exactly as the has-assertion already is.
+sc_rejected_batch_diagnostic_names_the_missing_id() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "diag-missing-id-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue diagnostic batch message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  # Staged order, read back from the queue — see staged_names for why send order will not do.
+  kept=$(staged_names "$pd" | sed -n '1p')
+  lost_a=$(staged_names "$pd" | sed -n '2p')
+  lost_b=$(staged_names "$pd" | sed -n '3p')
+  [ -n "$kept" ] && [ -n "$lost_a" ] && [ -n "$lost_b" ] \
+    || { fail "fixture: could not resolve the three staged ids"; return 0; }
+
+  sed_script="$base/diag-missing-id.sed"
+  { printf '/"id":"%s"/d\n' "$lost_a"; printf '/"id":"%s"/d\n' "$lost_b"; } > "$sed_script" \
+    || { fail "fixture: could not write the digest-dropping sed script"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-diag-missing-id-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the diagnostic shim dir"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the diagnostic jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/jq) ;;                       # _dm_resolve_jq pins the first executable jq on
+    *) PATH=$saved_path; export PATH         # PATH, so if PATH does not resolve to the shim the
+       fail "instrument blind: PATH does not resolve jq to the diagnostic shim, so the serializer under test would be the real one"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the diagnostic jq shim is STILL what PATH resolves"; return 0 ;;
+  esac
+  hook_added="$base/diag-missing-id.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with a partial envelope"
+  # Instrument ENGAGED control: a shim that never edited the envelope would have emitted the
+  # complete context and archived all three, so these counts cannot hold unless the reject fired.
+  need_count "$pd" 3 "pending/ — the partial envelope must reject the whole staged batch"
+  need_count "$rd" 0 "read/ — nothing may be archived out of a rejected batch"
+  need_count "$fd" 0 "failed/ — a serializer anomaly is not proof any message is invalid"
+  warn_count=$(grep -c '^brain:' "$hook_added" 2>/dev/null)
+  [ "${warn_count:-0}" != 0 ] \
+    || { fail "a rejected partial envelope must be diagnosed: no 'brain:' line reached .hook-errors.log"; return 0; }
+  need_file_has "$hook_added" "$lost_a" \
+    "the reject diagnostic must name the staged id that was absent from the envelope — the shipped warning names only the jq binary, which leaves an operator hand-inspecting pending/ to find the message that stopped the batch"
+  need_file_lacks "$hook_added" "$kept" \
+    "the reject diagnostic must name the MISSING ids, not the staged batch: the id the envelope KEPT must not appear"
+}
+
+# V.B/108 — THE TWO REJECT CLASSES MUST BE TELLABLE APART. One fixture, one batch, ONE shim path,
+# two consecutive SessionStarts driving two different faults: (1) a staged id missing from an
+# otherwise well-formed envelope — the per-id check; (2) real jq's envelope minus its final byte
+# — the envelope-FRAMING check, which fires before any per-id check runs (V.V/81's fault).
+#   PROVES     the diagnostics the two faults write to .hook-errors.log are not identical text.
+#   REJECTS    the shipped engine, where both faults land on the single generic warning at
+#              bin/brain:1546 and are byte-for-byte indistinguishable; and the lazy fix of
+#              appending the staged batch to that SHARED line, which names ids in both classes
+#              and so still leaves an operator unable to tell which check rejected.
+#   WHY ONE SHIM PATH IS LOAD-BEARING: the generic warning interpolates $_DM_JQ_BIN, so two shim
+#   directories would make the two diagnostics differ on the BINARY PATH alone and this scenario
+#   would pass against the very engine it exists to reject. The shim file is overwritten in place
+#   between the runs; the batch is untouched because neither fault archives anything.
+#   DOES NOT   pin any wording. Comparing the whole added slice leaves GREEN free to phrase both
+#   PROVE      classes however it likes, so long as they differ.
+#   ⚠ WARNING  the per-id reject path must emit EXACTLY ONE `brain:` line. It must contain the jq
+#     COUNT    binary path (V.U/77, V.V/84), must name the missing id(s) (V.B/107), and must
+#     IS PINNED  differ from the framing line (this scenario). A single enriched CALLER warning
+#     ELSEWHERE  satisfies all four; an added `_warn` at the reject site does NOT.
+#              This header previously claimed the opposite — that only the FRAMING path was
+#              pinned at one line and GREEN "may legitimately add a second line on the per-id
+#              path". That was measurably false and is corrected here, because leaving it stood
+#              would have pushed GREEN into "fixing" two frozen, currently-passing scenarios.
+#              Both V.U/77 and V.V/84 drive the PER-ID path, not the framing path:
+#              write_rc0_empty_payload_jq emits `{}`, which PASSES the `\{*\}` framing case at
+#              bin/brain:1420 and rejects in the id loop at :1422; write_status_only_envelope_jq
+#              likewise yields a well-formed envelope that only fails per-id. Measured
+#              2026-08-06: a GREEN that adds a second `_warn` at the reject site scores 98/100,
+#              failing V.U/77 and V.V/84 with `got '2', want '1'`.
+sc_reject_classes_are_distinguishable() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "reject-class-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue reject-class message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  lost=$(staged_names "$pd" | sed -n '2p')
+  [ -n "$lost" ] || { fail "fixture: could not resolve the second staged id"; return 0; }
+
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-reject-class-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the reject-class shim dir"; return 0; }
+
+  # ── run 1: a staged id is absent from a well-formed envelope ──
+  sed_script="$base/reject-class.sed"
+  printf '/"id":"%s"/d\n' "$lost" > "$sed_script" \
+    || { fail "fixture: could not write the id-dropping sed script"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the id-dropping jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in
+    "$shim_dir"/jq) ;;
+    *) PATH=$saved_path; export PATH
+       fail "instrument blind: PATH does not resolve jq to the reject-class shim on the missing-id run"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  missing_rc=$?
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the reject-class jq shim is STILL what PATH resolves after the missing-id run"; return 0 ;;
+  esac
+  missing_err="$base/reject-class-missing-id.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$missing_err" 2>/dev/null || : > "$missing_err"
+
+  need_rc "$missing_rc" 0 "SessionStart hook wrapper status with a staged id missing from the envelope"
+  # Instrument ENGAGED control, and the precondition for run 2: the batch must survive intact.
+  need_count "$pd" 3 "pending/ after the missing-id rejection — the batch must survive for the framing run" || return 0
+
+  # ── run 2: SAME shim path, the envelope loses its closing delimiter instead ──
+  write_rc0_truncated_payload_jq "$shim_dir/jq" "$real_jq" c \
+    || { fail "fixture: could not overwrite the shim with the truncated-envelope jq"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in
+    "$shim_dir"/jq) ;;
+    *) PATH=$saved_path; export PATH
+       fail "instrument blind: PATH does not resolve jq to the reject-class shim on the framing run"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  framing_rc=$?
+  PATH=$saved_path; export PATH
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the reject-class jq shim is STILL what PATH resolves after the framing run"; return 0 ;;
+  esac
+  framing_err="$base/reject-class-framing.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$framing_err" 2>/dev/null || : > "$framing_err"
+
+  need_rc "$framing_rc" 0 "SessionStart hook wrapper status with a truncated envelope"
+  need_count "$pd" 3 "pending/ after the envelope-framing rejection"
+  need_count "$rd" 0 "read/ — neither rejection may archive anything"
+  need_count "$fd" 0 "failed/ — neither serializer anomaly is proof any message is invalid"
+
+  missing_warns=$(grep -c '^brain:' "$missing_err" 2>/dev/null)
+  framing_warns=$(grep -c '^brain:' "$framing_err" 2>/dev/null)
+  [ "${missing_warns:-0}" != 0 ] \
+    || { fail "the missing-staged-id rejection produced no 'brain:' line in .hook-errors.log"; return 0; }
+  [ "${framing_warns:-0}" != 0 ] \
+    || { fail "the envelope-framing rejection produced no 'brain:' line in .hook-errors.log"; return 0; }
+
+  missing_text=$(cat "$missing_err" 2>/dev/null)
+  framing_text=$(cat "$framing_err" 2>/dev/null)
+  [ "$missing_text" != "$framing_text" ] \
+    || fail "the two reject classes are indistinguishable: a staged id missing from the envelope and an envelope missing its closing delimiter wrote byte-identical diagnostics ($missing_text) — an operator cannot tell which check rejected the batch"
+}
+
+# ═══════ V.D — the CHANGES cursor may only advance when the banner was DELIVERED ═════════
+#
+# A SEPARATE CONCERN FROM V.B/103-108, which is why this takes its own section letter instead of
+# extending that block. V.B is BATCH INTEGRITY: which staged DM ids must survive into the envelope
+# before an archive is authorized. This is DELIVERY-CONDITIONED CURSOR COMMIT: a piece of on-disk
+# state that `cmd_status` advances while RENDERING, inside a caller that may then throw the render
+# away. The two share a fixture shape (a rejected pinned emit) and one instrument, and nothing
+# else — different state, different failure, different fix.
+#
+# AUTHORITY: .context/seams/pr10-cursor-and-diagnostic.md §2 ("Seam decision A — the CHANGES
+# cursor: ONE counter, ONE writer, split render from commit") — its delivery condition and its
+# settled shape are the spec for all three scenarios here; plus the dispatcher's 2026-08-06 brief,
+# which is what forced the V.D/110 guard (see WHY V.D/110 EXISTS, below).
+# Implementation lines are cited as EVIDENCE only: bin/brain:944-953 (the banner block — reads the
+# bookmark at :946, writes it at :951), :1521 (`_st=$(cmd_status 2>/dev/null)` — the hook CAPTURES
+# that render), :1530 and :1535 (the pinned emit, and the rc check that may discard the whole
+# payload), :1770 (the CLI `status` dispatch).
+#
+# THE DEFECT: `cmd_status` advances the bookmark as a side effect of rendering the banner.
+# `_hook_session_start` captures the render into a variable and discards the entire payload when
+# `_emit_session_ctx_pinned` rejects. The bookmark moved, the banner was never delivered to the
+# agent, and because the bookmark now equals the entry count, EVERY later healthy boot omits it —
+# permanently, silently, and unrecoverably short of hand-editing a gitignored file.
+#
+# WHY THIS BRANCH OWNS IT: on main only a MISSING FIRST staged id rejected. This branch widened the
+# check to every staged id, so the set of envelopes that reach the discard path is strictly larger.
+# V.D/109's fixture keeps the first staged id and drops the SECOND precisely so the widened loop is
+# the only thing that can reject it — a missing-first fixture would reject on main too and would
+# not isolate this branch's regression.
+#
+# WHY V.D/110 EXISTS — a resolved authority defect, kept on the record because it is the reason
+# this guard is not optional. §2 once read "stop the HOOK from committing the bookmark", full stop,
+# and its cost bullet called "never marking read → the banner repeats (annoying, harmless)" an
+# acceptable error. Read literally that describes a DIFFERENT implementation — one where the hook
+# never commits at all — which passes V.D/109 and leaves the banner nagging on every boot of all 13
+# lanes forever. It was built during the RED audit and V.D/110 rejected it. §2 has since been
+# corrected (see its own ⚠ CORRECTION note): the condition is DELIVERY, not caller — the hook must
+# not commit on a boot that did not deliver, and must still commit on one that did, which is
+# exactly what V.D/109 and V.D/110 pin between them. Nothing is open here; this paragraph is
+# history, not a live tension, and §2 is not ambivalent any more.
+#
+# OBSERVABLE, NOT STRUCTURAL: every assertion in V.D/109-112 reads the banner text out of an
+# emitted payload or a terminal capture. None of them inspects `$BRAIN/.cursors/*.changes`. That
+# file is an implementation detail — its path, its format, and whether it exists at all are the
+# fix's business — and a test that read it would pass against a fix that moved the bookmark
+# correctly while losing the banner some other way, which is exactly the failure under test.
+#   ⚠ V.D/113 IS THE ONE EXCEPTION, and it is unavoidable rather than an erosion: its fault is a
+#   hostile SHAPE at the bookmark's path, so the fixture cannot state the precondition without
+#   naming that path. Even there the assertion is on the DIAGNOSTIC, never on the file's contents
+#   or format. If a fix relocates the bookmark, V.D/113's fixture path must follow it — declared
+#   here so the dependency is found by reading rather than by a puzzling red.
+#
+# FIXTURE NOTE: CHANGES.md entries are appended DIRECTLY, for `write_presence`'s reason — the only
+# engine route to one is `brain propose` + `brain apply`, a governance gauntlet whose own behaviour
+# is not under test here. The engine's sole reader counts lines matching `^- ` (:945); that is the
+# shape these fixtures write.
+#
+# V.D/112 AND V.D/113 — the two faults an adversarial convergence pass confirmed in the shipped
+# `_changes_snapshot` / `_changes_commit` pair on 2026-08-06. Both are consequences of the SAME
+# split this section's fix introduced, which is why they live here rather than in a new section:
+#   · V.D/112 — the snapshot is read before the whole render and written after the emit, so a
+#     CHANGES.md that SHRINKS inside that window is committed at a bookmark HIGHER than the file's
+#     entry count, and every later entry up to that number is never announced. §2 ranks the two
+#     error directions and calls "marking read too early" today's silent loss and "failing to mark
+#     read" the merely annoying one; this crosses that line. It is NOT the append race §2's
+#     DECLARED GAP rules acceptable: that gap's own cost reasoning is "a few lines silently marked
+#     read during a race, not the permanent silencing this fix removes", and a shrink produces
+#     exactly the permanent silencing. It is also NOT pre-existing — see V.D/112's own header.
+#   · V.D/113 — `_changes_commit` routes through `_atomic_place`, whose terminal
+#     `command mv -f -- "$tmp" "$dest"` MOVES the temp INSIDE a directory-shaped destination and
+#     exits 0. The caller's rc contract (:1561-1564, :1804-1806) is what makes a failed commit
+#     visible at all, so a false success silences the breadcrumb this branch added.
+#
+# INSTRUMENTS: V.D/109 reuses `write_id_editing_envelope_jq` exactly as V.B/103-108 do, with the
+# same instrument-blind check before the run and instrument-leak check after PATH is restored. Its
+# POSITIVE control — the same shim with a matchless script must still deliver the whole batch — is
+# V.B/104 and is deliberately NOT duplicated here. V.D/112 adds ONE instrument, the one-shot
+# `write_changes_shrinking_awk` PATH shim, under the same blind/leak/engaged discipline; its own
+# header explains why nothing cheaper reaches the window. That shim is written TWICE — once per
+# call site, each instance over its own vault with its own fired marker — but it is one instrument
+# used twice, not two: no state crosses between the armings, so neither arming depends on the
+# other having fired. V.D/114 adds ONE instrument, the two-armed `write_changes_aba_cksum` PATH
+# shim, under the same blind/leak/engaged discipline; its own header explains why a `cksum` shim is
+# the only thing that lands between the snapshot's two reads. V.D/110, V.D/111 and V.D/113 use NO
+# instrument at all: they drive the unmodified engine and read its output. V.D/111's
+# `brain:`-silence assertion is an assertion on that output, the same rung as V.B/104's (:5077) —
+# not an instrument.
+#
+# NUMBERING: starts at 109, after V.B/108. 92-102 stay reserved for section V.P (task 5.7).
+
+# V.D/109 — THE REGRESSION. Three unread CHANGES entries, three staged DMs, and an envelope missing
+# the SECOND staged id, so the widened per-id loop is what rejects and the whole payload — banner
+# included — is discarded. The assertion that matters is the SUBSEQUENT healthy boot.
+#   PROVES     a boot whose payload was rejected does not consume the CHANGES banner: the next
+#              healthy SessionStart still carries it in additionalContext.
+#   REJECTS    the shipped engine, which advances the bookmark inside cmd_status at render time, so
+#              the banner dies the moment the caller discards the render; and any fix that stops
+#              the bookmark moving without leaving the banner deliverable on a later boot.
+#   WHY NOT A  a `.cursors/bravo.changes` assertion would also pass against a fix that keeps the
+#   CURSOR     bookmark honest but drops the banner from the payload for some unrelated reason. The
+#   ASSERTION  retry's additionalContext is what an agent actually receives, so that is what is
+#              asserted; no structural witness is needed to discriminate the named fault.
+#   DOES NOT   pin WHERE the commit decision lives — only that the banner survives a rejected
+#     PIN      boot and is delivered on the next healthy one. That neutrality is deliberate here
+#              but is NOT an open design question: seam §2 settles the shape as the parent-prepared
+#              snapshot (`_changes_snapshot` before the render, `cmd_status` renders only, the
+#              callers commit) and ELIMINATES the alternatives it once entertained — read §2 for
+#              which and why; this block is not a menu of permitted designs. Also unpinned: the
+#              cursor file's path, format or existence; the banner's wording beyond the substring
+#              the engine has always printed; and the REJECTED boot's own bookmark state. It does
+#              not re-pin batch retention either: V.B/103 owns that.
+sc_rejected_boot_does_not_consume_the_changes_banner() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  pd=$(q_dir "$fx" bravo pending); rd=$(q_dir "$fx" bravo read); fd=$(q_dir "$fx" bravo failed)
+  hooklog="$fx/.brain/.hook-errors.log"
+  changes="$fx/.brain/CHANGES.md"
+  needle="brain change(s) since you last looked"
+
+  for n in 1 2 3; do
+    printf '%s\n' "- 2026-08-06T00:00:0$n cursor-red-$n — fixture change $n" >> "$changes" \
+      || { fail "fixture: could not seed CHANGES.md"; return 0; }
+  done
+  # Fixture sanity only — the shape bin/brain:945 counts. Deliberately NOT a render: any status
+  # render here would consume the very banner this scenario is about.
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 3 \
+    "prerequisite: three unread CHANGES entries seeded" || return 0
+
+  for m in a b c; do
+    run_brain "$fx" alpha dm @bravo "cursor-red-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue cursor-regression message $m" || return 0
+  done
+  need_count "$pd" 3 "prerequisite: three healthy messages staged" || return 0
+
+  # Staged order, read back from the queue — see staged_names for why send order will not do.
+  # The FIRST staged id is kept on purpose: it is what makes this a regression of THIS branch
+  # rather than a fault main would also have rejected.
+  lost=$(staged_names "$pd" | sed -n '2p')
+  [ -n "$lost" ] || { fail "fixture: could not resolve the second staged id"; return 0; }
+
+  sed_script="$base/cursor-red.sed"
+  printf '/"id":"%s"/d\n' "$lost" > "$sed_script" \
+    || { fail "fixture: could not write the digest-dropping sed script"; return 0; }
+  real_jq=$(command -v jq) || { fail "fixture: cannot locate the real jq"; return 0; }
+  shim_dir="$base/jq-cursor-red-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the cursor-regression shim dir"; return 0; }
+  write_id_editing_envelope_jq "$shim_dir/jq" "$real_jq" "$sed_script" \
+    || { fail "fixture: could not write the cursor-regression jq shim"; return 0; }
+
+  before_hook=$(line_count "$hooklog")
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v jq)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/jq) ;;                       # _dm_resolve_jq pins the first executable jq on
+    *) PATH=$saved_path; export PATH         # PATH, so if PATH does not resolve to the shim the
+       fail "instrument blind: PATH does not resolve jq to the cursor-regression shim, so the serializer under test would be the real one"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  hook_rc=$?
+  hook_out="$base/cursor-red.out"
+  cp "$OUT" "$hook_out" 2>/dev/null || : > "$hook_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v jq)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the cursor-regression jq shim is STILL what PATH resolves"; return 0 ;;
+  esac
+  hook_added="$base/cursor-red.err"
+  tail -n "+$((before_hook + 1))" "$hooklog" > "$hook_added" 2>/dev/null || : > "$hook_added"
+
+  need_rc "$hook_rc" 0 "SessionStart hook wrapper status with a partial envelope"
+  # Instrument ENGAGED controls: a shim that never edited the envelope would have emitted the
+  # complete context and archived all three, so neither the empty stdout nor these counts could
+  # hold. They fire with their own distinct reasons rather than letting a blind instrument
+  # masquerade as the defect.
+  need_eq "$(byte_size "$hook_out")" 0 \
+    "stdout after a partial envelope — an envelope missing a staged id must not be emitted at all"
+  need_count "$pd" 3 "pending/ — the partial envelope must reject the whole staged batch"
+  need_count "$rd" 0 "read/ — nothing may be archived out of a rejected batch"
+  need_count "$fd" 0 "failed/ — a serializer anomaly is not proof any message is invalid"
+  warn_count=$(grep -c '^brain:' "$hook_added" 2>/dev/null)
+  [ "${warn_count:-0}" != 0 ] \
+    || { fail "a rejected partial envelope must be diagnosed: no 'brain:' line reached .hook-errors.log"; return 0; }
+
+  # THE ASSERTION THIS SCENARIO EXISTS FOR. The rejected boot delivered nothing, so the unread
+  # CHANGES must still be unread — a healthy boot right afterwards must carry the banner.
+  retry_ctx=$(hook_context "$fx" bravo) \
+    || { fail "the healthy SessionStart retry emitted no readable additionalContext"; return 0; }
+  need_str_has "$retry_ctx" "$needle" \
+    "the healthy SessionStart after a REJECTED one must still show the CHANGES banner — the rejected boot's payload was discarded, so the banner it rendered was never delivered to any agent, and a bookmark advanced during that render silences it on this and every later boot, permanently"
+}
+
+# V.D/110 — THE OVER-FIX GUARD: a DELIVERED banner must be consumed. Four consecutive healthy boots
+# against one fixture. No shim, no instrument — the unmodified engine, read through its output.
+#   boot 1   three unread entries + two staged DMs → the PINNED emit path (:1530). Banner present.
+#   boot 2   nothing staged (boot 1 archived it)   → banner ABSENT: boot 1's delivery consumed it.
+#   ── a fourth entry is appended ──
+#   boot 3   no DMs staged → the UNPINNED emit path (:1533). Banner present again.
+#   boot 4   no DMs staged → banner ABSENT: boot 3's delivery consumed it too.
+#   PROVES     a SessionStart whose payload was actually emitted advances the bookmark, on BOTH
+#              emit paths.
+#   REJECTS    "never commit the bookmark from the hook at all", which satisfies V.D/109 and turns
+#              the banner into a permanent nag on every boot of all 13 lanes (boots 2 and 4); and
+#              the adjacent misplacement of putting the commit inside the `[ "$#" -gt 0 ]` archive
+#              block at :1537, which would consume the banner only on boots that happened to carry
+#              DMs (boot 4 alone).
+#   BASELINE   green today — the shipped engine advances the bookmark on every render, by both
+#              paths. It is a guard, not a red.
+#   DOES NOT   pin the NUMBER in the banner (boot 3 legitimately shows a different count from boot
+#     PIN      1), nor the emit paths' shapes, nor anything about a boot whose emit FAILED — that
+#              is V.D/109's half of the contract, and re-pinning it here would double-red one
+#              defect. Boots 3-4 extend the same claim to the second emit path rather than adding
+#              a new one; they cost two engine invocations and no apparatus.
+sc_delivered_changes_banner_is_consumed() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  pd=$(q_dir "$fx" bravo pending)
+  changes="$fx/.brain/CHANGES.md"
+  needle="brain change(s) since you last looked"
+
+  for n in 1 2 3; do
+    printf '%s\n' "- 2026-08-06T00:00:0$n cursor-guard-$n — fixture change $n" >> "$changes" \
+      || { fail "fixture: could not seed CHANGES.md"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 3 \
+    "prerequisite: three unread CHANGES entries seeded" || return 0
+
+  for m in a b; do
+    run_brain "$fx" alpha dm @bravo "cursor-guard-$m-v13"
+    rc=$?
+    need_rc "$rc" 0 "prerequisite: queue delivered-banner message $m" || return 0
+  done
+  need_count "$pd" 2 "prerequisite: two healthy messages staged" || return 0
+
+  ctx1=$(hook_context "$fx" bravo) \
+    || { fail "boot 1 (DMs staged) emitted no readable additionalContext"; return 0; }
+  need_str_has "$ctx1" "$needle" \
+    "boot 1 must show the CHANGES banner — three entries are unread and this boot emits successfully"
+  need_count "$pd" 0 \
+    "boot 1 must deliver and archive the staged batch, otherwise boot 2 is not the no-DM path this scenario means to drive" || return 0
+
+  ctx2=$(hook_context "$fx" bravo) \
+    || { fail "boot 2 emitted no readable additionalContext"; return 0; }
+  need_str_lacks "$ctx2" "$needle" \
+    "boot 2 must NOT repeat the banner: boot 1 emitted its payload, so the banner WAS delivered and the bookmark must have advanced — a fix that never commits from the hook makes this banner a permanent nag on every boot of all 13 lanes"
+
+  printf '%s\n' "- 2026-08-06T00:00:04 cursor-guard-4 — fixture change 4" >> "$changes" \
+    || { fail "fixture: could not append the fourth CHANGES entry"; return 0; }
+
+  ctx3=$(hook_context "$fx" bravo) \
+    || { fail "boot 3 emitted no readable additionalContext"; return 0; }
+  need_str_has "$ctx3" "$needle" \
+    "boot 3 must show the banner again — a fourth entry was appended after boot 2 consumed the first three"
+  ctx4=$(hook_context "$fx" bravo) \
+    || { fail "boot 4 emitted no readable additionalContext"; return 0; }
+  need_str_lacks "$ctx4" "$needle" \
+    "boot 4 must NOT repeat the banner: boot 3 delivered it with NO DMs staged, so a commit placed only in the staged-DM archive branch leaves every DM-free boot nagging forever"
+}
+
+# V.D/111 — THE CLI PATH MUST NOT REGRESS. `brain status` (:1770) prints straight to the terminal:
+# once printed, delivered. There is no capture and no discard, so the fix has no business reaching
+# into it — seam §2 says so in as many words ("leave the CLI exactly as-is").
+#   PROVES     two consecutive `brain status` invocations show the banner, then omit it; and that
+#              the first one — whose bookmark WAS recorded — says nothing on the `brain:` channel.
+#   REJECTS    a fix that makes `cmd_status` render-only — which the shipped shape does — but then
+#              commits from `_hook_session_start` ALONE, leaving the CLI path with no committer,
+#              under which `brain status` reprints the same banner on every invocation forever.
+#   THE        the `brain:` silence assertion is the COMPLEMENT V.D/113 needs, and it lives here
+#   COMPLEMENT because this is the scenario that already drives a HEALTHY CLI commit. V.D/113 asks
+#   V.D/113    for a breadcrumb when the bookmark could NOT be recorded; on its own that is
+#   NEEDS      satisfiable by an engine that warns unconditionally — one which never fixes the
+#              `mv -f <temp> <directory>` fault at all and simply prints the breadcrumb every time
+#              scores a clean pass. A breadcrumb assertion is only meaningful next to a silence
+#              assertion: together they pin the DIAGNOSTIC to the failing commit rather than to the
+#              act of committing. The hook-side equivalent of that cheat dies to V.B/104's
+#              "a complete envelope must produce no emit warning" (:5077, the same rung — an
+#              assertion on the engine's own output, not an instrument); nothing pinned a quiet CLI
+#              `brain status` until this line.
+#   BASELINE   green today, including the silence assertion: HEAD emits zero `brain:` lines on a
+#              healthy `brain status`. It is a guard, not a red.
+#   DOES NOT   pin the CLI's output format, nor HOW the CLI ends up committing — whether it shares
+#     PIN      one code path with the hook or commits explicitly at its own call site. Any shape
+#              that leaves `brain status` consuming the banner passes here; seam §2 picks which
+#              shape ships, and this scenario deliberately does not restate that choice. The
+#              silence assertion is scoped to the `brain:` channel — `_warn`'s prefix (:63) — so
+#              ordinary status output is untouched by it, and a fix is free to say whatever it
+#              likes on stdout.
+sc_cli_status_consumes_the_changes_banner() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  changes="$fx/.brain/CHANGES.md"
+  needle="brain change(s) since you last looked"
+
+  for n in 1 2; do
+    printf '%s\n' "- 2026-08-06T00:00:0$n cursor-cli-$n — fixture change $n" >> "$changes" \
+      || { fail "fixture: could not seed CHANGES.md"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 2 \
+    "prerequisite: two unread CHANGES entries seeded" || return 0
+
+  run_brain "$fx" bravo status
+  first_rc=$?
+  need_rc "$first_rc" 0 "first CLI 'brain status' invocation"
+  need_eq "$(grep -c '^brain:' "$ERR" 2>/dev/null)" 0 \
+    "a CLI 'brain status' whose bookmark WAS recorded must stay silent"
+  need_file_has "$OUT" "$needle" \
+    "the first CLI 'brain status' must show the CHANGES banner — two entries are unread"
+
+  run_brain "$fx" bravo status
+  second_rc=$?
+  need_rc "$second_rc" 0 "second CLI 'brain status' invocation"
+  need_file_lacks "$OUT" "$needle" \
+    "the second CLI 'brain status' must not repeat the banner: the CLI prints straight to the terminal, so the first invocation DELIVERED it, and a fix that defers the bookmark commit for every caller would nag here forever"
+}
+
+# V.D/112 — A STALE SNAPSHOT MUST NOT PERMANENTLY SILENCE LATER, UNRELATED CHANGES. Two unread
+# entries, no bookmark; the render is driven with a `awk` shim that empties CHANGES.md the moment
+# the engine reaches the presence pass — squarely between `_changes_snapshot` (:1545) and
+# `_changes_commit` (:1562). The boot renders "2 changes", DELIVERS, and commits the bookmark 2
+# against a file that now holds 0. TWO DIFFERENT entries are then appended, and the assertion that
+# matters is the next boot: total 2, bookmark 2, banner gone — for those entries and for every
+# entry after them, permanently.
+#
+# THE SAME FAULT IS DRIVEN THROUGH BOTH CALL SITES, in this one scenario. `_changes_commit` has two
+# callers — the hook (:1562) and the CLI `status` dispatch (:1804) — and seam §2 puts the decision
+# with the caller ("the decision to commit belongs to the caller"). A guard placed at the hook call
+# site alone is therefore a plausible GREEN, not a contrived one, and it leaves `brain status`
+# committing a cursor that outruns the file exactly as the shipped engine does (measured on such a
+# build: cursor 2, CHANGES.md 0 entries, every later entry silenced). Two call sites of one fault
+# belong in one scenario, so the hook arm runs first and the CLI arm repeats it below.
+#   PROVES     entries recorded AFTER a render that saw a shrunk CHANGES.md are still announced —
+#              through the hook AND through `brain status`. The bookmark may never outrun what the
+#              file actually holds, whichever caller commits it.
+#   REJECTS    the shipped engine, which commits the snapshotted count unconditionally once the
+#              emit succeeded; a repair applied at ONE call site only, in either direction; and any
+#              fix that only narrows the window (moving the snapshot later still leaves a shrink
+#              between snapshot and commit) rather than refusing to commit a count the file can no
+#              longer support.
+#   WHY THE    the CLI arm builds its OWN fixture rather than continuing on the hook arm's. A
+#   CLI ARM    fresh vault carries no bookmark, so the CLI arm is the SAME shape as the hook arm —
+#   GETS A     seed 2, shrink to 0, append 2, look. Continuing on the first fixture would leave the
+#   FRESH      bookmark at whatever the hook arm's repair chose, and the later-append count would
+#   FIXTURE    then have to be tuned to straddle an honest bookmark and a poisoned one: arithmetic
+#              that is correct only for the repairs anyone happened to think of, and a false RED
+#              against a legitimate one. `make_vault` is the existing helper; no state, no
+#              bookmark and no instrument is shared between the two arms.
+#   NOT PRE-   MEASURED against `git show origin/main:bin/brain`, not inferred. On main the count
+#   EXISTING   (:945), the print (:949) and the write (:951) are three consecutive lines INSIDE the
+#              banner block, all after the presence loop — so the same shim shrinks CHANGES.md
+#              before the count runs, `_total` is 0, no banner prints and no bookmark is written.
+#              Driven end to end against a main-engine fixture: main SHOWS the banner on the later
+#              boot; this branch does not. This branch moved the read ahead of the entire render
+#              AND the emit, which is what opened a window wide enough to drive.
+#   WHY THE    §2 accepts "the banner repeats" as the safe failure direction and rejects "the
+#   SEAM       banner is lost". This is loss. §2's DECLARED GAP does not cover it: that gap is a
+#   FORBIDS IT CHANGES.md APPEND between render and commit, whose exposure it costs as "a few lines
+#              silently marked read", explicitly contrasted with "the permanent silencing this fix
+#              removes". A shrink IS the permanent silencing.
+#   DOES NOT   pin the cursor file's path, format or existence (this section's OBSERVABLE-NOT-
+#     PIN      STRUCTURAL rule), the banner's count, or HOW the commit is made safe. A commit that
+#              is skipped, clamped, or re-derived through the single `_changes_snapshot` grep all
+#              pass — §2's "one place" constraint is about the grep's code site, and re-reading it
+#              to take the LOWER of the two values only ever errs toward repeating the banner,
+#              which §2 names the acceptable direction. It also does not pin the SHRINKING boot's
+#              own bookmark state, nor re-pin delivery-conditioning: V.D/109 owns that. Nor does it
+#              pin WHERE the repair lives: a single guard inside `_changes_commit` covers both call
+#              sites at once and passes, and so does an equivalent guard duplicated at each caller.
+#              What fails is covering only one of them.
+sc_shrunk_changes_render_does_not_silence_later_entries() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  changes="$fx/.brain/CHANGES.md"
+  needle="brain change(s) since you last looked"
+
+  # A fresh vault carries no bookmark, so the snapshot's CURRENT is 0 and the banner is genuinely
+  # owed. That is asserted OBSERVABLY below (the shrinking boot must render the banner) rather
+  # than by probing the cursor path, which a fix is free to relocate.
+  for n in 1 2; do
+    printf '%s\n' "- 2026-08-06T00:00:0$n cursor-shrink-$n — fixture change $n" >> "$changes" \
+      || { fail "fixture: could not seed CHANGES.md"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 2 \
+    "prerequisite: two unread CHANGES entries seeded" || return 0
+
+  fired="$base/awk-shrink.fired"
+  real_awk=$(command -v awk) || { fail "fixture: cannot locate the real awk"; return 0; }
+  shim_dir="$base/awk-shrink-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the shrink shim dir"; return 0; }
+  write_changes_shrinking_awk "$shim_dir/awk" "$real_awk" "$changes" "$fired" \
+    || { fail "fixture: could not write the CHANGES-shrinking awk shim"; return 0; }
+
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v awk)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/awk) ;;                       # the engine calls bare `awk`, so unless PATH resolves
+    *) PATH=$saved_path; export PATH          # to the shim nothing mutates CHANGES.md inside the
+       fail "instrument blind: PATH does not resolve awk to the CHANGES-shrinking shim, so nothing would shrink CHANGES.md inside the snapshot→commit window"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  boot1_rc=$?
+  boot1_out="$base/cursor-shrink.out"
+  cp "$OUT" "$boot1_out" 2>/dev/null || : > "$boot1_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v awk)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the CHANGES-shrinking awk shim is STILL what PATH resolves"; return 0 ;;
+  esac
+
+  # Instrument ENGAGED controls. A shim that resolved but never matched, or matched outside the
+  # window, leaves CHANGES.md intact — under which the rest of this scenario would pass against
+  # ANY engine and prove nothing. Both fire with their own distinct reason.
+  [ -e "$fired" ] \
+    || { fail "instrument never engaged: the awk shim's one-shot marker was never created, so the presence pass it keys on did not run and nothing shrank CHANGES.md"; return 0; }
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 0 \
+    "instrument engaged: CHANGES.md must hold zero recorded entries after the shrinking boot — the shrink IS the premise of this scenario" || return 0
+
+  need_rc "$boot1_rc" 0 "SessionStart hook wrapper status on the shrinking boot"
+  boot1_ctx=$(jq -e -r '.hookSpecificOutput.additionalContext // empty' "$boot1_out" 2>/dev/null) \
+    || { fail "the shrinking boot emitted no readable additionalContext, so it never DELIVERED and the bookmark commit that delivery authorizes was never reached"; return 0; }
+  need_str_has "$boot1_ctx" "$needle" \
+    "the shrinking boot must render the banner from the snapshot it was handed — seam §2 settles that shape (snapshot before the render, cmd_status renders only). Without it this boot never displayed a count the file can no longer support and the window under test was not entered" || return 0
+
+  # The LATER, UNRELATED changes — recorded after the shrinking boot finished, with nothing in
+  # common with the two it displayed. Nobody has ever seen these.
+  for n in 1 2; do
+    printf '%s\n' "- 2026-08-06T00:01:0$n cursor-shrink-later-$n — LATER unrelated change $n" >> "$changes" \
+      || { fail "fixture: could not append the later CHANGES entries"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 2 \
+    "prerequisite: the two later entries are the only ones CHANGES.md now holds" || return 0
+
+  later_ctx=$(hook_context "$fx" bravo) \
+    || { fail "the healthy SessionStart after the shrinking boot emitted no readable additionalContext"; return 0; }
+  need_str_has "$later_ctx" "$needle" \
+    "the boot after a shrinking render must still announce the CHANGES recorded since — the shrinking boot committed a bookmark equal to a count the file no longer held, so these two later, unrelated entries are marked read without ever having been shown, and every entry up to that number stays silenced on this and every future boot"
+
+  # ── THE SAME WINDOW, THE OTHER CALLER ──────────────────────────────────────────────────────
+  # `brain status` (:1802-1804) snapshots, renders and commits exactly as the hook does, so a
+  # guard installed at the hook call site alone leaves this path committing a bookmark the file
+  # cannot support. Its own vault, its own shim instance and its own fired marker: nothing is
+  # carried over from the arm above, and both instances are the same one-shot shim written by the
+  # same existing helper.
+  fx2=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base2=$(dirname "$fx2")
+  changes2="$fx2/.brain/CHANGES.md"
+
+  for n in 1 2; do
+    printf '%s\n' "- 2026-08-06T00:02:0$n cursor-shrink-cli-$n — fixture change $n" >> "$changes2" \
+      || { fail "fixture: could not seed the CLI arm's CHANGES.md"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes2" 2>/dev/null)" 2 \
+    "prerequisite: two unread CHANGES entries seeded for the CLI arm" || return 0
+
+  fired2="$base2/awk-shrink-cli.fired"
+  shim_dir2="$base2/awk-shrink-cli-bin"
+  mkdir -p "$shim_dir2" || { fail "fixture: could not create the CLI arm's shrink shim dir"; return 0; }
+  write_changes_shrinking_awk "$shim_dir2/awk" "$real_awk" "$changes2" "$fired2" \
+    || { fail "fixture: could not write the CLI arm's CHANGES-shrinking awk shim"; return 0; }
+
+  PATH="$shim_dir2:$PATH"; export PATH
+  case "$(command -v awk)" in
+    "$shim_dir2"/awk) ;;
+    *) PATH=$saved_path; export PATH
+       fail "instrument blind: PATH does not resolve awk to the CLI arm's CHANGES-shrinking shim, so nothing would shrink CHANGES.md inside the CLI's snapshot→commit window"
+       return 0 ;;
+  esac
+  run_brain "$fx2" bravo status
+  cli_rc=$?
+  cli_out="$base2/cursor-shrink-cli.out"
+  cp "$OUT" "$cli_out" 2>/dev/null || : > "$cli_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v awk)" in
+    "$shim_dir2"/*)
+      fail "instrument leak: the CLI arm's CHANGES-shrinking awk shim is STILL what PATH resolves"; return 0 ;;
+  esac
+
+  [ -e "$fired2" ] \
+    || { fail "instrument never engaged (CLI arm): the awk shim's one-shot marker was never created, so the presence pass it keys on did not run and nothing shrank CHANGES.md inside the CLI's window"; return 0; }
+  need_eq "$(grep -c '^- ' "$changes2" 2>/dev/null)" 0 \
+    "instrument engaged (CLI arm): CHANGES.md must hold zero recorded entries after the shrinking 'brain status' — the shrink IS the premise of this arm" || return 0
+
+  need_rc "$cli_rc" 0 "CLI 'brain status' on the shrinking invocation"
+  need_file_has "$cli_out" "$needle" \
+    "the shrinking 'brain status' must render the banner from the snapshot it was handed — without it this invocation never displayed a count the file can no longer support and the CLI's window was not entered" || return 0
+
+  for n in 1 2; do
+    printf '%s\n' "- 2026-08-06T00:03:0$n cursor-shrink-cli-later-$n — LATER unrelated change $n" >> "$changes2" \
+      || { fail "fixture: could not append the CLI arm's later CHANGES entries"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes2" 2>/dev/null)" 2 \
+    "prerequisite: the two later entries are the only ones the CLI arm's CHANGES.md now holds" || return 0
+
+  run_brain "$fx2" bravo status
+  cli_later_rc=$?
+  need_rc "$cli_later_rc" 0 "CLI 'brain status' after the shrinking invocation"
+  need_file_has "$OUT" "$needle" \
+    "the 'brain status' after a shrinking render must still announce the CHANGES recorded since — the shrinking invocation committed a bookmark equal to a count the file no longer held, so these two later, unrelated entries are marked read without ever having been shown. A repair that guards only the hook's call site passes every assertion above this one and still loses them here"
+}
+
+# V.D/113 — A COMMIT THAT COULD NOT RECORD THE BOOKMARK MUST SAY SO. One unread entry and a cursor
+# path that is a DIRECTORY. `_changes_commit` (:910) routes through `_atomic_place` (:68), whose
+# terminal `command mv -f -- "$_ap_tmp" "$_ap_dest"` MOVES the temp file INSIDE the directory and
+# exits 0 — so the commit reports a success it did not achieve, the breadcrumb at :1806 never
+# fires, and the banner repeats every invocation with nothing to explain why.
+#   PROVES     `brain status` diagnoses a bookmark it could not record, on the engine's own
+#              `brain: ` channel (`_warn`, :63), naming the cursor it failed to write.
+#   REJECTS    the shipped `_atomic_place`, which cannot distinguish "replaced the destination"
+#              from "moved the temp into the destination"; and any repair that makes the commit
+#              return non-zero without letting the operator learn WHICH path is unwritable.
+#   NEWLY      on main the bookmark is written by a direct `printf '%s\n' "$_total" > "$_cf"`
+#   EXPOSED    (:951), which FAILS against a directory. This branch routed the same write through
+#              a pre-existing helper whose `mv` silently succeeds. Measured against a main-engine
+#              fixture: main writes a redirection error to stderr, this branch writes nothing.
+#   THE CLI    is the path an operator actually reads, and its diagnostic goes straight to stderr
+#   ON PURPOSE (:1806) rather than into `.hook-errors.log`. The hook's copy of the same breadcrumb
+#              (:1564) is the same mechanism through the same helper; driving both would double-red
+#              one defect.
+#   BASELINE   RED. `brain status` exits 0 with a completely empty stderr today.
+#   DOES NOT   pin the wording beyond the cursor path itself — the offender's own name, which is
+#     PIN      how :297-321 diagnose throughout the engine — nor the exit status (an unwritable
+#              per-machine bookmark is not a status failure and this scenario does not make it
+#              one), nor whether the banner repeats afterwards, nor what the engine does with the
+#              directory. A repair that refuses, one that reports and moves on, and one that
+#              cleans up all pass.
+#   OMITTED    a symlink-to-a-directory cursor: `mv` treats it identically, one predicate decides
+#              both, and a second scenario would buy no new discrimination. Deliberate,
+#              non-blocking.
+#   ONE        this is the only scenario in section V.D that names the bookmark's PATH, because
+#   STRUCTURAL its fault is a hostile shape AT that path and the precondition is unstatable
+#   DEPENDENCY without it. If a fix relocates the bookmark, this fixture's `cursor` must move with
+#              it — see the section header's OBSERVABLE, NOT STRUCTURAL note.
+sc_directory_shaped_cursor_commit_is_diagnosed() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  changes="$fx/.brain/CHANGES.md"
+  cursor="$fx/.brain/.cursors/bravo.changes"
+  needle="brain change(s) since you last looked"
+
+  printf '%s\n' "- 2026-08-06T00:00:01 cursor-dir-1 — fixture change 1" >> "$changes" \
+    || { fail "fixture: could not seed CHANGES.md"; return 0; }
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 1 \
+    "prerequisite: one unread CHANGES entry seeded" || return 0
+
+  mkdir -p "$cursor" || { fail "fixture: could not create the directory-shaped cursor"; return 0; }
+  need_real_dir "$cursor" "prerequisite: the cursor path is a real directory, not a writable file" || return 0
+
+  run_brain "$fx" bravo status
+  status_rc=$?
+  status_out="$base/cursor-dir.out"
+  cp "$OUT" "$status_out" 2>/dev/null || : > "$status_out"
+  brain_lines="$base/cursor-dir.brain-lines"
+  grep '^brain:' "$ERR" > "$brain_lines" 2>/dev/null || : > "$brain_lines"
+
+  need_rc "$status_rc" 0 "'brain status' with a directory-shaped cursor (an unrecordable per-machine bookmark is not a status failure)"
+  # PREMISE control: `_changes_commit` returns early unless unread entries exist, so without the
+  # banner nothing would have attempted to write the cursor and an empty stderr would mean nothing.
+  need_file_has "$status_out" "$needle" \
+    "prerequisite: this invocation must show the CHANGES banner — the bookmark write is attempted only when the snapshot holds unread entries" || return 0
+
+  [ -s "$brain_lines" ] \
+    || { fail "a bookmark that could not be recorded must be diagnosed on the engine's own channel: not one 'brain:' line reached stderr, because 'mv -f <temp> <directory>' moved the temp INSIDE the cursor directory and exited 0, so the commit reported a success it did not achieve"; return 0; }
+  need_file_has "$brain_lines" ".cursors/bravo.changes" \
+    "the diagnostic must NAME the cursor it could not record — house style at :297-321 names the offender, and an operator whose banner repeats every invocation has no other way to learn which path is unwritable"
+}
+
+# V.D/114 — A CHANGES.md THAT CHANGES AND CHANGES BACK MUST NOT SILENCE LATER ENTRIES. The third
+# fault in the shipped `_changes_snapshot` / `_changes_commit` pair, found by an adversarial
+# convergence pass on 2026-08-07 — and a fault in the FIX that V.D/112's finding produced, not in
+# anything that shipped before this branch.
+#
+# THE DEFECT — AN ABA WINDOW BETWEEN THE TOKEN READ AND THE COUNT READ. `_changes_snapshot`
+# (:896-909) reads CHANGES.md TWICE and revalidates nothing in between: the integrity token at
+# :904, the entry count at :905. `_changes_commit` (:921) then compares a fresh checksum against
+# that FIRST read's token. So a file that changes after :904 and returns to its ORIGINAL BYTES
+# before :921 passes the guard — while `_CHANGES_TOTAL` came from the changed state. Five entries
+# are hashed, a sixth is appended, six are counted, the sixth is reverted, and the bookmark is
+# committed at 6 against a file that holds 5. The next entry anyone records brings the total to 6,
+# total equals bookmark, and its banner is suppressed. Permanently.
+#
+# THE COMMENT AT :903 IS WHAT THIS SCENARIO REFUTES. It reads "Take the token first so a rewrite
+# before or after the count makes the later check fail safe." Taking the token first is safe
+# against a rewrite that STAYS rewritten and blind to one that comes back — and coming back is
+# exactly what `cmd_revert`'s `_atomic_place _render_without_change` rewrite does to a reverted
+# change. The ordering does not make the pair atomic; it only chooses which single instant the
+# token describes.
+#
+#   PROVES     an entry recorded after a snapshot whose two reads disagreed is still announced. The
+#              bookmark may never outrun what the file actually holds, however briefly the file
+#              held more.
+#   REJECTS    the shipped engine, which commits a count taken from a state its own token never
+#              described; and any repair that merely NARROWS the window rather than making the
+#              count and the token describe one state — measured, not predicted: an engine that
+#              re-checksums after the count and compares (`_CHANGES_TOTAL=0` on mismatch) still
+#              commits 6 here, because the revert lands on that revalidating read and it too
+#              compares equal.
+#   ADMITS     deriving BOTH the count and the token from ONE read of the file: it commits 5,
+#              announces the later entry, fires both arms of the instrument and matches both
+#              checksums, so every control below survives GREEN instead of turning this into a
+#              permanent red. This is the repair this suite should be read as blessing.
+#   ⚠ ALSO     taking the count BEFORE the token also passes — and that is a GAP IN THIS
+#     ADMITS   INSTRUMENT, not an endorsement. This block asserted on 2026-08-07 that count-first
+#     A REPAIR was the second "obvious honest repair"; the engine shipped on that claim at
+#     THAT IS  a89ecc7, and the next convergence pass measured the claim wrong. The shim's append
+#     NOT      arm fires on the TOKEN read, so with the count taken first the count never sees the
+#     HONEST   phantom entry and the MIRROR window is never driven: an append seen by the COUNT
+#              and reverted before the token leaves the token describing the smaller state, the
+#              commit-time compare succeeds, and a cursor of 6 lands on a 5-entry file — the same
+#              permanent silencing this scenario exists to reject, reached from the other side.
+#              Driving it needs a second shim limb that appends BEFORE the count; Steve ruled on
+#              2026-08-07 not to build it, so the mirror direction is UNTESTED and is declared in
+#              seam map §2 rather than guarded here. ONE read has no window in either direction,
+#              which is why it is the only shape the fix may take.
+#   SAME FAULT V.D/112 reaches "the bookmark outran the file" through a SHRINK during the render.
+#   CLASS,     This reaches it through a change-and-change-back inside the snapshot itself, which
+#   DIFFERENT  V.D/112's fixture cannot produce: its shim leaves CHANGES.md shrunk, so the
+#   WINDOW     commit-time checksum differs and — on the shipped engine — the guard at :921 is the
+#              only thing that would stop it. This scenario is the case that guard cannot see.
+#              Seam §2 ranks the two error directions and accepts only "the banner repeats"; this
+#              is loss, which is the direction it forbids. §2's DECLARED GAP does not cover it
+#              either: that gap is an append between the RENDER and the commit whose cost it prices
+#              as "a few lines silently marked read", explicitly contrasted with "the permanent
+#              silencing this fix removes".
+#   NOT PRE-   MEASURED against `git show origin/main:bin/brain`, not inferred — though the honest
+#   EXISTING   comparison is stronger than "main passes the same drive". On main this path calls
+#              `cksum` ZERO times: its only checksum site is :531, the DM collision-destination
+#              fallback. The count, the print and the bookmark write are three consecutive lines
+#              inside the banner block, taken from one read. There is no token, so there is no
+#              window to hold two disagreeing reads, and the instrument cannot even arm. Driven end
+#              to end against a main-engine fixture: main commits 5 and announces the later entry.
+#              The token/count split this branch introduced is what created the fault.
+#   BASELINE   RED. The later `brain status` prints no banner at all today.
+#   DOES NOT   pin the cursor file's path, format or existence (this section's OBSERVABLE-NOT-
+#     PIN      STRUCTURAL rule — every assertion here reads the banner out of a terminal capture),
+#              nor the banner's COUNT on the ABA invocation. The count is deliberately unpinned:
+#              the shipped engine renders 6 and an honest engine renders 5, and asserting either
+#              number would either bless the defect or make this scenario permanently red. Nor
+#              does it pin WHICH caller commits, or where the repair lives — a fix inside
+#              `_changes_snapshot` and a fix inside `_changes_commit` both pass. The CLI is the
+#              driver only because it is the shortest path to the shared helper pair; the hook
+#              reaches the identical window through the identical functions, and driving both
+#              would double-red one defect. V.D/112 already pins that a repair must cover both
+#              call sites.
+#   INSTRUMENT one `cksum` PATH shim (`write_changes_aba_cksum`) under this section's existing
+#              blind/leak/engaged discipline. Its own header explains why nothing cheaper reaches
+#              the window and why invocation order is safe to key on here. NEGATIVE control: with
+#              the shim unarmed the shipped engine commits 5 and announces the later entry — this
+#              scenario passes vacuously — which is why the three markers below are asserted and
+#              not merely created. POSITIVE control: BOTH repairs this instrument admits — the
+#              honest single-read one, and the count-first one it CANNOT reject (see the ⚠ ALSO
+#              ADMITS block above) — fire both arms, match both checksums and restore
+#              byte-identically, so none of the controls rejects a repair this scenario permits.
+#              "Permitted by the controls" is not "correct": only single-read is correct.
+sc_aba_changes_window_does_not_silence_later_entries() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  changes="$fx/.brain/CHANGES.md"
+  needle="brain change(s) since you last looked"
+
+  # A fresh vault carries no bookmark, so every entry is genuinely unread and the ABA invocation
+  # is guaranteed to reach the commit — asserted observably below, never by probing the cursor.
+  for n in 1 2 3 4 5; do
+    printf '%s\n' "- 2026-08-07T00:00:0$n cursor-aba-$n — fixture change $n" >> "$changes" \
+      || { fail "fixture: could not seed CHANGES.md"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 5 \
+    "prerequisite: five unread CHANGES entries seeded" || return 0
+
+  # STATE A, captured byte-for-byte. The instrument restores FROM this copy and the byte-identity
+  # assertion compares AGAINST it — returning to the ORIGINAL bytes is the whole premise, since a
+  # file left in any other state makes the commit-time checksum differ and the guard reject.
+  pristine="$base/cursor-aba.state-a"
+  cp "$changes" "$pristine" || { fail "fixture: could not capture state A"; return 0; }
+
+  marks="$base/cursor-aba"
+  real_cksum=$(command -v cksum) || { fail "fixture: cannot locate the real cksum"; return 0; }
+  shim_dir="$base/cksum-aba-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the ABA shim dir"; return 0; }
+  write_changes_aba_cksum "$shim_dir/cksum" "$real_cksum" "$changes" "$pristine" "$marks" \
+    || { fail "fixture: could not write the ABA cksum shim"; return 0; }
+
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v cksum)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/cksum) ;;                       # the engine calls bare `cksum`, so unless PATH
+    *) PATH=$saved_path; export PATH            # resolves to the shim nothing writes CHANGES.md
+       fail "instrument blind: PATH does not resolve cksum to the ABA shim, so nothing would change CHANGES.md between the token read and the count read"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo status
+  aba_rc=$?
+  aba_out="$base/cursor-aba.out"
+  cp "$OUT" "$aba_out" 2>/dev/null || : > "$aba_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v cksum)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the ABA cksum shim is STILL what PATH resolves"; return 0 ;;
+  esac
+
+  # Instrument ENGAGED controls. Measured: with the shim unarmed the shipped engine commits an
+  # honest bookmark and every assertion below passes — so a shim that resolved but never fired,
+  # or fired but whose append or restore silently failed, would render this scenario as a pass
+  # against ANY engine. Each control fires with its own distinct reason.
+  [ -s "$marks.sum1" ] \
+    || { fail "instrument never engaged: the shim's token arm never fired, so nothing was appended between the token read and the count read and the window under test was never entered"; return 0; }
+  need_eq "$(cat "$marks.grew" 2>/dev/null)" 6 \
+    "instrument engaged: CHANGES.md must hold SIX recorded entries the instant after the token was taken — that larger state is what the count one line later reads, and a token/count disagreement is the entire premise of this scenario" || return 0
+  [ -s "$marks.sum2" ] \
+    || { fail "instrument never engaged: the shim's restore arm never fired, so the commit-time integrity check was never reached and the ABA was never completed — the file was left in its CHANGED state, which is V.D/112's fault, not this one"; return 0; }
+  need_eq "$(cat "$marks.sum1" 2>/dev/null)" "$(cat "$marks.sum2" 2>/dev/null)" \
+    "the two checksums the engine compared must be EQUAL — that equality IS the ABA. Had they differed, the commit-time guard would have rejected, no bookmark would have been written, and every assertion below would pass vacuously against any engine" || return 0
+  cmp -s "$pristine" "$changes" \
+    || { fail "the restoration was not byte-identical to state A ($(byte_size "$pristine") vs $(byte_size "$changes") bytes): a file that does not come back to its ORIGINAL bytes is caught by the commit-time checksum, which is a weaker fault than the one under test"; return 0; }
+
+  need_rc "$aba_rc" 0 "'brain status' driven across the ABA window"
+  # PREMISE control: the bookmark write is attempted only when the snapshot holds unread entries,
+  # so without a banner here the commit-time check is never reached and the window was not entered.
+  need_file_has "$aba_out" "$needle" \
+    "the ABA invocation must show the CHANGES banner — five entries are unread on a fresh vault, and the count is deliberately NOT pinned because the shipped engine renders 6 while an honest one renders 5" || return 0
+
+  # THE LATER, NEVER-SEEN CHANGE — recorded after the ABA invocation finished, with nothing in
+  # common with the five it was handed. Nobody has ever seen this one.
+  printf '%s\n' "- 2026-08-07T00:01:01 cursor-aba-later — LATER never-seen change" >> "$changes" \
+    || { fail "fixture: could not append the later CHANGES entry"; return 0; }
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 6 \
+    "prerequisite: the later entry brings CHANGES.md to six recorded entries" || return 0
+
+  run_brain "$fx" bravo status
+  later_rc=$?
+  need_rc "$later_rc" 0 "'brain status' after the ABA window"
+  need_file_has "$OUT" "$needle" \
+    "the invocation after an ABA snapshot must still announce the change recorded since — the ABA invocation counted a sixth entry that was reverted before the integrity check could see it, so the bookmark was committed at 6 against a file holding 5, and this later, never-seen entry is marked read without ever having been shown. Every entry up to that number stays silenced on this and every future invocation"
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
 printf 'brain lane-DM v1.2 RED suite (claim layer deleted) + v1.2.1-v1.2.4 contract addenda\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
@@ -4909,6 +6389,20 @@ scenario red   "V.Y/88  unreadable-lane-status-banner"      sc_status_surfaces_u
 scenario guard "V.Y/89  proven-absent-failed-is-silent"     sc_status_keeps_proven_absent_failed_state_silent
 scenario guard "V.Z/90  existing-empty-failed-is-silent"    sc_status_keeps_existing_empty_failed_state_silent
 scenario guard "V.Z/91  positive-failed-count-is-visible"  sc_status_counts_existing_failed_entries
+
+scenario red   "V.B/103 partial-envelope-archives-none"   sc_partial_envelope_must_not_archive_the_batch
+scenario guard "V.B/104 complete-envelope-archives-all"   sc_complete_envelope_archives_the_whole_batch
+scenario guard "V.B/105 first-id-dropped-is-rejected"     sc_envelope_dropping_first_staged_id_is_rejected
+scenario red   "V.B/106 repeated-id-envelope-rejected"    sc_repeated_id_envelope_must_not_archive_the_batch
+scenario red   "V.B/107 reject-names-missing-id"          sc_rejected_batch_diagnostic_names_the_missing_id
+scenario red   "V.B/108 reject-classes-distinguishable"   sc_reject_classes_are_distinguishable
+
+scenario red   "V.D/109 rejected-boot-keeps-banner"       sc_rejected_boot_does_not_consume_the_changes_banner
+scenario guard "V.D/110 delivered-banner-is-consumed"     sc_delivered_changes_banner_is_consumed
+scenario guard "V.D/111 cli-status-consumes-banner"       sc_cli_status_consumes_the_changes_banner
+scenario red   "V.D/112 shrunk-changes-keeps-banner"      sc_shrunk_changes_render_does_not_silence_later_entries
+scenario red   "V.D/113 directory-cursor-diagnosed"       sc_directory_shaped_cursor_commit_is_diagnosed
+scenario red   "V.D/114 aba-window-keeps-banner"         sc_aba_changes_window_does_not_silence_later_entries
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'

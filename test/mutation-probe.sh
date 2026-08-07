@@ -129,6 +129,12 @@ instrument_selfcheck() {
 # multi-line by design; every matched line is listed here, so those selectors are bounded by
 # their declared counts AND their exact line sets.
 #
+# The `$_esc_payload` case is whole-line-exact because both M6 and M12 replace it. Its missing-id
+# accumulator is load-bearing in its own right, so both replacement programs preserve that tail
+# while changing only which envelope witness passes. The complementary sed address is deliberately
+# looser (indent- and variable-agnostic), so spelling drift trips this manifest before a mutant can
+# silently erase the diagnostic mechanism along with the envelope check.
+#
 # ONE ENTRY IS NOT A MUTATION TARGET: `set -- "$@" "$_pending_name"` is ruling 3(b)'s quoted
 # positional accumulation, and test/dm.sh declares at [Q3] that it CANNOT pin that mechanism —
 # a mutant that reintroduces the delimited round trip kills nothing (measured: 66/66). Listing
@@ -154,7 +160,8 @@ anchors_ok() {
         | if (($record | tojson | utf8bytelength) <= $line_max) or $limit <= 1
           id: $id
       \{*'"id":"'"$_pd_name"'"'*\})
-    case "$_esc_payload" in *'\"id\":\"'"$1"'\"'*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
+      case "$_esc_payload" in *'\"id\":\"'"$_ep_name"'\"'*) ;; *) _DM_MISSING_IDS="${_DM_MISSING_IDS}${_DM_MISSING_IDS:+ }$_ep_name" ;; esac
+  if [ "$_emit_rc" = 0 ]; then
 _dm_dest_occupied() { [ -e "$1" ] || [ -L "$1" ]; }
     _dm_route_failed "$_pd_lane" "$_pd_file" "structurally unusable dm queue entry" || return 3
   _warn "dm $_cd_state destination is occupied for $_cd_name; using a collision-safe name"
@@ -195,7 +202,13 @@ addresses_ok() {
 1~M5 bounded serializer~^      bounded(\$field_max) | tojson$
 1~M6 digest id field~^          id: \$id$
 1~M6 digest-case scope~^    case "\$_pd_digest" in$
-1~M6 envelope witness~^    case "\$_esc_payload" in .*_DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac$
+# The two envelope-witness rows are indent- and variable-agnostic (`^ *`, `.*`). The leading `\*`
+# disambiguates the per-id witness from the `\{*\}` envelope-framing case, while the accumulator
+# tail ensures each mutant preserves the diagnostic mechanism it is not meant to break.
+1~M6 envelope witness~^ *case "\$_esc_payload" in \*.*_DM_MISSING_IDS=.* ;; esac$
+1~M12 envelope witness~^ *case "\$_esc_payload" in \*.*_DM_MISSING_IDS=.* ;; esac$
+1~M13 cursor commit gate~^  if \[ "\$_emit_rc" = 0 \]; then$
+1~M14 hook cursor commit scope~^  if \[ "\$_emit_rc" = 0 \]; then$
 2~M7 byte metric~utf8bytelength
 1~M8 collision predicate~^_dm_dest_occupied() { \[ -e "\$1" \] || \[ -L "\$1" \]; }$
 1~MQ1 nonregular route~^    _dm_route_failed "\$_pd_lane" "\$_pd_file" "structurally unusable dm queue entry" || return 3$
@@ -361,10 +374,23 @@ probe "M5  prose-digest         " "V.W/26 V.W/27 V.W/28" "" 1 \
 # Must-survive #8: drop the stable ID from the rebuilt record. The digest and envelope witnesses
 # are relaxed only to require some `id` text so `{}` still dies in V.U/76 and V.U/77; this keeps
 # the legacy mutant focused on V.N/52 without weakening either new witness declaration.
-probe "M6  digest-drops-id      " "V.N/52" "" 3 \
+#   ⚠ THE ENVELOPE RELAXATION IS NOT FOCUS-PRESERVING ANY MORE, and the declaration says so
+#   rather than papering over it. Against the post-fix engine the third program relaxes a LOOP,
+#   so every staged id is accepted on the strength of the bare text `id` while the digest carries
+#   none of them — which is precisely what section V.B forbids, and V.B/103, V.B/105 and V.B/106
+#   die on it. Those kills are GENUINE (the engine archives messages whose ids never reached the
+#   envelope), not instrument damage, and they are deterministic, so they are REQUIRED rather
+#   than permitted. Removing the relaxation does not help: an un-relaxed loop rejects every
+#   batch wholesale and M6 becomes a blunt systemic mutant instead of a focused one.
+#   V.B/107, V.B/108 and V.D/109 die for M6 and M12 on a removed premise: both mutants stop the
+#   rejection, so the reject diagnostic is never reached. They do not cover that diagnostic.
+#   No mutant touches its warning because both replacements preserve _DM_MISSING_IDS: mutation
+#   coverage there is zero. The suite still pins it independently — naming every staged id instead
+#   of every missing id dies to V.B/107 alone — but the probe cannot re-prove that mechanism.
+probe "M6  digest-drops-id      " "V.N/52 V.B/103 V.B/105 V.B/106 V.B/107 V.B/108 V.D/109" "" 3 \
   's@^          id: \$id$@          id: ""@
 /^    case "\$_pd_digest" in$/{n;s@^      .*@      \\{*id*\\})@;}
-s@^    case "\$_esc_payload" in .*_DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac$@    case "$_esc_payload" in *id*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac@'
+s@^ *case "\$_esc_payload" in \*.*_DM_MISSING_IDS=.* ;; esac$@      case "$_esc_payload" in *id*) ;; *) _DM_MISSING_IDS="${_DM_MISSING_IDS}${_DM_MISSING_IDS:+ }$_ep_name" ;; esac@'
 
 # Must-survive #6: the wire caps are BYTE caps (utf8bytelength), not code-point counts. Both
 # source sites move together — the shared measurement used by preflight/re-probe, plus digest —
@@ -444,6 +470,45 @@ probe "M10 relative-engine-path " "V.C/24 V.N/50" "" 5 \
 # to be told what to do on activity.
 probe "M11 no-directive-verb    " "V.C/24" "" 1 \
   's@^On activity, consume it by running: @On activity: @'
+
+# ── emit-time batch integrity (section V.B) ──────────────────────────────────────────────
+# The defect this section exists for: `_emit_session_ctx_pinned` validated that the serialized
+# envelope carried the FIRST staged id, while `_hook_session_start` archived EVERY staged name on
+# its success — so an envelope that kept message 1 and dropped 2..N passed the guard and archived
+# all N as delivered. Same class as the r8 `count-checks-admit-set-drift` lesson: an integrity
+# check scoped narrower than the set it authorizes.
+#
+# This mutant reverts exactly that scope and nothing else. It rewrites the loop-BODY case line so
+# that every iteration tests the FIRST staged name (`"$1"`) instead of the name the loop is
+# currently on. The post-fix loop still runs once per staged message, still uses the real
+# `\"id\":\"<name>\"` framing, and still rejects — it just checks the same id N times, so it never
+# looks past message 1.
+#   WHY THE CASE LINE AND NOT THE LOOP HEADER: the case line already has a declared address that
+#   is indent- and variable-agnostic, so this mutant costs no new dependency on how GREEN spells
+#   the loop. Rewriting the pattern to a bare `*"$1"*` was measured and REJECTED as the mutant:
+#   it also drops the escaped-fragment framing, which kills V.V/84 on a second mechanism and
+#   makes the verdict unattributable. The framing is preserved here byte-for-byte.
+#   NOT V.B/104 or V.B/105: both survive BY CONSTRUCTION, and that is the mutant's own control.
+#   /104's envelope carries every id, so first-only still accepts and the batch still archives;
+#   /105's envelope drops the first id, which first-only is precisely the check that catches.
+#   As documented at M6, V.B/107, V.B/108 and V.D/109 remove the rejection premise here too;
+#   those declared kills do not mutation-cover the preserved reject diagnostic.
+probe "M12 envelope-first-id-only" "V.B/103 V.B/106 V.B/107 V.B/108 V.D/109" "" 1 \
+  's@^ *case "\$_esc_payload" in \*.*_DM_MISSING_IDS=.* ;; esac$@      case "$_esc_payload" in *'"'"'\\"id\\":\\"'"'"'"$1"'"'"'\\"'"'"'*) ;; *) _DM_MISSING_IDS="${_DM_MISSING_IDS}${_DM_MISSING_IDS:+ }$_ep_name" ;; esac@'
+
+# Delivery-conditioned cursor commit: add the bookmark commit before the delivery result is
+# consulted. The normal success-path commit remains, so this changes only the rejected-payload
+# behavior and recreates the silent banner loss without disturbing DM archive authorization.
+probe "M13 early-cursor-commit  " "V.D/109" "" 1 \
+  's@^  if \[ "\$_emit_rc" = 0 \]; then$@  if _changes_commit; [ "$_emit_rc" = 0 ]; then@'
+
+# The hook must commit after a successful delivery even when no DMs were staged. Scope through
+# the unique delivery gate because the hook and CLI commit calls have identical indentation.
+# M14 covers row 2 only: it kills V.D/110 at boots 2 and 4, while moving the commit into the
+# archive block kills boot 4 only. Row 3 is suite-guarded by boots 3-4 but not mutation-covered;
+# deleting those boots would leave M14 green on boot 2 while losing the placement guard.
+probe "M14 hook-cursor-commit   " "V.D/110" "" 1 \
+  '/^  if \[ "\$_emit_rc" = 0 \]; then$/{n;s@^    _changes_commit$@    :@;}'
 
 echo "=== final tree check ==="
 if cmp -s "$ENGINE_BACKUP" "$ENGINE_SOURCE"; then

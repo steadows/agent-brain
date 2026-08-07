@@ -1,5 +1,54 @@
 # Changelog
 
+## v1.2.3 — 2026-08-06 — nothing is marked delivered that was not delivered
+
+Two ways a message could be marked read without ever reaching an agent — one in the DM queue, one
+in the CHANGES banner — plus the diagnostic that made the first undiagnosable. Design record:
+`.context/seams/pr10-cursor-and-diagnostic.md`.
+
+- **The serializer validated only the FIRST staged message id while the caller archived all of
+  them.** A partial envelope — first id kept, 2..N dropped — passed the guard, and
+  `_hook_session_start` archived every staged name to `read/` as delivered. Silent loss, in the
+  one check whose whole purpose is catching it. The serializer now validates every staged id and
+  rejects the entire batch if any is missing.
+- **`cmd_status` no longer advances the CHANGES bookmark as a side effect of RENDERING the
+  banner.** The SessionStart hook captures that render and can discard the payload when the
+  widened check above rejects — so the bookmark moved, the banner was never delivered, and every
+  later healthy boot silently omitted it. Permanently. Widening the id check widened that path,
+  which is how the regression arrived with the fix. The count is now snapshotted **once, before**
+  the render, and the two callers commit it: the hook only after a successful emit, the CLI
+  immediately as before. Committing early loses the notification; failing to commit merely repeats
+  it — this errs the second way, deliberately. `brain status` behaviour is otherwise unchanged.
+- **A rejected batch names its offender.** The reject discarded which ids were missing, and the
+  caller's sole warning named the `jq` binary — byte-identical for an envelope-framing rejection
+  and a per-id one, so an operator could not tell which check fired. It now lists **every** missing
+  staged id in one warning. Naming all of them rather than the first is deliberate: `pending/`
+  preserves the staged set but never the omissions, and the extent is the diagnosis — a contiguous
+  run reads as truncation, a scattered subset as non-deterministic corruption.
+- **The bookmark can no longer outrun the file it describes.** Three adversarial convergence passes
+  found three ways the CHANGES count and the file could disagree, each one exposed by the fix for
+  the last. A render that SHRANK mid-flight committed a count the file no longer supported
+  (`V.D/112`). Splitting the count and the integrity token into two reads then let the file change
+  and change back between them — and the first repair for that, reordering the two reads, closed
+  one direction while opening its exact mirror (`V.D/114`). **The count and the token are now
+  derived from ONE read of `CHANGES.md`**: any ordering of two reads leaves a window in one
+  direction or the other, one read has none. Measured against six hand-built candidate engines, not
+  argued. A commit that cannot record the bookmark now says so rather than failing silently
+  (`V.D/113`), and the commit-time integrity check tests `cksum`'s exit status **before** comparing
+  — previously an unreadable file yielded an empty string that compared equal to an empty token and
+  passed the guard.
+- **Suite: 103 scenarios** (V.B/107-108 pin the diagnostic; V.D/109-111 pin the delivery-conditioned
+  commit, its two guards rejecting "never commit from the hook" and "defer for every caller";
+  V.D/112-114 pin the three snapshot-integrity faults above). Mutation probe at **19 mutants** —
+  M12 envelope-first-id-only, M13 early-cursor-commit, M14 hook-cursor-commit.
+- **Four gaps are declared in the seam map rather than closed**, and each is a ruling, not an
+  oversight: the reject diagnostic is suite-pinned but not mutation-covered; M14 covers the
+  missing-commit fault but not the adjacent misplacement; the MIRROR of the ABA window is untested
+  because `V.D/114`'s shim can only append on the token read (this gap already cost one shipped
+  defect, and `V.D/114`'s header now says so); and the validate→write race is **accepted** — it is
+  check-then-act rather than a two-read problem, it is pre-existing and strictly wider on `main`,
+  and its blast radius is the banner alone, never DM delivery.
+
 ## v1.2.2 — 2026-08-05 — enumeration is fatal-not-empty; paths, identities and the emit are byte-exact and pinned
 
 Seven hardening rounds (v1.2.2 + r2-r7) closing seam-map rulings 7-14 (`.context/seams/

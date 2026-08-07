@@ -8,11 +8,16 @@
 # (the portable equivalent — mkdir is atomic create on POSIX filesystems).
 
 set -u
-VERSION="1.2.2"
+VERSION="1.2.3"
 
 # Clear the vault-resolution sentinel at process entry: it is a marker for "this process ran
 # brain_root()", and an inherited value would let a caller's environment stand in for that.
 _BRAIN_RESOLVED=""
+# Clear snapshot state too: inherited values must not stand in for work this process performed.
+_CHANGES_TOTAL=0; _CHANGES_CURRENT=0; _CHANGES_TOKEN=""
+# Clear caller-visible warning state so inherited values cannot suppress or forge diagnostics.
+_WHOAMI_WARNED=""
+_DM_MISSING_IDS=""
 
 # DM bounds. One file per message removes the old append-atomicity rationale; the body cap now
 # bounds storage and digest work. Consumption is bounded by the surviving digest limits.
@@ -210,7 +215,7 @@ _resolve_whoami() {
     if _feat_ok "$BRAIN_FEATURE"; then
       _WHOAMI=$BRAIN_FEATURE
     else
-      _warn "invalid inherited BRAIN_FEATURE (bare slug only)"
+      [ "${_WHOAMI_WARNED:-}" = 1 ] || { _warn "invalid inherited BRAIN_FEATURE (bare slug only)"; _WHOAMI_WARNED=1; }
     fi
     return 0
   fi
@@ -888,6 +893,46 @@ _recent_journal() {
   grep -E "(^| )$_feat | @$_feat([^a-zA-Z]|$)" "$_jf" 2>/dev/null | tail -5
 }
 
+_changes_snapshot() { # <identity>
+  # Keep the sole CHANGES count here. Snapshot before rendering so commit records exactly what
+  # was displayed; re-counting at commit could mark later additions read. Neither invariant is
+  # test-guarded.
+  _CHANGES_TOTAL=0; _CHANGES_CURRENT=0; _CHANGES_TOKEN=""
+  _CHANGES_CURSOR="$BRAIN/.cursors/${1:-anon}.changes"
+  [ -f "$BRAIN/CHANGES.md" ] || return 0
+  # The sentinel preserves trailing newlines through command substitution; both values below
+  # then describe this one read. A failed read leaves an invalid, empty snapshot.
+  if ! _CHANGES_SNAPSHOT=$(cat "$BRAIN/CHANGES.md" 2>/dev/null && printf '%s' .); then
+    _CHANGES_SNAPSHOT=""
+    return 0
+  fi
+  _CHANGES_SNAPSHOT=${_CHANGES_SNAPSHOT%.}
+  _CHANGES_TOTAL=$(printf '%s' "$_CHANGES_SNAPSHOT" | grep -c '^- ' 2>/dev/null) \
+    || _CHANGES_TOTAL=0
+  if ! _CHANGES_TOKEN=$(printf '%s' "$_CHANGES_SNAPSHOT" | cksum 2>/dev/null); then
+    _CHANGES_TOTAL=0; _CHANGES_TOKEN=""
+    return 0
+  fi
+  if [ -f "$_CHANGES_CURSOR" ]; then
+    _CHANGES_CURRENT=$(cat "$_CHANGES_CURSOR" 2>/dev/null || echo 0)
+  fi
+  return 0
+}
+
+_changes_commit() {
+  [ -n "${_CHANGES_CURSOR:-}" ] || return 0
+  # A stale concurrent snapshot may move the cursor backward, causing only a repeat banner.
+  # Deliberately write the snapshot without re-reading so undisplayed changes are never marked read.
+  [ "$_CHANGES_TOTAL" -gt "$_CHANGES_CURRENT" ] 2>/dev/null || return 0
+  # mv treats a directory destination as a container, which would falsely report a committed cursor.
+  [ ! -d "$_CHANGES_CURSOR" ] || return 1
+  mkdir -p "$BRAIN/.cursors"
+  # If CHANGES cannot be read or changed after the snapshot, repeat rather than risk silent loss.
+  _CHANGES_LIVE_TOKEN=$(cksum < "$BRAIN/CHANGES.md" 2>/dev/null) || return 0
+  [ "$_CHANGES_LIVE_TOKEN" = "$_CHANGES_TOKEN" ] || return 0
+  _atomic_place printf "$_CHANGES_CURSOR" '%s\n' "$_CHANGES_TOTAL"
+}
+
 cmd_status() {
   _require_brain
   _resolve_whoami; _me=$_WHOAMI
@@ -940,16 +985,10 @@ cmd_status() {
   done
   [ "$_any" = 0 ] && printf '  (none)\n'
 
-  # CHANGES banner — "⚠ N brain changes since you last looked" (advances cursor on look)
-  if [ -f "$BRAIN/CHANGES.md" ]; then
-    _total=$(grep -c '^- ' "$BRAIN/CHANGES.md" 2>/dev/null || echo 0)
-    _cur=0; _cf="$BRAIN/.cursors/${_me:-anon}.changes"
-    [ -f "$_cf" ] && _cur=$(cat "$_cf" 2>/dev/null || echo 0)
-    if [ "$_total" -gt "$_cur" ] 2>/dev/null; then
-      printf '\n⚠ %s brain change(s) since you last looked — see .brain/CHANGES.md\n' \
-        "$((_total - _cur))"
-      mkdir -p "$BRAIN/.cursors"; printf '%s\n' "$_total" > "$_cf"
-    fi
+  # CHANGES banner — "⚠ N brain changes since you last looked" (render only; callers commit)
+  if [ "$_CHANGES_TOTAL" -gt "$_CHANGES_CURRENT" ] 2>/dev/null; then
+    printf '\n⚠ %s brain change(s) since you last looked — see .brain/CHANGES.md\n' \
+      "$((_CHANGES_TOTAL - _CHANGES_CURRENT))"
   fi
 
   # hook-error breadcrumbs
@@ -1411,6 +1450,7 @@ _emit_session_ctx() {
     || printf '%s\n' "$1"
 }
 _emit_session_ctx_pinned() { # <context> [staged-message-name...]
+  _DM_MISSING_IDS=""
   [ -n "${_DM_JQ_BIN:-}" ] || return 1
   _ep_context=$1; shift
   # shellcheck disable=SC2016  # jq source; $c is a jq variable
@@ -1418,9 +1458,10 @@ _emit_session_ctx_pinned() { # <context> [staged-message-name...]
     '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}' 2>/dev/null) \
     || return 1
   case "$_esc_payload" in \{*\}) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
-  if [ "$#" -gt 0 ]; then
-    case "$_esc_payload" in *'\"id\":\"'"$1"'\"'*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
-  fi
+  for _ep_name in "$@"; do
+      case "$_esc_payload" in *'\"id\":\"'"$_ep_name"'\"'*) ;; *) _DM_MISSING_IDS="${_DM_MISSING_IDS}${_DM_MISSING_IDS:+ }$_ep_name" ;; esac
+  done
+  [ -z "$_DM_MISSING_IDS" ] || { _DM_JQ_SYSTEMIC_FAILURE=1; return 1; }
   printf '%s\n' "$_esc_payload"
 }
 _emit_pretool() { # <decision: allow|ask> <text>
@@ -1518,6 +1559,7 @@ More DMs remain pending after this bounded batch. Continue by running: \"$BRAIN/
   # (c) cheap auto-fixes, robust to a never-wraps agent
   cmd_reconcile >/dev/null 2>&1 || true
   # (d) inject the protocol nudge + live state
+  _changes_snapshot "$_feat"
   _st=$(cmd_status 2>/dev/null)
   _session_ctx="${_dm_block}Run the **navigation-standards** skill now (the Agent-Brain coordination protocol).
 
@@ -1534,6 +1576,9 @@ $_st"
     _emit_rc=$?
   fi
   if [ "$_emit_rc" = 0 ]; then
+    _changes_commit
+    _changes_commit_rc=$?
+    [ "$_changes_commit_rc" = 0 ] || _warn "could not record the CHANGES cursor at $_CHANGES_CURSOR; the banner will repeat next boot"
     if [ "$#" -gt 0 ]; then
       _archive_rc=0
       for _emitted_name in "$@"; do
@@ -1543,7 +1588,7 @@ $_st"
         || _warn "one or more DMs were emitted but could not be archived; they remain pending and may replay"
     fi
   else
-    _warn "could not emit SessionStart context with ${_DM_JQ_BIN:-<unresolved>}; DMs remain pending and replayable"
+    _warn "could not emit SessionStart context with ${_DM_JQ_BIN:-<unresolved>}${_DM_MISSING_IDS:+; missing staged DM ids: $_DM_MISSING_IDS}; DMs remain pending and replayable"
   fi
   exit 0
 }
@@ -1767,7 +1812,17 @@ case "$_sub" in
   announce)    cmd_announce "$@" ;;
   dm)          cmd_dm "$@" ;;
   inbox)       cmd_inbox "$@" ;;
-  status)      cmd_status "$@" ;;
+  status)
+    _require_brain
+    _resolve_whoami
+    _changes_snapshot "$_WHOAMI"
+    cmd_status "$@"
+    _status_rc=$?
+    _changes_commit
+    _changes_commit_rc=$?
+    [ "$_changes_commit_rc" = 0 ] || _warn "could not record the CHANGES cursor at $_CHANGES_CURSOR; the banner will repeat next boot"
+    exit "$_status_rc"
+    ;;
   reconcile)   cmd_reconcile "$@" ;;
   commit)      cmd_commit "$@" ;;
   wrap)        cmd_wrap "$@" ;;
