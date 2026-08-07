@@ -750,6 +750,53 @@ write_id_editing_envelope_jq() {
   chmod +x "$_wi_dest"
 }
 
+# write_changes_shrinking_awk <dest> <real-awk> <changes-file> <fired-marker>
+# A one-shot `awk` shim that empties <changes-file> of its recorded entries the FIRST time the
+# engine runs the presence-frontmatter pass, then delegates that call — and every later one —
+# to the real binary byte-for-byte.
+#
+# WHY AN awk SHIM IS THE CHEAPEST THING THAT DRIVES THIS. The fault is a WINDOW: the CHANGES count
+# is snapshotted before the render and committed after the emit, so a CHANGES.md that SHRINKS in
+# between makes the engine commit a bookmark higher than the file's entry count. Reaching it needs
+# a write to land inside that window. A concurrent writer would need cross-process coordination —
+# the class of apparatus the proportionality rules exclude — but the engine already forks a
+# process inside the window for us: `_fm_presence` (bin/brain:116, called from cmd_status at :932)
+# runs one `awk` per presence note, strictly after `_changes_snapshot` (:1545) and strictly before
+# `_changes_commit` (:1562). Shimming it is deterministic, single-process, and needs no clock.
+#
+# WHY IT KEYS ON THE PROGRAM TEXT, not on "first invocation". `_fm` (:100) also runs awk, and
+# `cmd_reconcile` calls it many times at :1543 — BEFORE the snapshot. A fire-on-first-call shim
+# would mutate CHANGES.md outside the window and prove nothing. `_fm_presence` is the only awk
+# program in the engine carrying `current_ticket dialog_with` (its one-pass field list), and it is
+# called from nowhere but cmd_status, so that substring selects the window exactly. This is the
+# same argv case-check discipline as write_rc0_empty_payload_jq — not a JSON/awk parser, not a
+# cross-process state machine.
+#
+# The <fired-marker> is the shim's ENGAGED control: a scenario asserts it exists, so a shim that
+# never resolved, or resolved but never matched, fails loudly instead of rendering as a pass.
+# The replacement content is `brain init`'s own CHANGES.md header (bin/brain:1713) with no `- `
+# lines — the shape `cmd_revert` (:1407-1422, `_atomic_place _render_without_change`) leaves
+# behind once every recorded change has been reverted. That is the real engine route by which
+# CHANGES.md shrinks; it is written directly here for the same reason V.D's other fixtures append
+# directly — `brain propose` + `brain apply` is a governance gauntlet not under test.
+write_changes_shrinking_awk() {
+  _wc_dest=$1; _wc_real=$2; _wc_changes=$3; _wc_fired=$4
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'case "$*" in\n'
+    printf '  *"current_ticket dialog_with"*)\n'
+    printf '    if [ ! -e "%s" ]; then\n' "$_wc_fired"
+    printf '      : > "%s"\n' "$_wc_fired"
+    printf '      printf "%%s\\n\\n" "# Brain CHANGES — structural change log" > "%s"\n' "$_wc_changes"
+    printf '    fi\n'
+    printf '    ;;\n'
+    printf 'esac\n'
+    printf 'exec "%s" "$@"\n' "$_wc_real"
+  } > "$_wc_dest" || return 1
+  chmod +x "$_wc_dest"
+}
+
 # plant_message <repo> <lane> <marker> — send a REAL message from alpha carrying <marker>, then
 # print the path of the file the engine queued for it.
 #
@@ -5478,22 +5525,49 @@ sc_reject_classes_are_distinguishable() {
 # exactly what V.D/109 and V.D/110 pin between them. Nothing is open here; this paragraph is
 # history, not a live tension, and §2 is not ambivalent any more.
 #
-# OBSERVABLE, NOT STRUCTURAL: every assertion in this section reads the banner text out of an
-# emitted payload or a terminal capture. NOTHING here inspects `$BRAIN/.cursors/*.changes`. That
+# OBSERVABLE, NOT STRUCTURAL: every assertion in V.D/109-112 reads the banner text out of an
+# emitted payload or a terminal capture. None of them inspects `$BRAIN/.cursors/*.changes`. That
 # file is an implementation detail — its path, its format, and whether it exists at all are the
 # fix's business — and a test that read it would pass against a fix that moved the bookmark
 # correctly while losing the banner some other way, which is exactly the failure under test.
+#   ⚠ V.D/113 IS THE ONE EXCEPTION, and it is unavoidable rather than an erosion: its fault is a
+#   hostile SHAPE at the bookmark's path, so the fixture cannot state the precondition without
+#   naming that path. Even there the assertion is on the DIAGNOSTIC, never on the file's contents
+#   or format. If a fix relocates the bookmark, V.D/113's fixture path must follow it — declared
+#   here so the dependency is found by reading rather than by a puzzling red.
 #
 # FIXTURE NOTE: CHANGES.md entries are appended DIRECTLY, for `write_presence`'s reason — the only
 # engine route to one is `brain propose` + `brain apply`, a governance gauntlet whose own behaviour
 # is not under test here. The engine's sole reader counts lines matching `^- ` (:945); that is the
 # shape these fixtures write.
 #
+# V.D/112 AND V.D/113 — the two faults an adversarial convergence pass confirmed in the shipped
+# `_changes_snapshot` / `_changes_commit` pair on 2026-08-06. Both are consequences of the SAME
+# split this section's fix introduced, which is why they live here rather than in a new section:
+#   · V.D/112 — the snapshot is read before the whole render and written after the emit, so a
+#     CHANGES.md that SHRINKS inside that window is committed at a bookmark HIGHER than the file's
+#     entry count, and every later entry up to that number is never announced. §2 ranks the two
+#     error directions and calls "marking read too early" today's silent loss and "failing to mark
+#     read" the merely annoying one; this crosses that line. It is NOT the append race §2's
+#     DECLARED GAP rules acceptable: that gap's own cost reasoning is "a few lines silently marked
+#     read during a race, not the permanent silencing this fix removes", and a shrink produces
+#     exactly the permanent silencing. It is also NOT pre-existing — see V.D/112's own header.
+#   · V.D/113 — `_changes_commit` routes through `_atomic_place`, whose terminal
+#     `command mv -f -- "$tmp" "$dest"` MOVES the temp INSIDE a directory-shaped destination and
+#     exits 0. The caller's rc contract (:1561-1564, :1804-1806) is what makes a failed commit
+#     visible at all, so a false success silences the breadcrumb this branch added.
+#
 # INSTRUMENTS: V.D/109 reuses `write_id_editing_envelope_jq` exactly as V.B/103-108 do, with the
 # same instrument-blind check before the run and instrument-leak check after PATH is restored. Its
 # POSITIVE control — the same shim with a matchless script must still deliver the whole batch — is
-# V.B/104 and is deliberately NOT duplicated here. V.D/110 and V.D/111 use NO instrument at all:
-# they drive the unmodified engine and read its output. No new apparatus in this section.
+# V.B/104 and is deliberately NOT duplicated here. V.D/112 adds ONE instrument, the one-shot
+# `write_changes_shrinking_awk` PATH shim, under the same blind/leak/engaged discipline; its own
+# header explains why nothing cheaper reaches the window. That shim is written TWICE — once per
+# call site, each instance over its own vault with its own fired marker — but it is one instrument
+# used twice, not two: no state crosses between the armings, so neither arming depends on the
+# other having fired. V.D/110, V.D/111 and V.D/113 use NO instrument at all: they drive the
+# unmodified engine and read its output. V.D/111's `brain:`-silence assertion is an assertion on
+# that output, the same rung as V.B/104's (:5077) — not an instrument.
 #
 # NUMBERING: starts at 109, after V.B/108. 92-102 stay reserved for section V.P (task 5.7).
 
@@ -5669,15 +5743,31 @@ sc_delivered_changes_banner_is_consumed() {
 # V.D/111 — THE CLI PATH MUST NOT REGRESS. `brain status` (:1770) prints straight to the terminal:
 # once printed, delivered. There is no capture and no discard, so the fix has no business reaching
 # into it — seam §2 says so in as many words ("leave the CLI exactly as-is").
-#   PROVES     two consecutive `brain status` invocations show the banner, then omit it.
+#   PROVES     two consecutive `brain status` invocations show the banner, then omit it; and that
+#              the first one — whose bookmark WAS recorded — says nothing on the `brain:` channel.
 #   REJECTS    a fix that makes `cmd_status` render-only — which the shipped shape does — but then
 #              commits from `_hook_session_start` ALONE, leaving the CLI path with no committer,
 #              under which `brain status` reprints the same banner on every invocation forever.
-#   BASELINE   green today. It is a guard, not a red.
+#   THE        the `brain:` silence assertion is the COMPLEMENT V.D/113 needs, and it lives here
+#   COMPLEMENT because this is the scenario that already drives a HEALTHY CLI commit. V.D/113 asks
+#   V.D/113    for a breadcrumb when the bookmark could NOT be recorded; on its own that is
+#   NEEDS      satisfiable by an engine that warns unconditionally — one which never fixes the
+#              `mv -f <temp> <directory>` fault at all and simply prints the breadcrumb every time
+#              scores a clean pass. A breadcrumb assertion is only meaningful next to a silence
+#              assertion: together they pin the DIAGNOSTIC to the failing commit rather than to the
+#              act of committing. The hook-side equivalent of that cheat dies to V.B/104's
+#              "a complete envelope must produce no emit warning" (:5077, the same rung — an
+#              assertion on the engine's own output, not an instrument); nothing pinned a quiet CLI
+#              `brain status` until this line.
+#   BASELINE   green today, including the silence assertion: HEAD emits zero `brain:` lines on a
+#              healthy `brain status`. It is a guard, not a red.
 #   DOES NOT   pin the CLI's output format, nor HOW the CLI ends up committing — whether it shares
 #     PIN      one code path with the hook or commits explicitly at its own call site. Any shape
 #              that leaves `brain status` consuming the banner passes here; seam §2 picks which
-#              shape ships, and this scenario deliberately does not restate that choice.
+#              shape ships, and this scenario deliberately does not restate that choice. The
+#              silence assertion is scoped to the `brain:` channel — `_warn`'s prefix (:63) — so
+#              ordinary status output is untouched by it, and a fix is free to say whatever it
+#              likes on stdout.
 sc_cli_status_consumes_the_changes_banner() {
   fx=$(make_vault alpha bravo) || fatal "fixture build failed"
   changes="$fx/.brain/CHANGES.md"
@@ -5693,6 +5783,8 @@ sc_cli_status_consumes_the_changes_banner() {
   run_brain "$fx" bravo status
   first_rc=$?
   need_rc "$first_rc" 0 "first CLI 'brain status' invocation"
+  need_eq "$(grep -c '^brain:' "$ERR" 2>/dev/null)" 0 \
+    "a CLI 'brain status' whose bookmark WAS recorded must stay silent"
   need_file_has "$OUT" "$needle" \
     "the first CLI 'brain status' must show the CHANGES banner — two entries are unread"
 
@@ -5701,6 +5793,257 @@ sc_cli_status_consumes_the_changes_banner() {
   need_rc "$second_rc" 0 "second CLI 'brain status' invocation"
   need_file_lacks "$OUT" "$needle" \
     "the second CLI 'brain status' must not repeat the banner: the CLI prints straight to the terminal, so the first invocation DELIVERED it, and a fix that defers the bookmark commit for every caller would nag here forever"
+}
+
+# V.D/112 — A STALE SNAPSHOT MUST NOT PERMANENTLY SILENCE LATER, UNRELATED CHANGES. Two unread
+# entries, no bookmark; the render is driven with a `awk` shim that empties CHANGES.md the moment
+# the engine reaches the presence pass — squarely between `_changes_snapshot` (:1545) and
+# `_changes_commit` (:1562). The boot renders "2 changes", DELIVERS, and commits the bookmark 2
+# against a file that now holds 0. TWO DIFFERENT entries are then appended, and the assertion that
+# matters is the next boot: total 2, bookmark 2, banner gone — for those entries and for every
+# entry after them, permanently.
+#
+# THE SAME FAULT IS DRIVEN THROUGH BOTH CALL SITES, in this one scenario. `_changes_commit` has two
+# callers — the hook (:1562) and the CLI `status` dispatch (:1804) — and seam §2 puts the decision
+# with the caller ("the decision to commit belongs to the caller"). A guard placed at the hook call
+# site alone is therefore a plausible GREEN, not a contrived one, and it leaves `brain status`
+# committing a cursor that outruns the file exactly as the shipped engine does (measured on such a
+# build: cursor 2, CHANGES.md 0 entries, every later entry silenced). Two call sites of one fault
+# belong in one scenario, so the hook arm runs first and the CLI arm repeats it below.
+#   PROVES     entries recorded AFTER a render that saw a shrunk CHANGES.md are still announced —
+#              through the hook AND through `brain status`. The bookmark may never outrun what the
+#              file actually holds, whichever caller commits it.
+#   REJECTS    the shipped engine, which commits the snapshotted count unconditionally once the
+#              emit succeeded; a repair applied at ONE call site only, in either direction; and any
+#              fix that only narrows the window (moving the snapshot later still leaves a shrink
+#              between snapshot and commit) rather than refusing to commit a count the file can no
+#              longer support.
+#   WHY THE    the CLI arm builds its OWN fixture rather than continuing on the hook arm's. A
+#   CLI ARM    fresh vault carries no bookmark, so the CLI arm is the SAME shape as the hook arm —
+#   GETS A     seed 2, shrink to 0, append 2, look. Continuing on the first fixture would leave the
+#   FRESH      bookmark at whatever the hook arm's repair chose, and the later-append count would
+#   FIXTURE    then have to be tuned to straddle an honest bookmark and a poisoned one: arithmetic
+#              that is correct only for the repairs anyone happened to think of, and a false RED
+#              against a legitimate one. `make_vault` is the existing helper; no state, no
+#              bookmark and no instrument is shared between the two arms.
+#   NOT PRE-   MEASURED against `git show origin/main:bin/brain`, not inferred. On main the count
+#   EXISTING   (:945), the print (:949) and the write (:951) are three consecutive lines INSIDE the
+#              banner block, all after the presence loop — so the same shim shrinks CHANGES.md
+#              before the count runs, `_total` is 0, no banner prints and no bookmark is written.
+#              Driven end to end against a main-engine fixture: main SHOWS the banner on the later
+#              boot; this branch does not. This branch moved the read ahead of the entire render
+#              AND the emit, which is what opened a window wide enough to drive.
+#   WHY THE    §2 accepts "the banner repeats" as the safe failure direction and rejects "the
+#   SEAM       banner is lost". This is loss. §2's DECLARED GAP does not cover it: that gap is a
+#   FORBIDS IT CHANGES.md APPEND between render and commit, whose exposure it costs as "a few lines
+#              silently marked read", explicitly contrasted with "the permanent silencing this fix
+#              removes". A shrink IS the permanent silencing.
+#   DOES NOT   pin the cursor file's path, format or existence (this section's OBSERVABLE-NOT-
+#     PIN      STRUCTURAL rule), the banner's count, or HOW the commit is made safe. A commit that
+#              is skipped, clamped, or re-derived through the single `_changes_snapshot` grep all
+#              pass — §2's "one place" constraint is about the grep's code site, and re-reading it
+#              to take the LOWER of the two values only ever errs toward repeating the banner,
+#              which §2 names the acceptable direction. It also does not pin the SHRINKING boot's
+#              own bookmark state, nor re-pin delivery-conditioning: V.D/109 owns that. Nor does it
+#              pin WHERE the repair lives: a single guard inside `_changes_commit` covers both call
+#              sites at once and passes, and so does an equivalent guard duplicated at each caller.
+#              What fails is covering only one of them.
+sc_shrunk_changes_render_does_not_silence_later_entries() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  changes="$fx/.brain/CHANGES.md"
+  needle="brain change(s) since you last looked"
+
+  # A fresh vault carries no bookmark, so the snapshot's CURRENT is 0 and the banner is genuinely
+  # owed. That is asserted OBSERVABLY below (the shrinking boot must render the banner) rather
+  # than by probing the cursor path, which a fix is free to relocate.
+  for n in 1 2; do
+    printf '%s\n' "- 2026-08-06T00:00:0$n cursor-shrink-$n — fixture change $n" >> "$changes" \
+      || { fail "fixture: could not seed CHANGES.md"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 2 \
+    "prerequisite: two unread CHANGES entries seeded" || return 0
+
+  fired="$base/awk-shrink.fired"
+  real_awk=$(command -v awk) || { fail "fixture: cannot locate the real awk"; return 0; }
+  shim_dir="$base/awk-shrink-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the shrink shim dir"; return 0; }
+  write_changes_shrinking_awk "$shim_dir/awk" "$real_awk" "$changes" "$fired" \
+    || { fail "fixture: could not write the CHANGES-shrinking awk shim"; return 0; }
+
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v awk)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/awk) ;;                       # the engine calls bare `awk`, so unless PATH resolves
+    *) PATH=$saved_path; export PATH          # to the shim nothing mutates CHANGES.md inside the
+       fail "instrument blind: PATH does not resolve awk to the CHANGES-shrinking shim, so nothing would shrink CHANGES.md inside the snapshot→commit window"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo hook session-start
+  boot1_rc=$?
+  boot1_out="$base/cursor-shrink.out"
+  cp "$OUT" "$boot1_out" 2>/dev/null || : > "$boot1_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v awk)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the CHANGES-shrinking awk shim is STILL what PATH resolves"; return 0 ;;
+  esac
+
+  # Instrument ENGAGED controls. A shim that resolved but never matched, or matched outside the
+  # window, leaves CHANGES.md intact — under which the rest of this scenario would pass against
+  # ANY engine and prove nothing. Both fire with their own distinct reason.
+  [ -e "$fired" ] \
+    || { fail "instrument never engaged: the awk shim's one-shot marker was never created, so the presence pass it keys on did not run and nothing shrank CHANGES.md"; return 0; }
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 0 \
+    "instrument engaged: CHANGES.md must hold zero recorded entries after the shrinking boot — the shrink IS the premise of this scenario" || return 0
+
+  need_rc "$boot1_rc" 0 "SessionStart hook wrapper status on the shrinking boot"
+  boot1_ctx=$(jq -e -r '.hookSpecificOutput.additionalContext // empty' "$boot1_out" 2>/dev/null) \
+    || { fail "the shrinking boot emitted no readable additionalContext, so it never DELIVERED and the bookmark commit that delivery authorizes was never reached"; return 0; }
+  need_str_has "$boot1_ctx" "$needle" \
+    "the shrinking boot must render the banner from the snapshot it was handed — seam §2 settles that shape (snapshot before the render, cmd_status renders only). Without it this boot never displayed a count the file can no longer support and the window under test was not entered" || return 0
+
+  # The LATER, UNRELATED changes — recorded after the shrinking boot finished, with nothing in
+  # common with the two it displayed. Nobody has ever seen these.
+  for n in 1 2; do
+    printf '%s\n' "- 2026-08-06T00:01:0$n cursor-shrink-later-$n — LATER unrelated change $n" >> "$changes" \
+      || { fail "fixture: could not append the later CHANGES entries"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 2 \
+    "prerequisite: the two later entries are the only ones CHANGES.md now holds" || return 0
+
+  later_ctx=$(hook_context "$fx" bravo) \
+    || { fail "the healthy SessionStart after the shrinking boot emitted no readable additionalContext"; return 0; }
+  need_str_has "$later_ctx" "$needle" \
+    "the boot after a shrinking render must still announce the CHANGES recorded since — the shrinking boot committed a bookmark equal to a count the file no longer held, so these two later, unrelated entries are marked read without ever having been shown, and every entry up to that number stays silenced on this and every future boot"
+
+  # ── THE SAME WINDOW, THE OTHER CALLER ──────────────────────────────────────────────────────
+  # `brain status` (:1802-1804) snapshots, renders and commits exactly as the hook does, so a
+  # guard installed at the hook call site alone leaves this path committing a bookmark the file
+  # cannot support. Its own vault, its own shim instance and its own fired marker: nothing is
+  # carried over from the arm above, and both instances are the same one-shot shim written by the
+  # same existing helper.
+  fx2=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base2=$(dirname "$fx2")
+  changes2="$fx2/.brain/CHANGES.md"
+
+  for n in 1 2; do
+    printf '%s\n' "- 2026-08-06T00:02:0$n cursor-shrink-cli-$n — fixture change $n" >> "$changes2" \
+      || { fail "fixture: could not seed the CLI arm's CHANGES.md"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes2" 2>/dev/null)" 2 \
+    "prerequisite: two unread CHANGES entries seeded for the CLI arm" || return 0
+
+  fired2="$base2/awk-shrink-cli.fired"
+  shim_dir2="$base2/awk-shrink-cli-bin"
+  mkdir -p "$shim_dir2" || { fail "fixture: could not create the CLI arm's shrink shim dir"; return 0; }
+  write_changes_shrinking_awk "$shim_dir2/awk" "$real_awk" "$changes2" "$fired2" \
+    || { fail "fixture: could not write the CLI arm's CHANGES-shrinking awk shim"; return 0; }
+
+  PATH="$shim_dir2:$PATH"; export PATH
+  case "$(command -v awk)" in
+    "$shim_dir2"/awk) ;;
+    *) PATH=$saved_path; export PATH
+       fail "instrument blind: PATH does not resolve awk to the CLI arm's CHANGES-shrinking shim, so nothing would shrink CHANGES.md inside the CLI's snapshot→commit window"
+       return 0 ;;
+  esac
+  run_brain "$fx2" bravo status
+  cli_rc=$?
+  cli_out="$base2/cursor-shrink-cli.out"
+  cp "$OUT" "$cli_out" 2>/dev/null || : > "$cli_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v awk)" in
+    "$shim_dir2"/*)
+      fail "instrument leak: the CLI arm's CHANGES-shrinking awk shim is STILL what PATH resolves"; return 0 ;;
+  esac
+
+  [ -e "$fired2" ] \
+    || { fail "instrument never engaged (CLI arm): the awk shim's one-shot marker was never created, so the presence pass it keys on did not run and nothing shrank CHANGES.md inside the CLI's window"; return 0; }
+  need_eq "$(grep -c '^- ' "$changes2" 2>/dev/null)" 0 \
+    "instrument engaged (CLI arm): CHANGES.md must hold zero recorded entries after the shrinking 'brain status' — the shrink IS the premise of this arm" || return 0
+
+  need_rc "$cli_rc" 0 "CLI 'brain status' on the shrinking invocation"
+  need_file_has "$cli_out" "$needle" \
+    "the shrinking 'brain status' must render the banner from the snapshot it was handed — without it this invocation never displayed a count the file can no longer support and the CLI's window was not entered" || return 0
+
+  for n in 1 2; do
+    printf '%s\n' "- 2026-08-06T00:03:0$n cursor-shrink-cli-later-$n — LATER unrelated change $n" >> "$changes2" \
+      || { fail "fixture: could not append the CLI arm's later CHANGES entries"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes2" 2>/dev/null)" 2 \
+    "prerequisite: the two later entries are the only ones the CLI arm's CHANGES.md now holds" || return 0
+
+  run_brain "$fx2" bravo status
+  cli_later_rc=$?
+  need_rc "$cli_later_rc" 0 "CLI 'brain status' after the shrinking invocation"
+  need_file_has "$OUT" "$needle" \
+    "the 'brain status' after a shrinking render must still announce the CHANGES recorded since — the shrinking invocation committed a bookmark equal to a count the file no longer held, so these two later, unrelated entries are marked read without ever having been shown. A repair that guards only the hook's call site passes every assertion above this one and still loses them here"
+}
+
+# V.D/113 — A COMMIT THAT COULD NOT RECORD THE BOOKMARK MUST SAY SO. One unread entry and a cursor
+# path that is a DIRECTORY. `_changes_commit` (:910) routes through `_atomic_place` (:68), whose
+# terminal `command mv -f -- "$_ap_tmp" "$_ap_dest"` MOVES the temp file INSIDE the directory and
+# exits 0 — so the commit reports a success it did not achieve, the breadcrumb at :1806 never
+# fires, and the banner repeats every invocation with nothing to explain why.
+#   PROVES     `brain status` diagnoses a bookmark it could not record, on the engine's own
+#              `brain: ` channel (`_warn`, :63), naming the cursor it failed to write.
+#   REJECTS    the shipped `_atomic_place`, which cannot distinguish "replaced the destination"
+#              from "moved the temp into the destination"; and any repair that makes the commit
+#              return non-zero without letting the operator learn WHICH path is unwritable.
+#   NEWLY      on main the bookmark is written by a direct `printf '%s\n' "$_total" > "$_cf"`
+#   EXPOSED    (:951), which FAILS against a directory. This branch routed the same write through
+#              a pre-existing helper whose `mv` silently succeeds. Measured against a main-engine
+#              fixture: main writes a redirection error to stderr, this branch writes nothing.
+#   THE CLI    is the path an operator actually reads, and its diagnostic goes straight to stderr
+#   ON PURPOSE (:1806) rather than into `.hook-errors.log`. The hook's copy of the same breadcrumb
+#              (:1564) is the same mechanism through the same helper; driving both would double-red
+#              one defect.
+#   BASELINE   RED. `brain status` exits 0 with a completely empty stderr today.
+#   DOES NOT   pin the wording beyond the cursor path itself — the offender's own name, which is
+#     PIN      how :297-321 diagnose throughout the engine — nor the exit status (an unwritable
+#              per-machine bookmark is not a status failure and this scenario does not make it
+#              one), nor whether the banner repeats afterwards, nor what the engine does with the
+#              directory. A repair that refuses, one that reports and moves on, and one that
+#              cleans up all pass.
+#   OMITTED    a symlink-to-a-directory cursor: `mv` treats it identically, one predicate decides
+#              both, and a second scenario would buy no new discrimination. Deliberate,
+#              non-blocking.
+#   ONE        this is the only scenario in section V.D that names the bookmark's PATH, because
+#   STRUCTURAL its fault is a hostile shape AT that path and the precondition is unstatable
+#   DEPENDENCY without it. If a fix relocates the bookmark, this fixture's `cursor` must move with
+#              it — see the section header's OBSERVABLE, NOT STRUCTURAL note.
+sc_directory_shaped_cursor_commit_is_diagnosed() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  changes="$fx/.brain/CHANGES.md"
+  cursor="$fx/.brain/.cursors/bravo.changes"
+  needle="brain change(s) since you last looked"
+
+  printf '%s\n' "- 2026-08-06T00:00:01 cursor-dir-1 — fixture change 1" >> "$changes" \
+    || { fail "fixture: could not seed CHANGES.md"; return 0; }
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 1 \
+    "prerequisite: one unread CHANGES entry seeded" || return 0
+
+  mkdir -p "$cursor" || { fail "fixture: could not create the directory-shaped cursor"; return 0; }
+  need_real_dir "$cursor" "prerequisite: the cursor path is a real directory, not a writable file" || return 0
+
+  run_brain "$fx" bravo status
+  status_rc=$?
+  status_out="$base/cursor-dir.out"
+  cp "$OUT" "$status_out" 2>/dev/null || : > "$status_out"
+  brain_lines="$base/cursor-dir.brain-lines"
+  grep '^brain:' "$ERR" > "$brain_lines" 2>/dev/null || : > "$brain_lines"
+
+  need_rc "$status_rc" 0 "'brain status' with a directory-shaped cursor (an unrecordable per-machine bookmark is not a status failure)"
+  # PREMISE control: `_changes_commit` returns early unless unread entries exist, so without the
+  # banner nothing would have attempted to write the cursor and an empty stderr would mean nothing.
+  need_file_has "$status_out" "$needle" \
+    "prerequisite: this invocation must show the CHANGES banner — the bookmark write is attempted only when the snapshot holds unread entries" || return 0
+
+  [ -s "$brain_lines" ] \
+    || { fail "a bookmark that could not be recorded must be diagnosed on the engine's own channel: not one 'brain:' line reached stderr, because 'mv -f <temp> <directory>' moved the temp INSIDE the cursor directory and exited 0, so the commit reported a success it did not achieve"; return 0; }
+  need_file_has "$brain_lines" ".cursors/bravo.changes" \
+    "the diagnostic must NAME the cursor it could not record — house style at :297-321 names the offender, and an operator whose banner repeats every invocation has no other way to learn which path is unwritable"
 }
 
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
@@ -5816,6 +6159,8 @@ scenario red   "V.B/108 reject-classes-distinguishable"   sc_reject_classes_are_
 scenario red   "V.D/109 rejected-boot-keeps-banner"       sc_rejected_boot_does_not_consume_the_changes_banner
 scenario guard "V.D/110 delivered-banner-is-consumed"     sc_delivered_changes_banner_is_consumed
 scenario guard "V.D/111 cli-status-consumes-banner"       sc_cli_status_consumes_the_changes_banner
+scenario red   "V.D/112 shrunk-changes-keeps-banner"      sc_shrunk_changes_render_does_not_silence_later_entries
+scenario red   "V.D/113 directory-cursor-diagnosed"       sc_directory_shaped_cursor_commit_is_diagnosed
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'
