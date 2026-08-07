@@ -142,6 +142,34 @@ read any CHANGES lines added between render and commit. Same defect class, narro
 > `_CHANGES_TOTAL` and `_CHANGES_TOKEN`. Any construction that reads the file twice is wrong in one
 > direction or the other, however the two reads are ordered; both orderings were measured failing.
 
+> ⚠ **DECLARED GAP #3 — the validate→write race is ACCEPTED, not closed (2026-08-07).**
+> `_changes_commit` validates the live checksum and *then* calls `_atomic_place`. A concurrent
+> `brain revert` landing between those two statements leaves a cursor of 6 on a 5-entry file — the
+> forbidden direction. This is **check-then-act, not a two-read problem**: consolidating reads
+> cannot close it, which is why `6761ce4` does not.
+>
+> **It is pre-existing on `origin/main` and this branch strictly narrows it.** Measured against
+> `git show origin/main:bin/brain`, not inferred: main runs count → print → write with **no
+> validation at all**, so its window spans the entire render. This branch's window is two adjacent
+> statements.
+>
+> **Blast radius is the CHANGES banner only.** `_changes_commit`'s return code is consumed at
+> exactly two sites (`:1581`, `:1823`) and both only `_warn`; nothing branches on it, and it runs
+> after `_emit_rc = 0`. **DM delivery cannot be affected** — the serializer and archive gate are a
+> different path. Worst case is one changelog entry never announced to one lane on one machine
+> (cursor files are per-machine and gitignored).
+>
+> **Steve accepted it on 2026-08-07** after asking whether it touches the primary capability. The
+> three closure options were priced and all rejected as worse than the gap at this stage: a lock
+> adds a locking primitive to a path 13 lanes run continuously (and a stale lock silently
+> suppresses banners — the very failure direction being removed); a self-validating cursor breaks
+> the verified byte-identical 1.2.2/1.2.3 rollback; write-then-rollback is the stash/restore shape
+> already rejected as racy.
+>
+> **Tripwires that should reopen this:** the cursor gains any consumer other than the banner; a
+> `_changes_commit` return code starts gating delivery; or `brain revert` stops being a rare,
+> deliberate, human-driven operation.
+
 **@pm amendment — no defer sentinel. `cmd_status` renders; CALLERS commit.**
 The consult sketched a `_STATUS_CHANGES_DEFER` sentinel to tell `cmd_status` which mode it is in.
 Drop it and make `cmd_status` a pure renderer that never commits, with both call sites owning the
