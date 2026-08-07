@@ -25,12 +25,29 @@ in the CHANGES banner — plus the diagnostic that made the first undiagnosable.
   staged id in one warning. Naming all of them rather than the first is deliberate: `pending/`
   preserves the staged set but never the omissions, and the extent is the diagnosis — a contiguous
   run reads as truncation, a scattered subset as non-deterministic corruption.
-- **Suite: 100 scenarios** (V.B/107-108 pin the diagnostic; V.D/109-111 pin the delivery-conditioned
-  commit, its two guards rejecting "never commit from the hook" and "defer for every caller").
-  Mutation probe at **19 mutants** — M12 envelope-first-id-only, M13 early-cursor-commit, M14
-  hook-cursor-commit. Two mutation gaps are declared in the seam map rather than closed: the reject
-  diagnostic is suite-pinned but not mutation-covered, and M14 covers the missing-commit fault but
-  not the adjacent misplacement.
+- **The bookmark can no longer outrun the file it describes.** Three adversarial convergence passes
+  found three ways the CHANGES count and the file could disagree, each one exposed by the fix for
+  the last. A render that SHRANK mid-flight committed a count the file no longer supported
+  (`V.D/112`). Splitting the count and the integrity token into two reads then let the file change
+  and change back between them — and the first repair for that, reordering the two reads, closed
+  one direction while opening its exact mirror (`V.D/114`). **The count and the token are now
+  derived from ONE read of `CHANGES.md`**: any ordering of two reads leaves a window in one
+  direction or the other, one read has none. Measured against six hand-built candidate engines, not
+  argued. A commit that cannot record the bookmark now says so rather than failing silently
+  (`V.D/113`), and the commit-time integrity check tests `cksum`'s exit status **before** comparing
+  — previously an unreadable file yielded an empty string that compared equal to an empty token and
+  passed the guard.
+- **Suite: 103 scenarios** (V.B/107-108 pin the diagnostic; V.D/109-111 pin the delivery-conditioned
+  commit, its two guards rejecting "never commit from the hook" and "defer for every caller";
+  V.D/112-114 pin the three snapshot-integrity faults above). Mutation probe at **19 mutants** —
+  M12 envelope-first-id-only, M13 early-cursor-commit, M14 hook-cursor-commit.
+- **Four gaps are declared in the seam map rather than closed**, and each is a ruling, not an
+  oversight: the reject diagnostic is suite-pinned but not mutation-covered; M14 covers the
+  missing-commit fault but not the adjacent misplacement; the MIRROR of the ABA window is untested
+  because `V.D/114`'s shim can only append on the token read (this gap already cost one shipped
+  defect, and `V.D/114`'s header now says so); and the validate→write race is **accepted** — it is
+  check-then-act rather than a two-read problem, it is pre-existing and strictly wider on `main`,
+  and its blast radius is the banner alone, never DM delivery.
 
 ## v1.2.2 — 2026-08-05 — enumeration is fatal-not-empty; paths, identities and the emit are byte-exact and pinned
 
