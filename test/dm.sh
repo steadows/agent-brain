@@ -797,6 +797,76 @@ write_changes_shrinking_awk() {
   chmod +x "$_wc_dest"
 }
 
+# write_changes_aba_cksum <dest> <real-cksum> <changes-file> <pristine-copy> <marker-prefix>
+# A two-armed `cksum` PATH shim that drives one ABA cycle across the engine's token→count→commit
+# sequence, and records what it did so a blind arming cannot render as a pass.
+#   arm 1 (the ENGINE'S TOKEN READ)  compute the real checksum of <changes-file> and emit it, THEN
+#                                    append one entry, so the count that follows sees the LARGER
+#                                    state while the token describes the smaller one.
+#   arm 2 (the ENGINE'S COMMIT CHECK) restore <changes-file> from <pristine-copy> FIRST, then
+#                                    compute and emit the real checksum — which now equals arm 1's.
+#   arm 3 (anything else)            delegate to the real binary byte-for-byte, stdin included.
+#
+# WHY A cksum SHIM IS THE CHEAPEST THING THAT REACHES THIS WINDOW. `_changes_snapshot`
+# (bin/brain:896-909) reads CHANGES.md TWICE — `cksum` at :904, `grep -c` at :905 — and
+# revalidates nothing between them, and `_changes_commit` (:921) compares its own checksum against
+# that FIRST read. The fault therefore needs two writes landing at two specific instants inside one
+# process. A concurrent writer would need cross-process coordination — the class of apparatus the
+# proportionality rules exclude — but the engine already forks a process at each of those instants
+# FOR US: `cksum` itself. Shimming it is deterministic, single-process, and needs no clock.
+#
+# WHY PLAIN INVOCATION ORDER IS SAFE HERE, where write_changes_shrinking_awk needed a program-text
+# match. `cksum` appears in exactly THREE places in the engine — :904, :921, and :536, a DM
+# collision-destination fallback inside `_dm_collision_dest` that is reachable only when a `read/`
+# or `failed/` destination is already occupied AND the name exceeds NAME_MAX. `brain status`
+# archives nothing, so :536 cannot run at all in this fixture and the first two invocations are the
+# token and the commit check. Measured: exactly two invocations on the shipped engine.
+#
+# WHY BOTH ARMS READ BY PATH AND IGNORE STDIN. Arm 2 must checksum the file it has just restored,
+# but the engine opened its `< "$BRAIN/CHANGES.md"` redirect BEFORE this process started — that
+# descriptor's contents after a restore depend on whether the restoring tool truncated in place or
+# replaced the inode. Reading the path is deterministic and is exactly what a real concurrent
+# writer racing just ahead of the engine's open would produce. Arm 1 reads the path for symmetry;
+# at that instant nothing has been written, so path and stdin are the same bytes either way.
+#
+# THE MARKERS ARE THE SHIM'S ENGAGED CONTROLS, and each carries the evidence for one claim rather
+# than merely existing: `<prefix>.sum1` is what arm 1 emitted, `<prefix>.grew` is the entry count
+# measured the instant after the append (a shim whose append silently failed reads 5, not 6, and
+# fails loudly instead of leaving the scenario to pass against any engine), and `<prefix>.sum2` is
+# what arm 2 emitted. A scenario asserting sum1 == sum2 is asserting that the guard at :921
+# compared two EQUAL values — the ABA itself — rather than assuming it.
+#
+# The appended entry is written directly, for the same reason every other fixture in section V.D
+# appends directly: the only engine route to a CHANGES.md entry is `brain propose` + `brain apply`,
+# a governance gauntlet whose own behaviour is not under test. The restore is a copy of the file's
+# own earlier bytes, which is the byte-for-byte outcome `cmd_revert`'s `_atomic_place
+# _render_without_change` rewrite produces once the appended change is reverted.
+write_changes_aba_cksum() {
+  _wa_dest=$1; _wa_real=$2; _wa_changes=$3; _wa_pristine=$4; _wa_pre=$5
+  [ -s "$_wa_pristine" ] || return 1   # nothing to restore FROM is a silently blind instrument
+  # shellcheck disable=SC2016
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'if [ ! -e "%s.sum1" ]; then\n' "$_wa_pre"
+    printf '  _s=$("%s" < "%s") || exit 1\n' "$_wa_real" "$_wa_changes"
+    printf '  printf "%%s\\n" "$_s" > "%s.sum1"\n' "$_wa_pre"
+    printf '  printf "%%s\\n" "- 2026-08-07T00:00:06 cursor-aba-phantom — appended between the token read and the count read" >> "%s" || exit 1\n' "$_wa_changes"
+    printf '  grep -c "^- " "%s" > "%s.grew" 2>/dev/null\n' "$_wa_changes" "$_wa_pre"
+    printf '  printf "%%s\\n" "$_s"\n'
+    printf '  exit 0\n'
+    printf 'fi\n'
+    printf 'if [ ! -e "%s.sum2" ]; then\n' "$_wa_pre"
+    printf '  cp "%s" "%s" || exit 1\n' "$_wa_pristine" "$_wa_changes"
+    printf '  _s=$("%s" < "%s") || exit 1\n' "$_wa_real" "$_wa_changes"
+    printf '  printf "%%s\\n" "$_s" > "%s.sum2"\n' "$_wa_pre"
+    printf '  printf "%%s\\n" "$_s"\n'
+    printf '  exit 0\n'
+    printf 'fi\n'
+    printf 'exec "%s" "$@"\n' "$_wa_real"
+  } > "$_wa_dest" || return 1
+  chmod +x "$_wa_dest"
+}
+
 # plant_message <repo> <lane> <marker> — send a REAL message from alpha carrying <marker>, then
 # print the path of the file the engine queued for it.
 #
@@ -5565,9 +5635,12 @@ sc_reject_classes_are_distinguishable() {
 # header explains why nothing cheaper reaches the window. That shim is written TWICE — once per
 # call site, each instance over its own vault with its own fired marker — but it is one instrument
 # used twice, not two: no state crosses between the armings, so neither arming depends on the
-# other having fired. V.D/110, V.D/111 and V.D/113 use NO instrument at all: they drive the
-# unmodified engine and read its output. V.D/111's `brain:`-silence assertion is an assertion on
-# that output, the same rung as V.B/104's (:5077) — not an instrument.
+# other having fired. V.D/114 adds ONE instrument, the two-armed `write_changes_aba_cksum` PATH
+# shim, under the same blind/leak/engaged discipline; its own header explains why a `cksum` shim is
+# the only thing that lands between the snapshot's two reads. V.D/110, V.D/111 and V.D/113 use NO
+# instrument at all: they drive the unmodified engine and read its output. V.D/111's
+# `brain:`-silence assertion is an assertion on that output, the same rung as V.B/104's (:5077) —
+# not an instrument.
 #
 # NUMBERING: starts at 109, after V.B/108. 92-102 stay reserved for section V.P (task 5.7).
 
@@ -6046,6 +6119,161 @@ sc_directory_shaped_cursor_commit_is_diagnosed() {
     "the diagnostic must NAME the cursor it could not record — house style at :297-321 names the offender, and an operator whose banner repeats every invocation has no other way to learn which path is unwritable"
 }
 
+# V.D/114 — A CHANGES.md THAT CHANGES AND CHANGES BACK MUST NOT SILENCE LATER ENTRIES. The third
+# fault in the shipped `_changes_snapshot` / `_changes_commit` pair, found by an adversarial
+# convergence pass on 2026-08-07 — and a fault in the FIX that V.D/112's finding produced, not in
+# anything that shipped before this branch.
+#
+# THE DEFECT — AN ABA WINDOW BETWEEN THE TOKEN READ AND THE COUNT READ. `_changes_snapshot`
+# (:896-909) reads CHANGES.md TWICE and revalidates nothing in between: the integrity token at
+# :904, the entry count at :905. `_changes_commit` (:921) then compares a fresh checksum against
+# that FIRST read's token. So a file that changes after :904 and returns to its ORIGINAL BYTES
+# before :921 passes the guard — while `_CHANGES_TOTAL` came from the changed state. Five entries
+# are hashed, a sixth is appended, six are counted, the sixth is reverted, and the bookmark is
+# committed at 6 against a file that holds 5. The next entry anyone records brings the total to 6,
+# total equals bookmark, and its banner is suppressed. Permanently.
+#
+# THE COMMENT AT :903 IS WHAT THIS SCENARIO REFUTES. It reads "Take the token first so a rewrite
+# before or after the count makes the later check fail safe." Taking the token first is safe
+# against a rewrite that STAYS rewritten and blind to one that comes back — and coming back is
+# exactly what `cmd_revert`'s `_atomic_place _render_without_change` rewrite does to a reverted
+# change. The ordering does not make the pair atomic; it only chooses which single instant the
+# token describes.
+#
+#   PROVES     an entry recorded after a snapshot whose two reads disagreed is still announced. The
+#              bookmark may never outrun what the file actually holds, however briefly the file
+#              held more.
+#   REJECTS    the shipped engine, which commits a count taken from a state its own token never
+#              described; and any repair that merely NARROWS the window rather than making the
+#              count and the token describe one state — measured, not predicted: an engine that
+#              re-checksums after the count and compares (`_CHANGES_TOTAL=0` on mismatch) still
+#              commits 6 here, because the revert lands on that revalidating read and it too
+#              compares equal.
+#   ADMITS     both obvious honest repairs, measured against hand-built engines rather than
+#              assumed: taking the count BEFORE the token (so the token describes a state at or
+#              after the count, and the revert makes :921 differ) commits 5; deriving BOTH the
+#              count and the token from ONE read of the file commits 5. Each then announces the
+#              later entry, and each still fires both arms of the instrument, so every control
+#              below survives GREEN instead of turning this into a permanent red.
+#   SAME FAULT V.D/112 reaches "the bookmark outran the file" through a SHRINK during the render.
+#   CLASS,     This reaches it through a change-and-change-back inside the snapshot itself, which
+#   DIFFERENT  V.D/112's fixture cannot produce: its shim leaves CHANGES.md shrunk, so the
+#   WINDOW     commit-time checksum differs and — on the shipped engine — the guard at :921 is the
+#              only thing that would stop it. This scenario is the case that guard cannot see.
+#              Seam §2 ranks the two error directions and accepts only "the banner repeats"; this
+#              is loss, which is the direction it forbids. §2's DECLARED GAP does not cover it
+#              either: that gap is an append between the RENDER and the commit whose cost it prices
+#              as "a few lines silently marked read", explicitly contrasted with "the permanent
+#              silencing this fix removes".
+#   NOT PRE-   MEASURED against `git show origin/main:bin/brain`, not inferred — though the honest
+#   EXISTING   comparison is stronger than "main passes the same drive". On main this path calls
+#              `cksum` ZERO times: its only checksum site is :531, the DM collision-destination
+#              fallback. The count, the print and the bookmark write are three consecutive lines
+#              inside the banner block, taken from one read. There is no token, so there is no
+#              window to hold two disagreeing reads, and the instrument cannot even arm. Driven end
+#              to end against a main-engine fixture: main commits 5 and announces the later entry.
+#              The token/count split this branch introduced is what created the fault.
+#   BASELINE   RED. The later `brain status` prints no banner at all today.
+#   DOES NOT   pin the cursor file's path, format or existence (this section's OBSERVABLE-NOT-
+#     PIN      STRUCTURAL rule — every assertion here reads the banner out of a terminal capture),
+#              nor the banner's COUNT on the ABA invocation. The count is deliberately unpinned:
+#              the shipped engine renders 6 and an honest engine renders 5, and asserting either
+#              number would either bless the defect or make this scenario permanently red. Nor
+#              does it pin WHICH caller commits, or where the repair lives — a fix inside
+#              `_changes_snapshot` and a fix inside `_changes_commit` both pass. The CLI is the
+#              driver only because it is the shortest path to the shared helper pair; the hook
+#              reaches the identical window through the identical functions, and driving both
+#              would double-red one defect. V.D/112 already pins that a repair must cover both
+#              call sites.
+#   INSTRUMENT one `cksum` PATH shim (`write_changes_aba_cksum`) under this section's existing
+#              blind/leak/engaged discipline. Its own header explains why nothing cheaper reaches
+#              the window and why invocation order is safe to key on here. NEGATIVE control: with
+#              the shim unarmed the shipped engine commits 5 and announces the later entry — this
+#              scenario passes vacuously — which is why the three markers below are asserted and
+#              not merely created. POSITIVE control: the two honest repairs named under ADMITS
+#              both fire both arms, match both checksums and restore byte-identically, so none of
+#              the controls rejects a permitted fix.
+sc_aba_changes_window_does_not_silence_later_entries() {
+  fx=$(make_vault alpha bravo) || fatal "fixture build failed"
+  base=$(dirname "$fx")
+  changes="$fx/.brain/CHANGES.md"
+  needle="brain change(s) since you last looked"
+
+  # A fresh vault carries no bookmark, so every entry is genuinely unread and the ABA invocation
+  # is guaranteed to reach the commit — asserted observably below, never by probing the cursor.
+  for n in 1 2 3 4 5; do
+    printf '%s\n' "- 2026-08-07T00:00:0$n cursor-aba-$n — fixture change $n" >> "$changes" \
+      || { fail "fixture: could not seed CHANGES.md"; return 0; }
+  done
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 5 \
+    "prerequisite: five unread CHANGES entries seeded" || return 0
+
+  # STATE A, captured byte-for-byte. The instrument restores FROM this copy and the byte-identity
+  # assertion compares AGAINST it — returning to the ORIGINAL bytes is the whole premise, since a
+  # file left in any other state makes the commit-time checksum differ and the guard reject.
+  pristine="$base/cursor-aba.state-a"
+  cp "$changes" "$pristine" || { fail "fixture: could not capture state A"; return 0; }
+
+  marks="$base/cursor-aba"
+  real_cksum=$(command -v cksum) || { fail "fixture: cannot locate the real cksum"; return 0; }
+  shim_dir="$base/cksum-aba-bin"
+  mkdir -p "$shim_dir" || { fail "fixture: could not create the ABA shim dir"; return 0; }
+  write_changes_aba_cksum "$shim_dir/cksum" "$real_cksum" "$changes" "$pristine" "$marks" \
+    || { fail "fixture: could not write the ABA cksum shim"; return 0; }
+
+  saved_path=$PATH
+  PATH="$shim_dir:$PATH"; export PATH
+  case "$(command -v cksum)" in                 # instrument LIVE control, checked before the run:
+    "$shim_dir"/cksum) ;;                       # the engine calls bare `cksum`, so unless PATH
+    *) PATH=$saved_path; export PATH            # resolves to the shim nothing writes CHANGES.md
+       fail "instrument blind: PATH does not resolve cksum to the ABA shim, so nothing would change CHANGES.md between the token read and the count read"
+       return 0 ;;
+  esac
+  run_brain "$fx" bravo status
+  aba_rc=$?
+  aba_out="$base/cursor-aba.out"
+  cp "$OUT" "$aba_out" 2>/dev/null || : > "$aba_out"
+  PATH=$saved_path; export PATH        # restore BEFORE any assertion can return early
+  case "$(command -v cksum)" in
+    "$shim_dir"/*)
+      fail "instrument leak: the ABA cksum shim is STILL what PATH resolves"; return 0 ;;
+  esac
+
+  # Instrument ENGAGED controls. Measured: with the shim unarmed the shipped engine commits an
+  # honest bookmark and every assertion below passes — so a shim that resolved but never fired,
+  # or fired but whose append or restore silently failed, would render this scenario as a pass
+  # against ANY engine. Each control fires with its own distinct reason.
+  [ -s "$marks.sum1" ] \
+    || { fail "instrument never engaged: the shim's token arm never fired, so nothing was appended between the token read and the count read and the window under test was never entered"; return 0; }
+  need_eq "$(cat "$marks.grew" 2>/dev/null)" 6 \
+    "instrument engaged: CHANGES.md must hold SIX recorded entries the instant after the token was taken — that larger state is what the count one line later reads, and a token/count disagreement is the entire premise of this scenario" || return 0
+  [ -s "$marks.sum2" ] \
+    || { fail "instrument never engaged: the shim's restore arm never fired, so the commit-time integrity check was never reached and the ABA was never completed — the file was left in its CHANGED state, which is V.D/112's fault, not this one"; return 0; }
+  need_eq "$(cat "$marks.sum1" 2>/dev/null)" "$(cat "$marks.sum2" 2>/dev/null)" \
+    "the two checksums the engine compared must be EQUAL — that equality IS the ABA. Had they differed, the commit-time guard would have rejected, no bookmark would have been written, and every assertion below would pass vacuously against any engine" || return 0
+  cmp -s "$pristine" "$changes" \
+    || { fail "the restoration was not byte-identical to state A ($(byte_size "$pristine") vs $(byte_size "$changes") bytes): a file that does not come back to its ORIGINAL bytes is caught by the commit-time checksum, which is a weaker fault than the one under test"; return 0; }
+
+  need_rc "$aba_rc" 0 "'brain status' driven across the ABA window"
+  # PREMISE control: the bookmark write is attempted only when the snapshot holds unread entries,
+  # so without a banner here the commit-time check is never reached and the window was not entered.
+  need_file_has "$aba_out" "$needle" \
+    "the ABA invocation must show the CHANGES banner — five entries are unread on a fresh vault, and the count is deliberately NOT pinned because the shipped engine renders 6 while an honest one renders 5" || return 0
+
+  # THE LATER, NEVER-SEEN CHANGE — recorded after the ABA invocation finished, with nothing in
+  # common with the five it was handed. Nobody has ever seen this one.
+  printf '%s\n' "- 2026-08-07T00:01:01 cursor-aba-later — LATER never-seen change" >> "$changes" \
+    || { fail "fixture: could not append the later CHANGES entry"; return 0; }
+  need_eq "$(grep -c '^- ' "$changes" 2>/dev/null)" 6 \
+    "prerequisite: the later entry brings CHANGES.md to six recorded entries" || return 0
+
+  run_brain "$fx" bravo status
+  later_rc=$?
+  need_rc "$later_rc" 0 "'brain status' after the ABA window"
+  need_file_has "$OUT" "$needle" \
+    "the invocation after an ABA snapshot must still announce the change recorded since — the ABA invocation counted a sixth entry that was reverted before the integrity check could see it, so the bookmark was committed at 6 against a file holding 5, and this later, never-seen entry is marked read without ever having been shown. Every entry up to that number stays silenced on this and every future invocation"
+}
+
 # ═════════════════════════════════════ run ═══════════════════════════════════════════════
 printf 'brain lane-DM v1.2 RED suite (claim layer deleted) + v1.2.1-v1.2.4 contract addenda\n'
 printf '  engine : %s\n' "$BRAIN_BIN"
@@ -6161,6 +6389,7 @@ scenario guard "V.D/110 delivered-banner-is-consumed"     sc_delivered_changes_b
 scenario guard "V.D/111 cli-status-consumes-banner"       sc_cli_status_consumes_the_changes_banner
 scenario red   "V.D/112 shrunk-changes-keeps-banner"      sc_shrunk_changes_render_does_not_silence_later_entries
 scenario red   "V.D/113 directory-cursor-diagnosed"       sc_directory_shaped_cursor_commit_is_diagnosed
+scenario red   "V.D/114 aba-window-keeps-banner"         sc_aba_changes_window_does_not_silence_later_entries
 
 NON_GUARD_FAILED=$((FAILED - GUARD_FAILED))
 printf '\n── summary ──\n'
