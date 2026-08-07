@@ -302,6 +302,15 @@ Budget note: each added mutant costs one more full suite run (~150s at the curre
 and each added *scenario* costs ~19× that (1 baseline + 18 mutants). Know the price before adding
 either.
 
+> **THIRD declared mutation gap (convergence pass 1, 2026-08-07).** `V.D/112` (a shrinking
+> `CHANGES.md` must not silence later entries) and `V.D/113` (an unrecordable bookmark must be
+> diagnosed) are **suite-pinned but not mutation-covered** — the two-mutant ceiling for this bundle
+> was already spent on M13/M14. Their discriminating power was measured instead by `spec-watchdog`,
+> which built **ten** wrong implementations: unconditional-suppression shapes die to the `V.D/110`
+> and `V.D/111` guards, a hook-only cursor guard dies to `V.D/112`'s CLI arming, and an
+> unconditional breadcrumb dies to `V.D/111`'s silence assertion. That is proof they discriminated
+> *once*; the probe cannot re-prove it after a later edit. Declared, not closed.
+
 **Kill sets WILL move, and undeclared collateral fails the gate.** The two new RED scenarios sit
 directly under both mutants:
 
