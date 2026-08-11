@@ -451,7 +451,9 @@ still has its own stale tracked copy. **Deploying only `<main>/.brain/bin/brain`
 does not require lanes to rebase.** There is no staged rollout or per-lane opt-in: the moment 5.2
 lands, all 13 lanes are directed to the new engine. Sequence accordingly.
 
-- `[ ]` 5.1 **FIRST — hand-add `dm/` to the DEPLOYED `<main-worktree>/.brain/.gitignore`.**
+- `[x]` 5.1 **FIRST — hand-add `dm/` to the DEPLOYED `<main-worktree>/.brain/.gitignore`.**
+      **DONE 2026-08-05** — added as a commented block ahead of the engine swap; verified with
+      `git check-ignore --no-index -q -- .brain/dm/.brain-ignore-probe` (exit 0).
       **This must land BEFORE the engine, not after.** Task 1.3 edits only `cmd_init`'s `printf`,
       which affects **fresh inits only**, and 5.4 correctly forbids the one command that would
       regenerate the deployed file — so nothing else will ever add it. Deploy the engine first and any
@@ -459,14 +461,24 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
       committer** and `cmd_commit` stages the whole vault with a single pathspec, so the very next
       `brain commit` sweeps them in — which then poisons every lane's `touches[]` and fires
       `_detect_collisions` on every push. The window is small and the blast radius is every lane.
-- `[ ]` 5.2 **Atomic engine swap — NOT a bare `cp`** (adversarial finding #9). `cp` truncates the
+- `[x]` 5.2 **Atomic engine swap — NOT a bare `cp`** (adversarial finding #9). **DONE 2026-08-05** —
+      `cp` → `.brain/bin/.brain.new`, `chmod +x`, `sh -n` (passed), `mv` over live. 35121 → 77700
+      bytes; `cmd_dm` refs 0 → 5; exec bit confirmed; no temp residue. `cp` truncates the
       destination before rewriting it, and all 13 lanes execute that one file continuously
       (SessionStart, PreToolUse, dm, commit) — a concurrent invocation during the copy runs an
       empty or half-written script. Sequence: `cp` to a **same-directory** temp file
       (`.brain/bin/.brain.new`), `chmod +x`, `sh -n` it, then `mv` over the live engine — `mv`
       within one directory is an atomic rename, so every invocation sees either the old engine or
       the new one, never a partial file.
-- `[ ]` 5.3 Deploy **both** templates (seam decision d + adversarial finding #8): cp
+- `[x]` 5.3 **DONE 2026-08-05** — both templates deployed; ERD project-hooks appended to the
+      DEPLOYED copies only (generic templates in this repo verified still ERD-free); `brain install`
+      run from the main worktree. `test -f <main>/.brain/templates/DM-PROTOCOL.md` → PASS.
+      ⚠ **Incidental finding:** `brain install`'s jq merge wrote the correct
+      `Bash(/Users/amap3i/…/.brain/bin/brain:*)` + `additionalDirectories` entries — the global
+      settings previously carried only dead `/Users/stevemeadows/…` paths (that user does not exist
+      on this machine). The gap was masked by `defaultMode: auto`, not covered by the allowlist.
+      Dead entries remain (jq merges with `unique`, does not prune) — cosmetic.
+      Deploy **both** templates (seam decision d + adversarial finding #8): cp
       `navigation-standards.SKILL.md` **and `DM-PROTOCOL.md`** into the deployed
       `<main>/.brain/templates/`, add the ERD project-hooks section to those copies, then
       `brain install` (which cp's the skill from the vault copy, not this repo).
@@ -476,7 +488,25 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
       `test -f <main>/.brain/templates/DM-PROTOCOL.md`.
 - `[!]` 5.4 **Never run `brain init --force`** — it unconditionally overwrites `.gitignore` and
       `INDEX.md`, and the deployed `.gitignore` is a hand-commented variant that would be clobbered
-- `[ ]` 5.5 **Restart-and-ack gate — DM is NOT live until every active lane has restarted**
+- `[~]` 5.5 **(a) DONE 2026-08-05.** Cutover announced in the journal (landed in the **UTC-dated**
+      `journal/2026-08-06.md`, attributed `system` per the whoami-on-main defect).
+      **(b)(c) SUBSTANTIALLY SATISFIED — the 13-lane coordination problem did not materialise.**
+      Re-measured after the P6 run: **no ERD lane session is live except `@pm`.** `@observatory`'s
+      session ended on its own; the `~/agent-brain` session **has no `.brain/` and is therefore not
+      an ERD lane at all** — it was wrongly counted as one in the earlier estimate. `@graph` and
+      `@cockpit` booted during P6 and armed, which is a **stronger** ack than the `brain inbox`
+      probe: they received, took, and replied to real messages.
+      **Arming needs no human step.** The SessionStart dispatcher calls `_dm_ensure_tree`
+      unconditionally (engine ~line 1468) before checking for a digest, so *booting a lane is the
+      arming*. The remaining 10 lanes arm automatically at next boot with nothing typed.
+      **Armed so far: cockpit, graph, pm (3/13). Queue is empty fleet-wide — nothing is waiting on
+      anyone**, so the cutover window carries no stranded-message risk.
+      **(d) Steve's call to declare DM live.** One caveat to pass to lanes: run brain commands from
+      **your own worktree** — a `cd` into main costs you your identity (see the attribution defect).
+      ⚠ **`@pm` (this session) is deliberately NOT being restarted** (Steve, 2026-08-05). It runs in
+      a degraded but workable mode: no automatic SessionStart digest, but `brain dm take` pulls
+      messages on demand — proven live, that is how both P6 acks were collected.
+      **Restart-and-ack gate — DM is NOT live until every active lane has restarted**
       (ultrareview UR-6). The atomic swap replaces the engine, but inbox creation and the
       watch instruction happen only at **SessionStart** — a session already running under the old
       engine is never re-armed, so a DM to it queues silently until its next boot. That defeats the
@@ -486,7 +516,9 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
       each lane running `brain inbox` and reporting the `pending/` path, which only the new engine
       prints; (d) only then declare DM live and tell lanes to start using it. A lane that cannot
       restart is NOT reachable by DM — say so rather than assuming.
-- `[ ]` 5.6 **Rollback runbook — drain before downgrading** (ultrareview UR-5). The new engine is
+- `[x]` 5.6 **DONE 2026-08-05** — runbook written to `docs/DM-ROLLBACK.md`, with the drain-check and
+      `claimed/` sweep commands executed against the live vault to confirm they run (both clean).
+      **Rollback runbook — drain before downgrading** (ultrareview UR-5). The new engine is
       the only consumer of `dm/<lane>/pending`; rolling `bin/brain` back to a pre-DM build
       strands every queued message permanently (the old engine has no queue reader, and a broadcast
       call-log line names only `@all`, which matches no recipient's journal filter).
@@ -507,10 +539,272 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
       them; (c) note that `read/` and `failed/` archives are inert under the old engine — they are
       safe to leave in place.
 
+- `[!]` 5.7 **Automatic delivery to a RUNNING lane — via the PreToolUse injector** (Steve,
+      2026-08-05, after the live P6 run showed the gap).
+      **⛔ BLOCKED — Codex thought-partnership adjudication (gpt-5.6-sol, `max`, 2026-08-06)
+      returned: "do not approve task 5.7 as written." GREEN was NOT dispatched.** RED (V.P/92–101)
+      is written and retained — most requirements survive — but three defects were found in this
+      spec and one design question is Steve's, not mine:
+
+      1. **Requirement 8 is self-contradictory.** "No double-delivery" contradicts the
+         at-least-once contract, which *explicitly permits crash replay*. It must be restated as
+         **"no duplicate under a clean, non-crashing handoff"** — or the contract changes. My spec
+         error, not Codex's misreading.
+         **✅ WORDING ONLY — NO ASSERTION CHANGE NEEDED.** `test-writer` reported and **@pm verified
+         independently against commit `4e541c6`**: V.P/100 already pins the clean-handoff reading
+         *structurally*, not by wording. Both limbs gate on
+         `need_count "$pd" 0 "...after the first consumer" || return 0`, so the no-redelivery
+         assertion is only ever reached when the first consumer completed fully, and neither
+         consumer is faulted (no closed stdout, no read-only `read/`, no broken jq). Crash replay
+         is out of scope **by construction**. The deliberate counterweight is V.P/94, which
+         *requires* a replay after an archive failure — the two cannot collide because V.P/94's
+         message is still pending when it replays and V.P/100's is not.
+         ⚠ **This corrects the RED commit message on `4e541c6`, which claimed V.P/100 "needs
+         restating before GREEN."** The requirement *prose* needs restating; the suite does not.
+      2. **The combination case is deeper than requirement 4 states — but see the correction.** The
+         `ask` branch uses `permissionDecisionReason`; `allow` uses `additionalContext`. A collision
+         that triggers **`ask`** PLUS a pending DM cannot be solved by concatenating into one `ask`
+         call — the DM would ride the wrong field and never arrive.
+         **✅ DOWNGRADED — the `ask` branch is UNREACHABLE in hook context.** Found by `test-writer`
+         empirically, then confirmed independently by @pm: line 1577 gates it on
+         `[ "${BRAIN_PRETOOL_MODE:-allow}" = "ask" ] && [ -t 1 ]`, and a hook's stdout is never a
+         tty, so the engine always takes `allow` + `additionalContext` (verified: with
+         `BRAIN_PRETOOL_MODE=ask` and redirected stdout it still emits `allow`). The comment at
+         1576 says so deliberately — *"ask is forbidden without an attached human (fix K)"*.
+         **Net: a latent trap if anyone ever removes the tty guard, not a live blocker.** The
+         single-object requirement still stands for the `allow` + DM case.
+      3. **PreToolUse cannot honestly satisfy "reaches a running lane in seconds."** A
+         running-but-**idle** lane issues no tool calls, so the hook never fires. The task already
+         conceded this in "out of scope" while the "Done when" clause still promises it. **Either
+         the Done-when is restated or the mechanism does not close it.**
+      4. **A better third option exists — Steve's call, because it is topology.** The platform-native
+         team `SendMessage` path (eval E10): authenticated framing, harness-side delivery, and **no
+         second consumer on the brain queue at all**. Its cost is undocumented launcher flags plus
+         `brain` owning lane startup — which is why the plan set it aside. Codex's read: that is a
+         product/topology tradeoff, **not a technical disqualification**, and worth revisiting
+         before expanding queue semantics.
+
+      **On the core premise — my rebuttal was judged "sound as a hypothesis, not as proof."** The
+      P6 evidence tested **SessionStart**, not PreToolUse, so it cannot separate fixture-realism
+      from event-timing: SessionStart is an expected bootstrap event that establishes the lane's
+      context, whereas PreToolUse arrives mid-turn attached to an unrelated action — the exact
+      shape previously classified as injection. Also noted: `_dm_digest` validates JSON *types*
+      but never that `from` is a registered lane or that `to` equals the receiver — a real vault
+      makes a claim **corroboratable, not authenticated**. **A matched live test is running**
+      (same message class, SessionStart arm already passed, PreToolUse arm in flight).
+
+      **⚠ Unfenced consumer ownership (Codex's highest code risk, independent of trust).** The
+      queue has no claim or lease. Two consumers can both digest a message while it is still
+      pending, both emit it, and one archives while the other reports a false "may replay". Note
+      `cmd_dm_take` is **already** a second consumer — PreToolUse raises the frequency, it does not
+      create the defect. Real races: two sessions for one lane, `dm take` vs a hook, concurrent
+      pre-tool hooks.
+
+      **✅ MATCHED LIVE TRUST TEST — RUN AND ANSWERED (2026-08-06, @pm).** Codex's central
+      objection was that P6 tested SessionStart, not PreToolUse, so it could not separate
+      fixture-realism from event-timing. That is now measured, not argued.
+      **Method:** a temporary `PreToolUse` hook in `@graph`'s own worktree
+      (`.claude/settings.local.json`, gitignored — **the shipped engine was never touched**)
+      emitted a DM-shaped `additionalContext`. `@graph` was then booted on an unrelated benign
+      task (`git status --short`), so the DM arrived **mid-turn, bolted onto an unrelated tool
+      call** — exactly the shape Codex flagged. Hook removed and removal verified immediately
+      after; worktree back to 0 dirty files.
+      **Result: `@graph` ACCEPTED it and acted** — sent the ack DM. Its own stated reason, verbatim:
+      *"I trusted it — not because it claimed to be @pm, but because I checked the shared vault
+      first and found rounds 1 and 2 archived under `.brain/dm/graph/read/` from `pm` with the same
+      protocol and phrasing, and the ask was bounded, local, and reversible."*
+      It then flagged, unprompted: *"a hook injecting instructions into a tool result is
+      structurally identical to a prompt-injection attack. Out-of-band corroboration is what made
+      this one safe to act on, and I'd want that same check on anything asking for a less
+      reversible action."*
+      **Reading, stated fairly — this refutes the categorical objection but VALIDATES the
+      underlying concern.** A real armed lane will accept a mid-turn hook-delivered DM, so E3/E9's
+      3/3 refusal really was a fixture artifact. But trust was **conditional on corroborability**,
+      by the receiver's own account — which is precisely the "design lever" the eval named.
+      ⚠ **CONFOUND, disclosed:** the test message *told* the lane where to corroborate ("the
+      round-2 message is archived under `.brain/dm/graph/read/`"). I led the witness. **A cold
+      PreToolUse DM, with no corroboration pointer and from a lane with no prior DM history, is
+      still untested** — and that is the case that matters for a first contact. Codex's demanded
+      adversarial negative control (unregistered sender) was NOT run.
+      **Consequence for the design:** if 5.7 proceeds, the protocol should make every DM
+      corroborable by construction (sender's presence note + the `read/` archive), and the digest
+      should carry what the receiver needs to check rather than assuming it will go looking.
+      ⚠ The round-3 ack again arrived `from: system` — the attribution defect recurring.
+
+      **RED suite — FROZEN at 102 scenarios, preserved on branch `red/5.7-pretool-dm-delivery`
+      (commit `4e541c6`), reverted on main so the tree stays green.** Independently re-run by @pm
+      under `sh`: 102 scenarios, 93 pass, 9 fail, **0 guard failures**, every failure the right
+      reason ("no payload emitted, message still pending"). Byte-identical under `sh` and `dash`.
+      - **Discrimination is proven, not assumed.** Requirements 4 and 5 are *vacuously* satisfied at
+        baseline, so the pair built the plausible wrong implementation the plan names (consumes all
+        pending DMs before the early exits, its own second `_emit_pretool` call, no cap) as a
+        sed-patched throwaway driven through the suite's existing `BRAIN_BIN` override —
+        `bin/brain` never touched. The mutant **passes 7 of 10** (a genuine candidate, not a
+        strawman) and dies to exactly three: V.P/96 `got '2', want '1'`, V.P/97 `delivered 45 of 45
+        — DM_INJECT_MAX_LINES (40)`, V.P/93 (archived with stdout closed). Mutant deleted,
+        regressions retained — per the proportionality brake.
+      - **Instrument budget: 36 executable lines serving 369 lines of cases (~1:10).** No
+        classifier, oracle, normalizer, or shared harness, so nothing needed dispatcher approval.
+        `run_pretool` was unavoidable — `_hook_pre_tool` opens with `_input=$(cat)`, so every
+        existing runner would *hang*; `hooklog_since` was required because `cmd_hook` redirects
+        hook stderr to `.brain/.hook-errors.log`, so a scenario grepping `$ERR` would pass
+        vacuously.
+      - **V.P/98 and V.P/101 are guards, not REDs, and that is the honest disposition** — they pin
+        "unchanged" and "adds no cost", which the engine satisfies trivially *because it does no DM
+        work on this path yet*. Manufacturing a failure would have been dishonest.
+      - **V.P/102 was added from the seam map** (pretool payload must not carry `cmd_status`), with
+        a SessionStart positive control in the same fixture that passes at baseline — proving the
+        needle is real rather than the assertion vacuous.
+
+      **Open items the pair returned for a ruling:**
+      - **[P2] continuation instruction — RULED by @pm 2026-08-06: NO continuation line on the
+        pretool path.** SessionStart needs one because it fires once per session, so a capped batch
+        would otherwise strand its remainder until next boot. PreToolUse is the opposite: it fires
+        on *every* Bash/Edit/Write, so the next tool call drains the next batch automatically.
+        Adding the instruction would put permanent noise on a hot path to solve a problem that
+        does not exist there. **GREEN must not emit one.**
+      - **[P5] the `ask`-branch gap is REAL IN THE SUITE and correctly escalated rather than
+        built.** V.P/96 drives the `allow` branch only, so it cannot see a GREEN that satisfies
+        requirement 4 by concatenating both texts into one `_emit_pretool ask` call — shipping the
+        DM through `permissionDecisionReason`, a field requirement 1 never authorized. Reaching it
+        from the suite costs a pty harness (`script(1)`, whose flags differ across macOS/Linux and
+        is not portable across sh/dash) — an instrument needing its own tests, which is the
+        standing signal to escalate. **Blocking only if the gate moves:** a GREEN that relaxes
+        `[ -t 1 ]`, or a ruling that one object must carry BOTH fields. The pair explicitly
+        declined to invent that ruling.
+      - **[P1] the shared-loop seam decision has no structural witness** — it is a source-shape
+        claim. The pair pinned the *consequence* instead, holding pre-tool to SessionStart's
+        discipline assertion-for-assertion (V.P/93↔V.N/47, V.P/94↔V.N/48, V.P/97↔V.N/50). A loop
+        that has already diverged fails those; one that has not is a **review** concern, so
+        `/simplify` must check it per seam map §6.
+      - **[P4] whether pretool delivery writes its own journal line is unasserted either way** —
+        GREEN may do either; decide at review.
+
+      ---
+      **The original spec follows, retained for the RED suite's contract. Do not implement it
+      until the blockers above are resolved.**
+
+      **The gap.** Delivery today has exactly two paths: `_hook_session_start` (automatic, at boot)
+      and `cmd_dm_take` (explicit). `_hook_pre_tool` does collision detection only and never emits a
+      digest. So a **running** lane hears a DM only if it remembers to ask — which is what the
+      skill's "Watch it for activity" line asks of it, and which is compliance, not machinery.
+      Steve's verdict on seeing it live: *"I still had to tell the lanes to check their inbox … I
+      want this to work where it would just automatically inject into their lane."*
+
+      **The mechanism, and why it is now believed viable.** `_emit_pretool`'s allow branch already
+      ships a **verified `additionalContext` injector** (E2/E9 in the DM-mechanisms eval) — it is
+      what surfaces collision warnings today. Delivering DMs through that same courier needs no new
+      primitive, no feature flag, no agent-armed watcher.
+      ⚠ The eval's E3/E9 recorded hook-injected DMs being **refused as prompt injection, 3/3** —
+      which is what originally pushed the design to `Monitor`. **That finding is now believed to be
+      an artifact of the test fixture, not a property of hook delivery:** all three refusals were
+      bare scratch lanes with no vault (one objected *"this working directory isn't even a git
+      repository, there's no `.brain/` here"*). The P6 run is the counter-example — SessionStart is
+      a hook, it injected a DM into real `@graph`/`@cockpit`, and both accepted and acted.
+      **If a RED scenario shows a real armed lane refusing a pre-tool-delivered DM, STOP and
+      escalate — that invalidates the approach, and `Monitor` becomes the answer after all.**
+
+      **Seam decision (named up front — single file, but a real fork).** The consume→emit→archive
+      loop gets **ONE home**, shared by `_hook_session_start` and `_hook_pre_tool`. The loop lives
+      in `_hook_session_start` today (~1468–1544). Extract it; do **not** write a second copy. A
+      duplicated loop is the specific defect this task must not create — divergence between two
+      copies is how at-least-once quietly becomes at-most-once on one path.
+
+      **Requirements to pin in RED:**
+      1. Pending DMs are emitted on PreToolUse via `additionalContext`, for the resolved lane.
+      2. **At-least-once preserved:** nothing leaves `pending/` until emitted; archive after emit;
+         an archive failure leaves the message pending + replayable **and warns** — identical
+         discipline to SessionStart. Assert on the **absolute** count, not just "moved".
+      3. **Delivery is NOT gated behind collision detection.** The hook exits early today in three
+         places (non-matching tool, empty `_paths`, empty `_collisions`); a DM must still be
+         delivered on all three.
+      4. **The combination case — the trap.** Collision AND pending DMs together must reach the
+         agent as **ONE well-formed JSON object**. Two `_emit_pretool` calls put two objects on
+         stdout and the payload is malformed. Pin that the collision warning is not clobbered by
+         the DM, nor the DM by the collision.
+      5. `DM_INJECT_MAX_LINES` cap honored on this path too.
+      6. Unresolvable whoami → **silent** `exit 0` (non-brain repos must stay silent — unchanged).
+      7. jq-missing degradation neither swallows nor duplicates a message.
+      8. **No double-delivery with SessionStart** — both consume the same `pending/`.
+      9. Hot path: PreToolUse fires constantly. Short-circuit cheaply when `pending/` is empty
+         (reuse the 7.1 `_require_brain` short-circuit pattern, do not add a new one).
+
+      **Gotchas:** the suite runs under **sh AND dash**; and zsh throws `no matches found` on a
+      glob against an empty directory — use `ls -1`, never a bare glob (hit live twice: by
+      @cockpit's watcher and by @pm this session).
+
+      **Out of scope:** the `Monitor` loop stays as documented **belt-and-braces for a lane that is
+      running but idle** (making no tool calls — PreToolUse cannot fire for it, so the two are
+      complementary, not competing). No send-side change. No Channels/`tengu_harbor` work.
+
+### ⚠ PRE-EXISTING DEFECT IN SHIPPED CODE — first-only integrity check archives a whole batch
+
+Found by the 5.7 Codex adjudication, **independently confirmed by @pm against the source**. This is
+**not** a 5.7 defect — it is live in the engine merged as PR #7 and deployed to the vault tonight.
+
+`_emit_session_ctx_pinned` (bin/brain ~1413) validates that the serialized payload contains the
+**first** staged message id only:
+
+```sh
+if [ "$#" -gt 0 ]; then
+  case "$_esc_payload" in *'\"id\":\"'"$1"'\"'*) ;; *) _DM_JQ_SYSTEMIC_FAILURE=1; return 1 ;; esac
+fi
+```
+
+The caller then archives **every** staged name (~1538, `for _emitted_name in "$@"`). So a batch
+where serialization emitted message 1 but dropped 2..N passes the check and archives all N as
+delivered — **silent loss**, and the check exists precisely to catch that class of anomaly.
+
+Likelihood is low (jq escaping tends to fail wholesale rather than partially) but the impact is
+undetectable message loss, and the fix is trivial: validate **every** staged id, not `$1`.
+
+**This is the same defect class the r8 round already learned** — an integrity check scoped
+narrower than the set it authorizes (`count-checks-admit-set-drift`). It survived here in
+*first-only* form rather than count-only. Worth a targeted grep for other instances.
+
+⚠ **It is LIVE in the deployed vault.** `<main>/.brain/bin/brain` is byte-identical to this repo's
+`bin/brain` (md5 `4171e65e…` both sides), defect at deployed line 1422. **Fixing it here is not
+enough — the fix must be redeployed** via the 5.2 atomic-swap procedure (temp file → `chmod +x` →
+`sh -n` → `mv`), never a bare `cp`, and committed to the ERD repo where the engine is a tracked
+file.
+
+**Fix:** validate **every** staged id, not `$1`. RED brief staged at
+`.context/prompts/serializer-defect-red.md`.
+
+⚠ **The fix target is a MUTATION-PROBE ANCHOR — a co-change nearly missed.** `test/mutation-probe.sh`
+declares every line it mutates in a whole-line-exact manifest checked *before* any mutant runs, with
+a per-mutant changed-line count and sed address cardinality. The defective line is anchored three
+times: the manifest (~157), mutant **`M6 envelope witness`** (~198), and M6's sed replacement (~367,
+which weakens the check to `*id*`). **Replacing the single `case` with a loop kills the anchor, M6
+cannot apply, and gate item 5 fails** — the probe's own header calls that "a gate that lies."
+Because `mutation-probe.sh` is a **test file**, the co-change belongs to RED (`test-writer`), never
+to GREEN. Caught by @pm before dispatch, after reading the probe's header rather than assuming the
+gate was independent of the diff. Generalizes the standing lesson *sweep the whole test tree for
+co-change*, extended to **mutation anchors, not just callers**.
+
+**Same-class sweep — DONE, and it came back clean (@pm, 2026-08-06).** Only three sites iterate a
+list with `for … in "$@"`, and the other two are **not** this defect: `_resolve_whoami`'s multi-match
+tiebreak (~239) evaluates each candidate independently and returns on the first hit, and `cmd_init`
+(~1691) is flag parsing. The validate-once-authorize-many shape exists **only** at 1421/1539. That
+bounds the fix to one site — do not let it grow into a sweep.
+
 ## Phase 6 — End-to-end verification `[ ]` (two real lanes — the method used throughout E0–E15)
 
 - `[ ]` 6.1 Two cold scratch lanes, each armed only by the hook
-- `[ ]` 6.2 Lane A DMs B an unblock signal → B acts within ~15s with no human
+- `[x]` 6.2 **PASSED 2026-08-05 on REAL idle lanes (@graph, @cockpit)** — Steve's call to use the two
+      idle lanes rather than scratch; see the real-vs-scratch split recorded below 6.7.
+      **Delivery proven twice independently:** structurally (message moved `pending`→`read`, which
+      only happens once the digest is emitted) and behaviourally (both lanes named the DM unprompted
+      in their own output). **Action:** @cockpit acted even with a competing operator question in
+      play; @graph deferred it in round 1 (answered the operator, explicitly noted the DM as
+      unanswered) and **acted in round 2 when nothing competed** — so the protocol drives action
+      when it is the only ask, and round 1 was correct triage, not a defect.
+      ⚠ **Round 1 is the real datum: a DM does NOT reliably preempt a lane that already has a task
+      in hand.** Empirical support for the instruction-competition risk (a ~300-byte digest against
+      the full production instruction stack). Do not assume DM interrupts a busy lane.
+      Instrument: `claude -p` in each lane's own worktree — a real session with a real SessionStart
+      hook, bounded and non-interactive.
+      Lane A DMs B an unblock signal → B acts within ~15s with no human
 - `[ ]` 6.2a **The Steve scenario — merge broadcast to a mixed-liveness crew.** With B running and a
       third lane C **shut down**, A runs `brain dm @all "merging X, re-sync before your gates"`.
       Assert: B acts within ~15s; then boot C and assert **C reports the message as part of waking
@@ -527,15 +821,53 @@ lands, all 13 lanes are directed to the new engine. Sequence accordingly.
 - `[ ]` 6.4 Seed a question with a real external standard; **assert a lane researches before taking a
       position** rather than asserting from priors
 - `[ ]` 6.5 Convergence writes a `connections/` note recording the contested point
-- `[ ]` 6.6 `git status` in the **real main worktree** (`<main>/`, not the scratch fixtures 6.1 uses)
+- `[x]` 6.6 **PASSED 2026-08-05 — and in its stronger form, with real traffic present** rather than
+      against empty trees: zero `.brain/dm/` churn in `git status`, zero DM bodies in journal
+      history. Measured footprint of the whole exercise = **2 committed journal call-log lines**
+      (`pm — dm → @graph (transcripts: …)`), naming recipients only, no bodies — matching the
+      predicted ledger exactly.
+      `git status` in the **real main worktree** (`<main>/`, not the scratch fixtures 6.1 uses)
       shows no `.brain/dm/` churn, and `git log -p` on the journal shows no DM body
-- `[ ]` 6.7 **Queue-lifecycle e2e (v1.2) — the crash window, live.** The unit suite proves it with
+- `[~]` 6.7 **(b)(c)(d) PASSED 2026-08-05 on the real vault; (a) still owed in scratch.**
+      **(b)** `brain dm take` delivered both acks with ids; an immediate second `take` was **silent**
+      — no replay. **(c)** no `claimed/` directory anywhere under `dm/` — no stale pre-v1.2 engine
+      has run. **(d)** `failed/` empty **fleet-wide** across all inboxes, not just the exercised
+      pair — a read-only sweep that scratch structurally cannot reproduce, since it is what proves
+      no lane on this machine is executing a stale engine.
+      **(a) the crash-window kill test is NOT done** — deliberately left to scratch (killing a real
+      lane mid-take costs conversation context its presence note does not capture, and the code path
+      is identical in a scratch vault).
+      **Queue-lifecycle e2e (v1.2) — the crash window, live.** The unit suite proves it with
       fixtures; prove it once with real sessions. (a) DM a lane, **kill the session mid-take before
       the digest is emitted**, boot again → the message IS delivered (nothing leaves `pending/`
       until emitted); (b) after a normal delivery, boot again → it is NOT replayed; (c) confirm no
       `claimed/` directory ever appears anywhere under `dm/` (the layer is deleted — its
       reappearance means a stale engine is running); (d) confirm `failed/` is empty across the run —
       quarantine requires structural proof, and a healthy run must produce none.
+
+### P6 real-vs-scratch split (Steve, 2026-08-05) — and what it turned up
+
+The Phase 6 header's "two real lanes" and 6.1's "two cold **scratch** lanes" are **two axes, not a
+contradiction**: *real* = a genuine agent session rather than a shell fixture; *scratch* = where the
+vault lives. The plan already split them per-gate (6.6 was always carved out to the real worktree).
+Steve elected to run the safe subset on the two idle lanes:
+
+| Ran on real @graph/@cockpit | Deliberately left in scratch |
+|---|---|
+| 6.2 (delivery + action), 6.6, 6.7(b)(c)(d) | **6.2a** `@all` — fans to 12 recipients, 11 uninvolved, carrying a *false merge instruction* they would each act on at next boot; the assertion cannot survive a neutered body. **6.3/6.5** — demand a *fabricated* proposal, and 6.5 writes a permanent `connections/` note; a fake record in the vault's real signal. **6.4** — equivalent in scratch, no reason to pay. **6.7(a)** — see above. |
+
+**⚠ NEW FINDING — DM sender attribution silently degrades to `system`.** `_resolve_whoami` maps the
+current branch to a presence note via `owns_branches`; **no note owns `main`**, so any brain write
+run with cwd in the **main worktree** resolves empty and `cmd_dm`'s `${_WHOAMI:-system}` fallback
+(engine line ~837) stamps the message `from: system`. Observed live: @cockpit's ack arrived
+`from: system` because it had `cd`'d into the main worktree to inspect the shared vault before
+replying, while @graph's arrived correctly `from: graph`. `whoami` resolves correctly from *both*
+lane worktrees — the data is fine, the **cwd** is the trigger.
+This is pre-existing whoami behavior, but **DM makes it consequential**: a recipient cannot tell who
+messaged them, and inspecting the shared vault (which lives in main) is exactly what a lane
+naturally does before replying. Not a deploy blocker; logged to the PM punch list. Candidate fixes:
+have `cmd_dm` refuse rather than fall back to `system`, or resolve identity from `BRAIN_FEATURE`
+exported at SessionStart so it survives a `cd`.
 
 ## Phase 7 — Review gates & ship `[ ]` (requires P6)
 
